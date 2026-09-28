@@ -170,7 +170,7 @@ runsh() {
 	: >"$p.probe"
 	local ms; ms=$(awk -v t="$tmo" -v s="$TSCALE" 'BEGIN{printf "%d", t*s*1000}')
 	local -a E=(env -i PATH="/usr/local/bin:/usr/bin:/bin" HOME="$cwd" TMP="$cwd" LANG=C.UTF-8
-		TMPDIR="${R_TMPDIR:-$TT}" STH="$STH" STRESS_PROBE_OUT="$p.probe" STRESS_TDIR="$TDIR"
+		TMPDIR="${R_TMPDIR:-$TT}" STH="$STH" STRESS_PROBE_OUT="$p.probe" STRESS_TDIR="$TDIR" STRESS_REPO="$REPO"
 		XDG_RUNTIME_DIR="$XDG" XDG_CACHE_HOME="${R_CACHE:-$SCR/dcache}" CURSE_FALLBACK="$FALLBACK"
 		${R_ENV:-})
 	local -a C

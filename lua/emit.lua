@@ -142,6 +142,20 @@ local function makes_attr(st)
 			return true
 		end
 	end
+	-- (a loop variable too: `for UID in …` / `select PPID in …` is rejected each round, and a
+	-- `for ((UID = 0; …))` fails its init — fuzz F119)
+	if (st.t == "forin" or st.t == "select") and BUILTIN_RO[st.name] then
+		return true
+	end
+	if st.t == "forc" and st.src then
+		for _, sl in ipairs(st.src) do
+			for nm in pairs(BUILTIN_RO) do
+				if sl:find("%f[%w_]" .. nm .. "%f[^%w_]") then
+					return true
+				end
+			end
+		end
+	end
 	if st.t ~= "simple" or not st.words[1] then
 		return false
 	end
@@ -275,6 +289,16 @@ local function scan_program(node, acc)
 	if node.lit and node.lit:find("set", 1, true) and node.lit:find("%f[%w_]set[ \t]")
 		and (node.lit:find("verbose", 1, true) or node.lit:find("[ \t]%-%a*v")) then
 		acc.lex = acc.lex or "set -v"
+	end
+	-- (a signal name in any literal text — `S=ERR; trap h $S`, `$t h DEBUG`: a trap the scan
+	-- of `trap` commands can't see may name it)
+	if node.lit and (node.lit:find("%f[%w_]ERR%f[^%w_]") or node.lit:find("%f[%w_]DEBUG%f[^%w_]")
+		or node.lit:find("%f[%w_]RETURN%f[^%w_]")) then
+		for _, sg in ipairs({ "ERR", "DEBUG", "RETURN" }) do
+			if node.lit:find("%f[%w_]" .. sg .. "%f[^%w_]") then
+				acc.sigs[sg] = true
+			end
+		end
 	end
 	if node.lit and node.lit:find("\\#", 1, true) then
 		acc.lex = acc.lex or "prompt \\#" -- a prompt's \# (command number) counts the reader's lines
@@ -1207,6 +1231,9 @@ end
 -- unquoted expansion (would word-split) or unquoted glob char (would path-expand)
 -- — those need the shared field engine (a separate compiled path).
 local function word_safe(w, arith_ok)
+	if w.bxlazy then -- (a huge brace word: many fields, made as it runs — emit_fields_into)
+		return false
+	end
 	if not emitable_word(w) then
 		return false
 	end -- pexp / side-effecting arith
@@ -3386,6 +3413,10 @@ local function emit_fields_into(tbl, w, lifted, wrap)
 	local function W(x)
 		return wrap and wrap:format(x) or x
 	end
+	if w.bxlazy then -- a huge brace word: its words made (and expanded) as the command runs
+		return EF.aa_wrap(("do local __f = rt.brace_fields(sh, %q, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end"):format(
+			w.bxlazy, tostring(w.plainarg or false), tostring(w.bxelem or false), tbl, tbl, W("__f[__i]")), w, lifted)
+	end
 	if arith_guard(w) then -- (one field unless $IFS holds a digit or '-': see arith_guard)
 		local segs = {}
 		for i, p in ipairs(w.parts) do
@@ -3733,7 +3764,7 @@ end
 -- An array element word's fields appended to `into` as {val=…} items: natively when the
 -- field engine takes it, else through the shared one-word expander (rt.aa_fields)
 function EF.aa_fields(into, w, lifted)
-	if aa_fieldable(w, lifted) then
+	if w.bxlazy or aa_fieldable(w, lifted) then
 		return emit_fields_into(into, w, lifted, "{val=%s}")
 	end
 	return EF.aa_wrap(("rt.aa_fields(sh, %s[1], %s)"):format(EF.konst({ ser(w) }), into), w, lifted)
@@ -3753,7 +3784,7 @@ local function arrayassign_decl_ok(st, lifted, allow_nameref)
 	-- its value) compiles. (After a bare first word a `[k]=v` is one plain word: rt.arrayassign.)
 	local kvfirst = st.elems[1] and st.elems[1].key == nil
 	for _, e in ipairs(st.elems) do
-		if e.brace_bare then
+		if e.brace_bare or e.brace_lazy or e.bxlazy then
 			return false
 		end -- `[k]=` value brace-expands (de-keyed): interp
 		if e.key == nil and not kvfirst and not e.word.src:match("^[%w_./,:@%%+=-]+$") then
@@ -4071,6 +4102,9 @@ local function arith_can_error(e, lifted)
 		if e.op ~= "=" and not lifted[e.name] then
 			return true
 		end -- compound reads the target
+		if EF.has_attr and not lifted[e.name] then
+			return true -- (a readonly target: `for ((R = 0; …))` reports it, the loop ends)
+		end
 		return arith_can_error(e.e, lifted)
 	end
 	if (k == "post" or k == "pre") and not lifted[e.name] then
@@ -4631,8 +4665,30 @@ analyze_lift = function(ast)
 	-- can't see (a signal mid-loop, DEBUG/ERR per command): whatever it names can't live in
 	-- a native local. An action that isn't a literal could name anything: lift nothing.
 	local trap_opaque = false
-	any_node(ast.stmts, function(st)
+	local trap_check
+	trap_check = function(st)
 		local w1 = st.t == "simple" and st.words and st.words[1]
+		if w1 and full_lit(w1) == "eval" then
+			-- (a literal eval's text may set a trap too — `eval "trap 'n=…' ERR"`, fuzz F121:
+			-- scan it as the program's own)
+			local parts = {}
+			for j = 2, #st.words do
+				parts[#parts + 1] = full_lit(st.words[j])
+				if not parts[#parts] then
+					return false
+				end
+			end
+			if table.concat(parts, " "):find("trap", 1, true) then
+				local ok, east = pcall(require("parser").parse, table.concat(parts, " "))
+				if not ok then
+					require("parser").trap_flow(east)
+				end
+				if ok and east and east.stmts then
+					any_node(east.stmts, trap_check)
+				end
+			end
+			return false
+		end
 		if w1 and full_lit(w1) == "trap" then
 			local j = 2
 			while st.words[j] and (full_lit(st.words[j]) or ""):match("^%-") do
@@ -4679,7 +4735,8 @@ analyze_lift = function(ast)
 			end
 		end
 		return false
-	end)
+	end
+	any_node(ast.stmts, trap_check)
 	if trap_opaque then
 		for nm in pairs(assigned) do
 			disq[nm] = true
@@ -6611,7 +6668,7 @@ simple_compiled = function(cx, st, after)
 	if st.assigns == nil then
 		-- (a long argv — `echo {1..70000}` — goes through the argv table too: one argument
 		-- per word would overflow LuaJIT's call slots and jump range; field_argv chunks it)
-		local bigargv = #st.words > 200 and not as_local
+		local bigargv = (#st.words > 200 or st.words.bxlazy) and not as_local -- (bxlazy: a huge brace word)
 		local anyfield = bigargv
 		-- A `local`/in-function `declare` VALUE word (j>1) never word-splits or globs
 		-- (assignment context), so a merely-renderable value (`local x=$y`) is NOT a
@@ -6651,12 +6708,12 @@ simple_compiled = function(cx, st, after)
 				call = inl_sync(cmd, fnwrap(
 					cmd,
 					st.line,
-					ff.locals and ("sh:pushCallT(__a, 1); %s(sh); sh:popCall()"):format(fnlname(cmd))
-						or ("sh:pushParamsT(__a, 1); %s(sh); sh:popParams()"):format(fnlname(cmd))
+					ff.locals and ("sh:pushCallT(__a, 1); rt.ncall(sh, %s); sh:popCall()"):format(fnlname(cmd))
+						or ("sh:pushParamsT(__a, 1); rt.ncall(sh, %s); sh:popParams()"):format(fnlname(cmd))
 				), cx)
 			elseif cx.funcflags[cmd] then -- bare function (references NO positional params): build argv
 				from = 2 -- to run the args' side effects, then a bare call (params unread)
-				call = inl_sync(cmd, fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd))), cx)
+				call = inl_sync(cmd, fnwrap(cmd, st.line, ("rt.ncall(sh, %s)"):format(fnlname(cmd))), cx)
 			elseif
 				cmd ~= nil
 				and not NATIVE_BUILTIN[cmd]
@@ -6967,16 +7024,16 @@ simple_compiled = function(cx, st, after)
 			body = fnwrap(
 				cmd,
 				st.line,
-				("sh:pushCall(%s); %s(sh); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd))
+				("sh:pushCall(%s); rt.ncall(sh, %s); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd))
 			)
 		elseif ff.params then -- positional swap only (no per-call frame table)
 			body = fnwrap(
 				cmd,
 				st.line,
-				("sh:pushParams(%s); %s(sh); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd))
+				("sh:pushParams(%s); rt.ncall(sh, %s); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd))
 			)
 		else -- neither: bare call, no allocation
-			body = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
+			body = fnwrap(cmd, st.line, ("rt.ncall(sh, %s)"):format(fnlname(cmd)))
 		end
 		body = inl_sync(cmd, body, cx)
 	else -- external command — OR a function DEFINED AT RUNTIME (via source/eval).
@@ -7958,6 +8015,7 @@ H.arrayassign = function(cx, st, after)
 		cx.blocks[p] = dbg(st) .. ("rt.arrayassign_member(sh, %q, %q); pc = %d"):format(st.name, st.index, after)
 		return p
 	end
+
 	do
 		local p = cx.newpc()
 		local parts = { "local __it = {}" }
@@ -8000,6 +8058,18 @@ H.arrayassign = function(cx, st, after)
 				end
 				local item = ("do %s; %s; __it[#__it+1] = {key=__k, op=%q, val=__v, src=%q, rawkey=%q} end"):format(
 					keyc, valc, e.op, e.word and e.word.src or "", e.key)
+				if (e.key .. (e.word and e.word.src or "")):find("${", 1, true) then
+					-- (an indexed `[k]=v` expands as ONE word, its brackets quoted: a bad
+					-- substitution in it names `\[k\]=v` — interp's arrayassign_items)
+					item = ("rt.with_bs_word(sh, not sh:is_assoc(%q) and %q, function() %s end)"):format(st.name,
+						"\\[" .. e.key .. "\\]" .. e.op .. (e.word and e.word.src or ""), item)
+				end
+				if e.brace_lazy then -- (the same, huge: its words made as it runs)
+					asq()
+					local pw = require("parser").parse_word(e.brace_lazy)
+					local lw = { k = pw.k, parts = pw.parts, bxlazy = e.brace_lazy, bxelem = true }
+					item = ("if __as then %s else %s end"):format(item, EF.aa_fields("__it", lw, cx.lifted))
+				end
 				if e.brace_bare then -- an INDEXED target de-keys it: `[k]=` literal in each brace word
 					asq()
 					local bf = {}
@@ -8280,8 +8350,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			if type(v) ~= "string" then
 				return
 			end
+			-- (called directly, or under the pcall of a loop's / function's break-continue-
+			-- return catcher: `pcall(rt.exec_dynamic, sh, …)` — stress-attack S4)
 			local ext = v:find("sh:exec(", 1, true) or v:find("sh:exec_t(", 1, true)
-				or v:find("rt.exec_dynamic(", 1, true)
+				or v:find("rt.exec_dynamic(", 1, true) or v:find("rt.exec_dynamic,", 1, true)
+				or v:find("sh.exec,", 1, true) or v:find("sh.exec_t,", 1, true)
 			-- (and a redirected one's: a signal `kill` sends the shell waits for them to go — b_kill)
 			if cx.cur_simple and (ext or (cx.cur_simple.redirs and #cx.cur_simple.redirs > 0)) then
 				pcline.tx = pcline.tx or {}
@@ -8289,7 +8362,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			end
 			-- (and the line a foreground job it runs is reported at, where not its own: jcx)
 			local jl = EF.cur_jl
-			if jl and jl ~= EF.cur_line and (ext or v:find("sh:run_pipeline(", 1, true)
+			if jl and jl ~= EF.cur_line and (ext or (pcline.tx and pcline.tx[k]) or v:find("sh:run_pipeline(", 1, true)
 				or v:find("sh:subshell_run(", 1, true)) then
 				pcline.jl = pcline.jl or {}
 				pcline.jl[k] = jl
@@ -10069,8 +10142,10 @@ function M.emit_pass(ast, opts)
 	-- in the shell it compiles in: tier.trap_mode keys its cache by that state)
 	local fo = opts or {}
 	EF.functrace = fo.functrace or false
-	EF.has_err = fo.trap_err or scan.sigs.ERR or false -- gate compiled ERR-trap firing
-	EF.has_debug = fo.trap_debug or scan.sigs.DEBUG or false -- gate compiled DEBUG-trap firing
+	-- (eval/source code — or a `trap` whose signal or name isn't literal — may set one the
+	-- program's text doesn't show: `eval "trap … ERR"` must fire, fuzz F121)
+	EF.has_err = fo.trap_err or scan.sigs.ERR or scan.dyncode or false -- gate compiled ERR-trap firing
+	EF.has_debug = fo.trap_debug or scan.sigs.DEBUG or scan.dyncode or false -- gate compiled DEBUG-trap firing
 	-- (a fragment: also when the program around it reads them — tier.note_text "F"/"P")
 	EF.funcstack = scan.dstack or fo.funcstack or false -- gate FUNCNAME/BASH_SOURCE/BASH_LINENO stacks
 	EF.pipestatus = scan.pstat or fo.pipestatus or false -- gate $PIPESTATUS after simple cmds

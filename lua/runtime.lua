@@ -1358,7 +1358,12 @@ local function co_task()
 		return nil
 	end
 	local co = coroutine.running()
-	return co and CO.bycoro[co] or nil
+	local t = co and CO.bycoro[co]
+	while co and not t and M.HOP_UP[co] do -- (a deep call's hop coroutine: M.nest_pcall)
+		co = M.HOP_UP[co]
+		t = CO.bycoro[co]
+	end
+	return t or nil
 end
 M.co_task = co_task
 -- Save a copy of `fd` for a later restore — the way bash does: close-on-exec (a
@@ -1416,6 +1421,16 @@ function M.pipe_hi(fds)
 		return -1
 	end
 	fds[0], fds[1] = fd_hi(_hi_pipe[0]), fd_hi(_hi_pipe[1])
+	if fds[0] < 0 or fds[1] < 0 then -- (no fd to move one to: EMFILE, as pipe() would say)
+		if fds[0] >= 0 then
+			C.close(fds[0])
+		end
+		if fds[1] >= 0 then
+			C.close(fds[1])
+		end
+		ffi.errno(24)
+		return -1
+	end
 	return 0
 end
 local task_flush -- forward: flush a task's buffered stdout (defined with the scheduler)
@@ -1621,7 +1636,7 @@ function M.wait_child(pid, stbuf, flags, intr, inplace)
 			end
 			t.child_pid, t.child_inplace = nil, nil
 			C.close(pfd)
-		elseif t then -- no pidfd (old kernel): poll WNOHANG on a scheduler tick
+		elseif t then -- no pidfd (old kernel, or no fd to spare): poll WNOHANG on a scheduler tick
 			while C.waitpid(pid, stbuf, 1) == 0 do
 				pre_yield(t)
 				if coroutine.yield(-1, 0) == SIGMARK then
@@ -1629,6 +1644,21 @@ function M.wait_child(pid, stbuf, flags, intr, inplace)
 				end
 			end
 			return pid
+		else -- (the shell itself, the same way: the tasks run meanwhile — they may hold the
+			-- pipe its child reads, a small `ulimit -n` leaving no fd for a pidfd)
+			local r = C.waitpid(pid, stbuf, 1)
+			while r == 0 do
+				M.sched_pump({ deadline = M.wall_secs() + 0.01, untilf = intr and function()
+					return intr.wait_sig ~= nil
+				end })
+				if intr and intr.wait_sig then
+					return -1
+				end
+				r = C.waitpid(pid, stbuf, 1)
+			end
+			if r ~= -1 or ffi.errno() ~= 4 then
+				return r
+			end
 		end
 	end
 	if intr then
@@ -2459,6 +2489,68 @@ local function open_noclobber(path)
 	ffi.errno(e)
 	return -1
 end
+-- ---- fd 255: bash's script input ------------------------------------------------------
+-- bash reads a script through fd 255 (read-only, close-on-exec; its offset past the first
+-- buffer it read, at most 8 KiB), and every subshell closes it. curse reads the script
+-- itself, so fd 255 is VIRTUAL (sh.input_fd): opened only when the script's own top level
+-- names it as a dup source (`echo x >&255`: dup'd, then the write fails — `write error:
+-- Bad file descriptor` — where a closed fd would fail the redirection) and closed again
+-- after that command. `exec 255>FILE` while it is the input leaves fd 255 on the script,
+-- read-only (bash moves its input to a new fd, and the saved copy comes back): the file is
+-- created, but writes through 255 fail (stress-attack S19). Any exec of 255 ends the
+-- virtual state.
+do
+local function input_open(sh, fd)
+	local f = M.ropen(sh.input_path, 0, 0)
+	if f < 0 then
+		return false
+	end
+	local size = C.curse_rt_lseek(f, 0, 2)
+	C.curse_rt_lseek(f, size < 8192 and size or 8192, 0)
+	if f ~= fd then
+		C.dup2(f, fd)
+		C.close(f)
+	end
+	C.fcntl(fd, 2, 1) -- F_SETFD FD_CLOEXEC
+	return true
+end
+-- A dup source `m` that is closed: the script input at its top level? then opened for this
+-- command (backed up as closed: its restore closes it again). true when it now is open.
+function M.input_dup_src(sh, m, backup)
+	if not sh.input_fd or m ~= sh.input_fd or M.iso_cur(sh) or M.co_task() or C.fcntl(m, 1) ~= -1 then
+		return false
+	end
+	backup(m)
+	return input_open(sh, m)
+end
+-- `exec` made its redirections permanent (M.redir_discard): one onto the input fd
+function M.input_exec(sh, fd)
+	if not sh.input_fd or fd ~= sh.input_fd or M.iso_cur(sh) or M.co_task() then
+		return
+	end
+	sh.input_fd = nil
+	if C.fcntl(fd, 1) ~= -1 then
+		input_open(sh, fd)
+	end
+end
+end
+-- a path made absolute against the current directory
+function M.abspath(p)
+	if p:sub(1, 1) == "/" then
+		return p
+	end
+	local buf = ffi.new("char[4096]")
+	local c = C.curse_co_getcwd(buf, 4096)
+	return c ~= nil and (ffi.string(c) .. "/" .. p) or p
+end
+-- the soft RLIMIT_NOFILE
+function M.nofile_soft()
+	local r = ffi.new("struct curse_rt_rlimit")
+	if C.curse_rt_getrlimit(7, r) ~= 0 or r.cur > 1048576 then
+		return 1048576
+	end
+	return tonumber(r.cur)
+end
 local function redir_backup(saves, fd, sh)
 	local e = { fd = fd, saved = M.save_fd(fd) }
 	saves[#saves + 1] = e
@@ -2496,6 +2588,9 @@ local function redir_open(sh, op, fd, target, saves, vname)
 			M.open_fail(sh, target, vname)
 			return false
 		end
+		if not M.nofile_check(sh, h, both and 2 or fd, target) then
+			return false
+		end
 		if both then
 			C.dup2(h, 1)
 			C.dup2(h, 2)
@@ -2513,7 +2608,12 @@ local function redir_open(sh, op, fd, target, saves, vname)
 			if tf == fd then -- `N>&N`: nothing to do, even on a closed N (redir.c)
 				return true
 			end
-			if C.fcntl(tf, 1) == -1 then -- F_GETFD: target fd not open -> bash fails
+			if not M.nofile_check(sh, nil, fd, target) then
+				return false
+			end
+			if C.fcntl(tf, 1) == -1 and not M.input_dup_src(sh, tf, function(f)
+					redir_backup(saves, f, sh)
+				end) then -- F_GETFD: target fd not open -> bash fails
 				io.stderr:write("curse: " .. target .. ": Bad file descriptor\n")
 				return false
 			end
@@ -2525,6 +2625,12 @@ local function redir_open(sh, op, fd, target, saves, vname)
 			redir_backup(saves, fd, sh)
 		end
 		local h = _temp_fd(target) -- target = the already-built body text
+		local L = M.nofile_limit(sh)
+		if h >= 0 and L and h >= L then -- (the script's open-files limit: open's EMFILE)
+			C.close(h)
+			h = -1
+			ffi.errno(24)
+		end
 		if h < 0 then -- (redir.c: here_document_to_fd's failure, then the command fails)
 			io.stderr:write("curse: cannot create temp file for here-document: " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
 			return false
@@ -2627,6 +2733,9 @@ function M.redir_discard(saves, sh) -- (sh: in an in-process subshell, a fd >= 1
 	end
 	for i = #saves, 1, -1 do
 		local s = saves[i]
+		if sh and sh.input_fd == s.fd then
+			M.input_exec(sh, s.fd)
+		end
 		s.done = true
 		if s.saved >= 0 and not (sh and M.iso_keep_fd(sh, s.fd, s.saved)) then
 			C.close(s.saved)
@@ -2981,7 +3090,7 @@ function M.job_line(sh)
 		local t = M.PCLINE[f]
 		if t then
 			local _, pc = getlocal(level, 2)
-			local l = t.jl and t.jl[pc]
+			local l = t.jl and t.jl[pc] or (t.jl_default and t.tx and t.tx[pc] and t.jl_default)
 			return l and t.trel and (sh.trap_base or 1) + l - 1 or l
 		end
 	end
@@ -3272,7 +3381,77 @@ end
 -- has none of its own), file actions `fa` plus closing every fd another in-process shell
 -- owns, the signal mask a bash child starts with, SIGINT/SIGQUIT ignored for an async one
 -- (`hold`), and the child environ with SHLVL moved by `lvl`. Returns rc, pid.
+-- `NAME: fork: retry: Resource temporarily unavailable` (sys_error: no line)
+function M.nofork_msg(sh, retry)
+	io.stderr:write((M.err_prefix(sh):gsub("line %d+: $", "")) .. (retry and "fork: retry: " or "fork: ")
+		.. ffi.string(C.strerror(11)) .. "\n")
+end
+-- bash's sleep(forksleep) between fork retries — the pipeline's other stages (tasks) and
+-- the background jobs run meanwhile. false: a signal cut it short (bash stops retrying).
+function M.fork_sleep(secs)
+	local wall = M.wall_secs
+	local dl = wall() + secs
+	local t = co_task()
+	while true do
+		local left = dl - wall()
+		if left <= 0 then
+			return true
+		end
+		if next(M.internal_pids) then
+			M.reap_orphans()
+		end
+		if t then
+			pre_yield(t)
+			if coroutine.yield(-1, 0) == SIGMARK then
+				task_signals(t)
+			end
+		elseif sched_live() then
+			M.sched_pump({ deadline = dl })
+		else
+			local sec = math.floor(left)
+			local ts = ffi.new("struct curse_rt_timespec", sec, math.floor((left - sec) * 1e9))
+			if C.curse_rt_ppoll(nil, 0, ts, nil) < 0 then
+				return false -- (EINTR: a signal — its trap has run)
+			end
+		end
+	end
+end
+M.FORK_Q = {} -- (spawns waiting for another's fork retry to end: M.fork_sleep)
+-- A spawned program gets the script's (virtual) open-files limit: the real soft one is put
+-- down to it around the spawn (the child inherits it at clone), the hard one given to the
+-- child right after (prlimit), as for a subshell's CPU limit (M.iso_spawn_pre)
+do
+local nofile_rl, nofile_real = nil, nil
+function M.nofile_spawn_pre(sh)
+	local L = M.nofile_limit(sh)
+	if not L then
+		return nil
+	end
+	nofile_rl = nofile_rl or ffi.new("struct curse_iso_rlimit")
+	if C.curse_iso_getrlimit(7, nofile_rl) ~= 0 then
+		return nil
+	end
+	nofile_real = nofile_rl.cur
+	nofile_rl.cur = L < nofile_rl.max and L or nofile_rl.max
+	C.curse_iso_setrlimit(7, nofile_rl)
+	return true
+end
+function M.nofile_spawn_post(sh, pid)
+	nofile_rl.cur = nofile_real
+	C.curse_iso_setrlimit(7, nofile_rl)
+	local H = M.iso_vhard(sh, 7)
+	if pid > 0 and H and H < nofile_rl.max then
+		local rl = ffi.new("struct curse_iso_rlimit")
+		rl.cur, rl.max = math.min(M.nofile_limit(sh), tonumber(H)), H
+		C.curse_iso_prlimit(pid, 7, rl, nil)
+	end
+end
+end
 local function spawn_argv(self, path, args, n, fa, hold, lvl)
+	local st0 = co_task()
+	if st0 then
+		st0.spawned = true -- (a real child: its SIGCHLD is real — M.sim_chld)
+	end
 	if next(M.internal_pids) then -- (a `ps` it runs must not see orphans that have ended)
 		M.reap_orphans()
 	end
@@ -3314,7 +3493,55 @@ local function spawn_argv(self, path, args, n, fa, hold, lvl)
 	M.shlvl_delta = d
 	local pidp = ffi.new("curse_pid_t[1]")
 	local cpuv = self.iso_ctx and M.iso_spawn_pre(self)
+	local FORK_Q = M.FORK_Q
+	if M.fork_retrying or FORK_Q[1] then
+		-- another stage is in bash's fork retry: bash forks one at a time, in pipeline
+		-- order — the ones that came meanwhile queue, and go in their order once it is done
+		-- (else a later stage takes the freed process and the earlier ones never get one)
+		local me = {}
+		FORK_Q[#FORK_Q + 1] = me
+		local ok, err = pcall(function()
+			while M.fork_retrying or FORK_Q[1] ~= me do
+				M.fork_sleep(0.01)
+			end
+		end)
+		for k = 1, #FORK_Q do
+			if FORK_Q[k] == me then
+				table.remove(FORK_Q, k)
+				break
+			end
+		end
+		if not ok then
+			error(err, 0)
+		end
+	end
+	local nofile = M.nofile_spawn_pre(self)
 	local rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
+	-- No process to be had (EAGAIN: RLIMIT_NPROC, a cgroup's pids.max): bash's make_child
+	-- says `fork: retry: …`, reaps, sleeps 1, 2, 4, 8 s and tries again — meanwhile the
+	-- pipeline's earlier stages end and free theirs (an 800-stage pipeline under a 400-task
+	-- limit gets through: stress-attack S15); then `fork: …` (spawn_errmsg), status 126.
+	local forksleep = 1
+	if rc == 11 then
+		M.fork_retrying = true
+		while rc == 11 and forksleep < 16 do
+			M.nofork_msg(self, true)
+			local ok, slept = pcall(M.fork_sleep, forksleep)
+			if not ok then
+				M.fork_retrying = nil
+				error(slept, 0)
+			end
+			if not slept then
+				break
+			end
+			forksleep = forksleep * 2
+			rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
+		end
+		M.fork_retrying = nil
+	end
+	if nofile then
+		M.nofile_spawn_post(self, rc == 0 and pidp[0] or 0)
+	end
 	if cpuv then
 		M.iso_spawn_post(self, rc == 0 and pidp[0] or 0)
 	end
@@ -3933,10 +4160,34 @@ local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd, lb, stp)
 	self.cur_cline, self.loopdepth, self.subdepth = cl, ld, sd
 	self.in_subprogram = self.in_subprogram - 1
 end
+-- bash forks a child for every `( … )`, `$(…)` and pipeline stage, and runs its CHLD trap
+-- once for each it reaps; curse runs them in-process: no child, no SIGCHLD — the trap missed
+-- them (stress-attack S22: `( : ); x=$(:); : | :` counted 0 where bash counts 4). Each such
+-- context ending in the shell that has a CHLD trap runs it as the reaping would, n times —
+-- unless a real child it ran sent a SIGCHLD of its own (its tail command, exec'd in place:
+-- the child bash would have reaped). (`&` jobs: co_resume, as they end.)
+function M.sim_chld(sh, nspawn0, n)
+	if nspawn0 and M.nspawn ~= nspawn0 then
+		return
+	end
+	local ctx = M.iso_cur(sh)
+	if ctx and not ctx.traps then -- (inside a subshell that set no trap: its CHLD is the default)
+		return
+	end
+	local h = sh.sigtraps and sh.sigtraps.SIGCHLD and sh.traps and sh.traps.SIGCHLD
+	if not h or h == "" then
+		return
+	end
+	local I = require("interp")
+	for _ = 1, n or 1 do
+		I.run_signal(sh, 17, true)
+	end
+end
 local cap_depth, cap_pid, flush_deferred, cap_enter, cap_leave -- (the signal hold: see M.defer_signal)
 function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	-- (signals are held from here to the end, the capture's state all undone — a trap run
 	-- in between would write into the capture, or into state about to be dropped)
+	local nsp0 = M.nspawn
 	cap_enter()
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	-- ($(…) inside a loop knows it — a break/continue there ends the substitution, as it
@@ -3982,7 +4233,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
 	local sv_cj, sv_xs = self.cap_jobs, self.xsigint
 	self.cap_jobs, self.xsigint = {}, nil
-	local ok, err = pcall(runner, self)
+	local ok, err = M.nest_pcall(self, runner, self)
 	if not ok then
 		err = M.lua_overflow(self, err)
 	end
@@ -4077,6 +4328,11 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		C.kill(C.getpid(), 2)
 	end
 	flush_deferred(self)
+	if not ctx then -- (in a context of its own: counted once that has ended — capture_compiled_iso)
+		local stc = self.status
+		M.sim_chld(self, nsp0)
+		self.status = stc
+	end
 	return r
 end
 
@@ -4496,7 +4752,11 @@ function M.iso_vhard(sh, res)
 			return v
 		end
 	end
-	return sh.iso_vhard_base and sh.iso_vhard_base[res] -- (a stage: its subshell's, stage_clone)
+	local b = sh.iso_vhard_base and sh.iso_vhard_base[res] -- (a stage: its subshell's, stage_clone)
+	if b then
+		return b
+	end
+	return res == 7 and sh.vnofile and sh.vnofile.h or nil -- (the script's own: M.nofile_limit)
 end
 
 -- The CPU-time soft limit a subshell set (b_ulimit: the real one counts from the context's
@@ -4509,6 +4769,41 @@ function M.iso_vsoft(sh, res)
 			return v or nil, st[i] -- (false: this one set the real limit itself)
 		end
 	end
+	if res == 7 and sh.vnofile then
+		return sh.vnofile.s
+	end
+end
+-- RLIMIT_NOFILE is VIRTUAL: `ulimit -n N` never lowers the shell's own limit — curse's
+-- plumbing (in-process stages, $(…) captures, pidfds, parked std fds) needs more fds than
+-- bash's forks do, and a script's `ulimit -n 20` starved it: pipelines hung, output was
+-- lost, a procsub's /dev/fd/N was gone (stress-attack S20). The limit is the script's:
+-- `ulimit -n` shows it, a redirection past it fails as bash's (M.nofile_check), `{v}`
+-- allocates below it, and every program spawned gets it (M.nofile_spawn). nil: no
+-- virtual limit (the process's own applies).
+function M.nofile_limit(sh)
+	local v = M.iso_vsoft(sh, 7)
+	return v and tonumber(v) or nil
+end
+-- A redirection's new fd `h` (open's lowest free one) onto `fd`: past the script's limit,
+-- open's EMFILE (every fd below it taken) or dup2's EBADF, as bash reports them. true: ok.
+function M.nofile_check(sh, h, fd, target)
+	local L = M.nofile_limit(sh)
+	if not L then
+		return true
+	end
+	if h and h >= L and h ~= fd then
+		C.close(h)
+		io.stderr:write("curse: " .. tostring(target) .. ": " .. ffi.string(C.strerror(24)) .. "\n")
+		return false
+	end
+	if fd >= L then
+		if h and h ~= fd then
+			C.close(h)
+		end
+		io.stderr:write("curse: " .. fd .. ": " .. ffi.string(C.strerror(9)) .. "\n")
+		return false
+	end
+	return true
 end
 -- This process's CPU time so far, in seconds
 do
@@ -4924,7 +5219,7 @@ local function iso_undo(sh, ctx)
 		end
 		o.traps, o.sigtraps = sv.traps, sv.sigtraps
 		for _, num in ipairs(untrapped or {}) do -- (the parent's untrapped disposition: the
-			M.sig_untrapped(o, num) -- default — or caught, by a daemon worker or for its EXIT trap)
+			M.sig_untrapped(o, num, true) -- default — or caught, by a daemon worker or for its EXIT trap)
 		end
 		M.exit_trap_inherited, o.err_trap_sp, o.in_exit_trap = sv.inh, sv.esp, sv.inexit
 		o.dbg_trap_sp, o.ret_trap_sp, o.err_trap_ps = sv.dsp, sv.rsp, sv.eps
@@ -5204,10 +5499,29 @@ end
 -- default back at exec, as bash's children do.
 M.TERMSIG = { [1] = true, [2] = true, [4] = true, [5] = true, [6] = true, [7] = true, [8] = true,
 	[10] = true, [11] = true, [12] = true, [13] = true, [14] = true, [15] = true, [24] = true,
-	[25] = true, [31] = true }
+	[25] = true, [26] = true, [31] = true }
+pcall(ffi.cdef, "void curse_preempt_user(int catch_it);")
 -- the disposition of an untrapped signal `num` (trap - SIG, or at startup)
-function M.sig_untrapped(sh, num)
+function M.sig_untrapped(sh, num, was_trapped)
 	local x = sh.traps and sh.traps.EXIT
+	if num == 26 then
+		-- (SIGVTALRM is the job time-slice tick's: its handler stands in for SIG_DFL and
+		-- does what this disposition would with one somebody sends — lib_cursesig.c. Only a
+		-- trap's own handler is taken down: the tick's may be armed right now)
+		local catch = (M.daemon_worker or x) and true or false
+		if was_trapped then
+			C.curse_sig_default(26)
+		end
+		pcall(function()
+			C.curse_preempt_user(catch and 1 or 0)
+		end)
+		if catch and not _G.__curse_sigrun then
+			_G.__curse_sigrun = function(s)
+				require("interp").run_signal(sh, s)
+			end
+		end
+		return
+	end
 	if num == 3 or (M.TERMSIG[num] and (M.daemon_worker or x)) then
 		C.curse_sig_catch(num)
 		if not _G.__curse_sigrun then
@@ -5425,7 +5739,98 @@ end
 -- stack — SIGSEGV — or nests without end; bash UB, not copied: docs/bash-ub.md). The shell
 -- running it — the script, or a subshell / $(…) / job running in-process — stops with this
 -- diagnostic, status 1, as a crashed child would stop alone. Any other error: itself.
+-- ---- deep nesting: function calls, eval, source, subshells, $(…) ---------------------
+-- LuaJIT gives one coroutine at most 65500 stack slots, which an interpreted shell level
+-- (a function call, an eval) spends ~100-160 of: curse stopped with "stack overflow"
+-- 400-700 levels deep, bash (its C stack) near 5500-6800 (stress-attack S10). Each such
+-- level runs through M.nest_pcall: every NEST_HOP levels the rest runs on a fresh
+-- coroutine (a new Lua stack; its yields are passed on, so a pipeline stage's scheduler
+-- still sees them — co_task follows HOP_UP), so the depth is bounded only by
+-- NEST_MAX: one level per 600 bytes of RLIMIT_STACK (8 MiB: 13981 — past where bash's C
+-- stack has overflowed, SIGSEGV, for every kind of recursion: docs/bash-ub.md); none
+-- when the stack is unlimited (memory then bounds it: M.oom).
+do
+local NEST_HOP = 32
+local HOP_UP = setmetatable({}, { __mode = "k" }) -- hop coroutine -> the coroutine it runs for
+M.HOP_UP = HOP_UP
+local NEST_MAX
+local function nest_max()
+	local r = ffi.new("struct curse_rt_rlimit")
+	if C.curse_rt_getrlimit(3, r) ~= 0 or r.cur == ffi.cast("unsigned long", -1) then
+		return math.huge
+	end
+	return math.max(1000, math.floor(tonumber(r.cur) / 600))
+end
+local function hop_body(f, ...)
+	return f(...)
+end
+local cyield, cresume, cstatus = coroutine.yield, coroutine.resume, coroutine.status
+local function hop_forward(co, ok, ...)
+	if cstatus(co) == "dead" then
+		return ok, ...
+	end
+	if not ok then
+		return false, ...
+	end
+	return hop_forward(co, cresume(co, cyield(...)))
+end
+local function hop_pcall(f, ...)
+	local co = coroutine.create(hop_body)
+	HOP_UP[co] = coroutine.running()
+	return hop_forward(co, cresume(co, f, ...))
+end
+function M.nest_pcall(sh, f, ...)
+	local d0 = sh.nest or 0
+	local d = d0 + 1
+	if d > (NEST_MAX or 0) then
+		NEST_MAX = NEST_MAX or nest_max()
+		if d > NEST_MAX then
+			return false, "stack overflow" -- (reported as LuaJIT's own: M.lua_overflow)
+		end
+	end
+	sh.nest = d
+	local ok, e, e2
+	if d % NEST_HOP == 0 then
+		ok, e, e2 = hop_pcall(f, ...)
+	else
+		ok, e, e2 = pcall(f, ...)
+	end
+	sh.nest = d0
+	return ok, e, e2
+end
+-- A compiled call of a compiled shell function (emit's fnwrap sites): the same count and
+-- hops, no pcall of its own (an error unwinds to the nearest nest_pcall, which restores
+-- the count)
+function M.ncall(sh, f)
+	local d0 = sh.nest or 0
+	local d = d0 + 1
+	if d > (NEST_MAX or 0) then
+		NEST_MAX = NEST_MAX or nest_max()
+		if d > NEST_MAX then
+			error("stack overflow", 0)
+		end
+	end
+	sh.nest = d
+	if d % NEST_HOP == 0 then
+		local ok, e = hop_pcall(f, sh)
+		sh.nest = d0
+		if not ok then
+			error(e, 0)
+		end
+	else
+		f(sh)
+		sh.nest = d0
+	end
+end
+-- (a `ulimit -s` changes the bound: bash's stack is the new one)
+function M.nest_reset()
+	NEST_MAX = nil
+end
+end
 function M.lua_overflow(sh, err)
+	if type(err) == "string" and err:find("not enough memory$") then
+		return M.oom(sh)
+	end
 	if type(err) ~= "string" or not err:find("stack overflow$") then
 		return err
 	end
@@ -5435,9 +5840,33 @@ function M.lua_overflow(sh, err)
 	sh.force_line = fl
 	return { __curse_exit = 1 }
 end
+-- Out of memory (LuaJIT's LUA_ERRMEM, once the failed work has unwound): bash's xmalloc /
+-- xrealloc failure — fatal_error, `NAME: xmalloc: cannot allocate N bytes` (no line), and
+-- sh_exit(2): that shell (a subshell: only it) ends with status 2, no EXIT trap
+-- (stress-attack S18). N is bash's own request size, which curse's allocator doesn't
+-- have: it reports the heap it held (docs/bash-ub.md).
+function M.oom(sh)
+	local held = math.floor(collectgarbage("count") * 1024)
+	collectgarbage()
+	local ok, name = pcall(M.err_where, sh)
+	pcall(function()
+		io.stderr:write((ok and name or "bash") .. ": xmalloc: cannot allocate " .. held .. " bytes\n")
+	end)
+	if not M.iso_cur(sh) and not M.co_task() then
+		-- the shell itself: exit(2) now — its variables still fill the heap, and going on
+		-- (the exit path, the EXIT trap) would run out again (a daemon worker: the request)
+		pcall(io.flush)
+		if M.daemon_worker and M.daemon_fatal then
+			M.daemon_fatal(2)
+		end
+		C._exit(2)
+	end
+	return { __curse_exit = 2, __curse_noexittrap = true }
+end
 function Shell:subshell_run(runner, saves, paren, inplace)
 	-- (signals are held from here until the context is pushed, which holds them itself:
 	-- a trap run meanwhile would change the checkpointed state, dropped at the end)
+	local nsp0 = M.nspawn
 	cap_enter()
 	local s1, s2, s3, s4, s5, s6, s7, s8, s9 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
@@ -5472,7 +5901,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	if self.pstage and up0 and up0.task and up0.task == co_task() then
 		ctx.task_proc = up0.task
 	end
-	local ok, err = pcall(runner, self)
+	local ok, err = M.nest_pcall(self, runner, self)
 	local status = self.status
 	local rethrow, killed
 	if not ok then
@@ -5544,6 +5973,10 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	end
 	if rethrow then error(rethrow) end
 	self.status = status
+	if paren and not self.pstage then -- (a pipeline stage's own `( … )` is the stage: counted there)
+		M.sim_chld(self, nsp0)
+		self.status = status
+	end
 end
 
 -- $BASH_SUBSHELL for a pipeline stage (bash): a `( … )` stage counts once (its own
@@ -5623,6 +6056,7 @@ end
 -- in_subprogram, cur_line, trailing-newline/NUL strip, exit/return→status); the heavy
 -- checkpoint wraps it. Returns the captured string.
 function Shell:capture_compiled_iso(cs_fn, backtick)
+	local nsp0 = M.nspawn
 	cap_enter() -- (held until the context is pushed: see subshell_run)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	local sv_foreign = self.foreign_pids
@@ -5640,6 +6074,9 @@ function Shell:capture_compiled_iso(cs_fn, backtick)
 	if not ok then
 		error(out, 0)
 	end
+	local stc = self.status
+	M.sim_chld(self, nsp0)
+	self.status = stc
 	return out
 end
 
@@ -5817,6 +6254,22 @@ end
 -- The shell keeps one end of each of the two pipes: NAME=(read-fd write-fd), NAME_PID.
 -- Like bash, each pipe end first moves to the highest FREE fd below 64 (move_to_high_fd),
 -- so a lone coproc is `63 60` (the read pipe takes 63/62, the write pipe 61/60).
+-- A process substitution's fd: bash moves it to 63 and down (move_to_high_fd) — unless the
+-- open-files limit is below 64, when it stays the lowest free one (from 3)
+function M.procsub_fd(sh, fd)
+	local L = M.nofile_limit(sh)
+	if L and L < 64 then
+		local d = C.curse_co_fcntl3(fd, 0, 3) -- F_DUPFD
+		if d >= 0 and d < L then
+			C.close(fd)
+			return d
+		end
+		if d >= 0 then
+			C.close(d)
+		end
+	end
+	return M.fd_below(fd, 64)
+end
 function M.fd_below(fd, lim)
 	for t = lim - 1, 10, -1 do
 		if C.curse_co_fcntl3(t, 1, 0) < 0 and C.dup2(fd, t) == t then -- F_GETFD fails: free
@@ -6853,9 +7306,14 @@ end
 -- pushParams, so a stage gets fresh ones.
 function Shell:stage_clone()
 	local c = setmetatable({}, getmetatable(self))
+	-- (no trap may run in the middle of the copy: one that adds a field to the shell — its
+	-- wait_sig, a counter — makes pairs' traversal skip keys, and the clone came out without
+	-- its `traps` — the stage's iso_undo then indexed nil (leftovers P3, under a signal storm))
+	cap_enter()
 	for k, v in pairs(self) do
 		c[k] = type(v) == "table" and shallowcopy(v) or v
 	end
+	cap_leave()
 	c.subdepth = (self.subdepth or 0) + 1 -- (a stage is a subshell)
 	c.clone_parent, c.clone_gen = self, M.fd_gen -- (the fds it inherits: M.fd_register)
 	c.subenv = true -- (subshell_environment, even where $BASH_SUBSHELL doesn't count it)
@@ -6880,6 +7338,7 @@ function Shell:stage_clone()
 	c.paren_sp = nil -- (a stage is a subshell of its own, not the `( … )` it may sit in)
 	c.loopdepth = 0
 	c.capturing = nil
+	flush_deferred(self) -- (a trap held during the copy runs now)
 	return c
 end
 local function env_copy(envp)
@@ -7306,6 +7765,9 @@ local function co_resume(ctx, t)
 			co_cl(ctx, fd)
 		end
 		g.alive = g.alive - 1
+		if not g.bg and not t.spawned and t ~= g.lp then -- (a stage bash would have forked)
+			g.simchld = (g.simchld or 0) + 1
+		end
 		if g.alive == 0 and g.bg then -- a background job ended: its starting fds go too
 			fds_release(ctx, g.base.fd, 0, 9)
 			g.done = true
@@ -7315,7 +7777,7 @@ local function co_resume(ctx, t)
 			-- (a forked job's death is a SIGCHLD: its CHLD trap runs — here, unless a real
 			-- child it ran already sent one)
 			local ow = g.launcher
-			if ow and ow.sigtraps and ow.sigtraps.SIGCHLD and ow.traps.SIGCHLD ~= "" and M.nspawn == g.nspawn0 then
+			if ow and ow.sigtraps and ow.sigtraps.SIGCHLD and ow.traps.SIGCHLD ~= "" and not t.spawned then
 				C.kill(C.getpid(), 17)
 			end
 		end
@@ -7586,6 +8048,11 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	end
 	M.raise_task_held() -- (a signal that came while a stage ran: the shell's — held by
 	-- the caller until the pipeline is done: fg_hold_enter)
+	if g and g.simchld then
+		local st = self.status
+		M.sim_chld(self, nil, g.simchld)
+		self.status = st
+	end
 	return g ~= nil or nil
 end
 
@@ -7736,6 +8203,27 @@ function M.procsub_waitall(sh, intr)
 end
 -- Run every background job to its end (the script is over; bash would leave them
 -- running — in-process they must finish before this process can).
+-- The script is over but in-process background jobs still run: bash's shell would exit at
+-- once, its jobs (processes of their own) going on — the caller sees the status now and a
+-- job may wait for what the caller does next (stress-attack S6: `sh -c '(…) & exit 7'`
+-- waited for the job). The shell forks ONCE here: the parent exits with the status, the
+-- child runs the jobs to their end (M.sched_drain) and exits quietly. (A daemon worker
+-- replies first and drains after: daemon.lua.)
+function M.fork_at_exit(sh)
+	if M.daemon_worker or CO or not sched_live() or M.tasks_all_stuck() then
+		return
+	end
+	real_flush()
+	io.stderr:flush()
+	pid_cache = pid_cache or tonumber(C.getpid()) -- ($$ stays the shell's in its jobs)
+	local pid = C.fork()
+	if pid > 0 then
+		C._exit((sh and sh.status or 0) % 256)
+	elseif pid == 0 then
+		M.exit_trap_inherited = true -- (its EXIT trap ran in the shell: never again here)
+	end
+	-- (fork failed: the shell drains the jobs itself, as before)
+end
 function M.sched_drain(sh)
 	M.jobs_exit_hangup(sh or M.cur_shell)
 	if sched_live() and not CO then
@@ -8384,6 +8872,29 @@ end
 -- also in a trap handler that runs at the top level (return.def: no return_catch_flag)
 -- An array literal element's fields (a word the compiled engine can't render) from the
 -- shared one-word expander, as {val=…} items for rt.arrayassign_stmt
+-- A huge brace word (parser bxlazy) as its command runs: every word it makes, expanded
+-- (split, globbed) — or, under `set +B`, the raw word alone
+-- (elem: an array literal's element — its words as the literal's own)
+function M.brace_fields(sh, raw, plainarg, elem)
+	local P = require("parser")
+	local pw = P.parse_word(raw)
+	local w = { k = pw.k, parts = pw.parts, src = raw, plain = pw.plain, bxlazy = raw, plainarg = plainarg or nil }
+	local I = require("interp")
+	local out = {}
+	local ws
+	if elem and sh.opt_B ~= false then
+		ws = P.brace_elem_words(raw)
+	else
+		ws = P.brace_words({ w, bxlazy = true }, sh.opt_B)
+	end
+	for _, bw in ipairs(ws) do
+		local fs = I.expand_to_fields(sh, bw.bxlazy and pw or bw)
+		for k = 1, #fs do
+			out[#out + 1] = fs[k]
+		end
+	end
+	return out
+end
 function M.aa_fields(sh, w, into)
 	local fs = require("interp").expand_to_fields(sh, w)
 	for k = 1, #fs do
@@ -9134,6 +9645,10 @@ end
 -- whose file then fails ENOENT is named by its PATH (bash: the hashed file is gone, or
 -- — the file exists — its interpreter is: "cannot execute: required file not found").
 function M.spawn_errmsg(self, name, execpath, rc)
+	if rc == 11 then -- (no process to be had, after bash's retries: make_child's sys_error)
+		M.nofork_msg(self, false)
+		return ""
+	end
 	local pre = "curse: " .. (self.exec_builtin and "exec: " or "")
 	if rc == 2 and not self.exec_builtin and execpath then
 		-- (shell_execve's file_error / internal_error name the file as it is — only a
@@ -15783,7 +16298,16 @@ function M.ansi_unescape(s, mode) -- ("z": as $'…', but kept whole past a \0)
 	return r
 end
 
-function Shell:echo(...)
+-- A builtin's output line (declare -p, alias, cd, help, …), printed as is: bash's builtins
+-- print with printf/puts, never through echo — under `shopt -s xpg_echo` a backslash in a
+-- value must not be taken as an escape, nor a leading `-n` as an option (fuzz F123/F124).
+function Shell:echo(s)
+	self.out(s == nil and "" or tostring(s))
+	return self:echo_end(false, false)
+end
+
+-- The `echo` builtin (compiled call sites, through Shell:echo_cmd).
+function Shell:echo_b(...)
 	-- echo [-neE] ARGS: -n suppresses the trailing newline, -e interprets backslash
 	-- escapes, -E disables them (bash). Same flag handling as the interp echo builtin,
 	-- so compiled and interpreted echo agree.
@@ -15828,6 +16352,10 @@ function Shell:echo(...)
 		s, stopped = M.ansi_unescape(s)
 	end -- \c stops all output (incl. the newline)
 	self.out(s)
+	return self:echo_end(nonl, stopped)
+end
+
+function Shell:echo_end(nonl, stopped)
 	if not nonl and not stopped then
 		self.out("\n")
 	end
@@ -15899,7 +16427,7 @@ end
 -- of a failed write. (Other builtins print through Shell:echo silently.)
 function Shell:echo_cmd(...)
 	self.write_err = nil
-	self:echo(...)
+	self:echo_b(...)
 	if self.write_err and (self.out == io.write or CO_OUTS[self.out]) then
 		self.status = 1
 		M.chkwrite_report(self, "echo", self.write_errmsg)
@@ -17118,7 +17646,9 @@ function M.int_value(sh, s, ev)
 	if short_digits(s) and (s:byte(1) ~= 48 or #s == 1) then -- (010 is octal)
 		return M.arith_num(s)
 	end
-	local ok, v = pcall(ev or M.arith_str, sh, s)
+	-- (the value is expansion output: a `$`/`` ` `` in it is a bad token, never expanded
+	-- again — `declare -i n; n='1+${x}'` is bash's `operand expected`)
+	local ok, v = pcall((s:find("[$`]") and require("interp").arith_expanded_eval) or ev or M.arith_str, sh, s)
 	if ok then
 		return v
 	end
@@ -18135,6 +18665,19 @@ function M.funcnest_over(sh, name)
 end
 -- One word's value in assignment context (no splitting, no globbing) through the shared
 -- word expander — for an array element the compiled renderers can't express natively.
+-- run f with a bad substitution naming `text` (the whole word bash expands; false: as is)
+function M.with_bs_word(sh, text, f)
+	if not text then
+		return f()
+	end
+	local sw, sd = sh.bs_word, sh.bs_depth
+	sh.bs_word, sh.bs_depth = text, sh.subdepth
+	local ok, e = pcall(f)
+	sh.bs_word, sh.bs_depth = sw, sd
+	if not ok then
+		error(e, 0)
+	end
+end
 function M.assign_elem(sh, w)
 	return require("interp").expand_assign_word(sh, w)
 end

@@ -18,10 +18,14 @@ f=${TMPDIR:-/tmp}/ss.$$; mkfifo "$f"
 p=$!
 "$STH" sendwhen $p 15 5000 any || { echo "  could not signal \$! from an external"; kill -KILL $p; }
 wait $p; echo "TERM while blocked: st=$?"
-"$S" -c 'trap "echo \"  TERM trap, exiting\"; exit 9" TERM; exec 3<>"$1"; read -r x <&3; echo "read returned $?"' _ "$f" &
+# (the script says when its trap is set: through the daemon $! is the CLIENT, blocked from
+# the start — sendwhen alone let the TERM land before the worker had run `trap`: 143, not 9)
+"$S" -c 'trap "echo \"  TERM trap, exiting\"; exit 9" TERM; : > "$1.ready"; exec 3<>"$1"; read -r x <&3; echo "read returned $?"' _ "$f" &
 p=$!
+SECONDS=0; until [ -e "$f.ready" ] || ((SECONDS >= 5)); do sleep 0.01; done
 "$STH" sendwhen $p 15 5000 any || { echo "  could not signal \$! from an external"; kill -KILL $p; }
 wait $p; echo "trapped TERM while blocked: st=$?"
+rm -f "$f.ready"
 rm -f "$f"
 echo "-- a pipeline's statuses when a stage dies of a signal"
 "$S" -c 'kill -TERM $$' | cat; echo "PIPESTATUS=${PIPESTATUS[*]}"

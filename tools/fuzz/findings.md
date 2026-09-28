@@ -1278,7 +1278,7 @@ third candidate from this same batch, an ambiguous-redirect error on a backgroun
 losing its `line N:` prefix, turned out to already be fixed by that merge's
 2766-compound-redirect-error-line.sh and was dropped).
 
-## F119. Compiled tier: a `for`/`select` loop assigning into a readonly special variable bypasses the readonly check and overwrites it
+## F119. FIXED — Compiled tier: a `for`/`select` loop assigning into a readonly special variable bypasses the readonly check and overwrites it
 
     old=$UID
     for UID in a b
@@ -1295,7 +1295,7 @@ losing its `line N:` prefix, turned out to already be fixed by that merge's
   `for`/`select` list (not just a special one) escapes detection entirely and corrupts it.
   (gram:compiled queue; not touched by the for-loop line-attribution fixes in F62/F69/F79.)
 
-## F120. `(( ${} ))`: bash's bad-substitution message keeps the subexpression's surrounding whitespace, curse trims it
+## F120. FIXED — `(( ${} ))`: bash's bad-substitution message keeps the subexpression's surrounding whitespace, curse trims it
 
     (( ${} ))
 
@@ -1308,7 +1308,7 @@ losing its `line N:` prefix, turned out to already be fixed by that merge's
 
 ## Campaign 2 (gram:tiers + gram:parse, containerized), branch fuzz-night
 
-## F121. Compiled tier: after an `eval`'d `trap ... ERR` sets a variable to `!`, using it unquoted as a command word runs the rest of the line as a negated pipeline instead of trying to execute a program named `!`
+## F121. FIXED — Compiled tier: after an `eval`'d `trap ... ERR` sets a variable to `!`, using it unquoted as a command word runs the rest of the line as a negated pipeline instead of trying to execute a program named `!`
 
     eval "trap \"v='!'\" ERR"
     false
@@ -1333,7 +1333,7 @@ Both targeted fuzzers (persistent AFL loop over curse's own forkserver child, RE
 the campaign brief's fork-per-input verification requirement, since `FUZZ_TLOOP=1` isn't
 wired through `docker/run.sh`'s env passthrough.
 
-## F122. `${name[*]@A}` / `${name[@]@A}` on a plain scalar: bash uses the light `${@Q}`-style quoting, curse uses full `declare -p` output
+## F122. FIXED — `${name[*]@A}` / `${name[@]@A}` on a plain scalar: bash uses the light `${@Q}`-style quoting, curse uses full `declare -p` output
 
     w='hello world'
     echo "${w[*]@A}"
@@ -1353,7 +1353,7 @@ wired through `docker/run.sh`'s env passthrough.
 
 ## Campaign 4 (gram:glob + gram:regex, containerized), branch fuzz-night
 
-## F123. `BASH_REMATCH`'s `declare -p` drops one level of backslash-escaping for a captured value ending in a literal backslash
+## F123. FIXED — `BASH_REMATCH`'s `declare -p` drops one level of backslash-escaping for a captured value ending in a literal backslash
 
     shopt -s nocasematch xpg_echo
     s=$'x\x5c'
@@ -1376,7 +1376,7 @@ wired through `docker/run.sh`'s env passthrough.
 
 ## Campaign 5 (gram:read + gram:printf, containerized, 18 min), branch fuzz-night
 
-## F124. `declare -p` of a `read`/`printf -v`-assigned value under-escapes embedded backslashes by one level (same family as F123)
+## F124. FIXED — `declare -p` of a `read`/`printf -v`-assigned value under-escapes embedded backslashes by one level (same family as F123)
 
     #@ xpg_echo nopatsub
     =:,
@@ -1404,3 +1404,24 @@ line as `ARG`, then `declare -p __v`.)
   `printf -v v %s $'a\\'`) did *not* reproduce with only one trailing backslash, so the
   exact trigger (more than one backslash? a specific `read`/`printf` option combination?)
   needs a further session; not reduced outside the harness for lack of time.
+
+## Fixes (branch fix-s2)
+
+- F119 FIXED — the compiled tier's attribute scan (emit makes_attr) now counts a `for`/`select`
+  variable or a `for ((…))` slot naming one of bash's own readonly variables (UID, EUID, PPID,
+  …), so the loop takes the readonly-checking assignment; a `for ((R = …))` init on a readonly
+  variable ends only that loop (arith_can_error). test/cases/3360-for-readonly-special-var.sh
+- F120 FIXED — a bad substitution in arithmetic names the whole expression text (the ${…}
+  leaf carries it: bash expands the text as one word); a for (( )) slot drops only its
+  leading blanks; an indexed `[k]=v` element names `\[k\]=v`; a subscript's expansion error is
+  not reported again as a syntax error; an integer variable's value is never expanded again
+  (`declare -i n; n='1+${x}'`: operand expected). test/cases/3361-arith-bad-substitution-text.sh
+- F121 FIXED — the root was not `!`: the compiled tier hooked ERR/DEBUG only for traps named
+  in the program's text, so `eval "trap … ERR"` never fired (`v` stayed unset and `$v echo hi`
+  ran echo). eval/source code, or a signal name in any literal text, now turns the hooks on,
+  and a literal eval's trap is scanned for lifted variables. test/cases/3364-eval-sets-err-debug-trap.sh
+- F122 FIXED — `${w[@]@A}` on a scalar is `${w@A}`. test/cases/3362-scalar-array-subscript-at-A.sh
+- F123, F124 FIXED — the common root was `shopt -s xpg_echo`: builtins printed their listings
+  through the echo builtin's code (Shell:echo), which then took `\\` as an escape; they now print
+  lines as they are. test/cases/3363-builtin-output-xpg-echo.sh
+

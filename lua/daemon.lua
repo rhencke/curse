@@ -310,11 +310,14 @@ local function serve_request(cfd, req, fds, ctx)
 	C.clearerr(C.stdin)
 	-- the caller's other inherited fds go back to their own numbers (`cmd 3<&0`): park
 	-- each received copy clear of the targets first, so none overwrites another
-	local parked = {}
+	local parked, base = {}, 64
+	for _, target in ipairs(req.extra or {}) do
+		base = math.max(base, target + 1)
+	end
 	for i, target in ipairs(req.extra or {}) do
 		local f = fds[3 + i]
 		if f then
-			parked[i] = C.fcntl(f, F_DUPFD_CLOEXEC, ffi.new("int", 64))
+			parked[i] = C.fcntl(f, F_DUPFD_CLOEXEC, ffi.new("int", base))
 		end
 	end
 	for _, f in ipairs(fds) do
@@ -371,6 +374,15 @@ local function serve_request(cfd, req, fds, ctx)
 	-- the request, rt.termsig, and must be caught there, not kill the worker)
 	-- A Lua error escaping the run is a curse BUG: report it on the request's stderr
 	-- (status 1) instead of failing silently.
+	-- (out of memory in the request's shell itself — rt.oom: its heap is still full, so no
+	-- unwinding: the status goes to the client now, and this worker ends; the parent
+	-- replaces it)
+	rt.daemon_fatal = function(status)
+		pcall(io.flush)
+		ctx.busy[ctx.slot] = -1
+		C.write(cfd, ffi.new("int32_t[1]", status), 4)
+		C._exit(1)
+	end
 	local ok, xerr = xpcall(function()
 		C.write(cfd, ffi.new("int32_t[1]", -ctx.worker_pid), 4)
 		-- the invocation (options, $0/params, startup files, the script): shared with run.lua
@@ -591,7 +603,7 @@ local function worker_main(lfd, my_uid, ctx, slot)
 	end
 	collectgarbage("collect")
 	local iobuf = ffi.new("char[?]", 65536)
-	local ctrl = ffi.new("char[512]") -- (fds 0,1,2 + up to 64 inherited extras)
+	local ctrl = ffi.new("char[4096]") -- (fds 0,1,2 + inherited extras: up to 253 a message)
 	local cred = ffi.new("struct curse_ucred[1]")
 	local credlen = ffi.new("unsigned int[1]")
 	local served = 0
@@ -643,23 +655,39 @@ local function worker_main(lfd, my_uid, ctx, slot)
 				msg[0].iov = iov
 				msg[0].iovlen = 1
 				msg[0].control = ctrl
-				msg[0].controllen = 512
+				msg[0].controllen = 4096
 				local n = tonumber(C.recvmsg(cfd, msg, 0))
 				if n <= 0 then
 					C.close(cfd)
 				else
 					local fds = {}
-					local clen = tonumber(ffi.cast("unsigned long *", ctrl)[0])
-					local level = ffi.cast("int *", ctrl + 8)[0]
-					local ctype = ffi.cast("int *", ctrl + 12)[0]
-					if level == SOL_SOCKET and ctype == SCM_RIGHTS then
-						local nfds = math.floor((clen - 16) / 4)
-						local fdp = ffi.cast("int *", ctrl + 16)
-						for i = 0, nfds - 1 do
-							fds[i + 1] = fdp[i]
+					local function take_fds()
+						if tonumber(msg[0].controllen) < 16 then
+							return
+						end
+						local clen = tonumber(ffi.cast("unsigned long *", ctrl)[0])
+						local level = ffi.cast("int *", ctrl + 8)[0]
+						local ctype = ffi.cast("int *", ctrl + 12)[0]
+						if level == SOL_SOCKET and ctype == SCM_RIGHTS then
+							local nfds = math.floor((clen - 16) / 4)
+							local fdp = ffi.cast("int *", ctrl + 16)
+							for i = 0, nfds - 1 do
+								fds[#fds + 1] = fdp[i]
+							end
 						end
 					end
+					take_fds()
 					local req = parse_request(ffi.string(iobuf, n))
+					-- (more inherited fds than one message holds: the rest follow, 1 byte each)
+					while req and #fds < 3 + #req.extra do
+						iov[0].len = 1
+						msg[0].controllen = 4096
+						if tonumber(C.recvmsg(cfd, msg, 0)) ~= 1 then
+							break
+						end
+						take_fds()
+					end
+					iov[0].len = 65536
 					if not req then
 						for _, f in ipairs(fds) do
 							C.close(f)

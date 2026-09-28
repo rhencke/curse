@@ -105,6 +105,29 @@ return function(sh, cmd, args, hook, tcb)
 			if r[1] < 0 or C.getrlimit(r[1], rl) ~= 0 then
 				return false
 			end
+			if r[1] == 7 then -- open files: virtual (the shell's own fds need headroom): rt.nofile_limit
+				local curS = rt.iso_vsoft(sh, 7) or rl[0].rlim_cur
+				local curH = rt.iso_vhard(sh, 7) or rl[0].rlim_max
+				local newS, newH = setsoft and nv or curS, sethard and nv or curH
+				local e
+				if sethard and newH > curH and C.geteuid() ~= 0 then
+					e = 1 -- EPERM
+				elseif newS > newH then
+					e = 22 -- EINVAL
+				end
+				if e then
+					io.stderr:write("curse: ulimit: " .. r[3] .. ": cannot modify limit: "
+						.. ffi.string(C.strerror(e)) .. "\n")
+					return false
+				end
+				local vctx = rt.iso_cur(sh) and rt.iso_save_rlimits(sh)
+				if vctx then
+					vctx.vsoft[7], vctx.vhard[7] = newS, newH
+				else
+					sh.vnofile = { s = newS, h = newH }
+				end
+				return true
+			end
 			-- in an in-process subshell a hard limit stays virtual (lowering the real one
 			-- could never be undone); the soft limit is real, within it
 			local ctx = rt.iso_cur(sh) and rt.iso_save_rlimits(sh)
@@ -145,6 +168,9 @@ return function(sh, cmd, args, hook, tcb)
 				io.stderr:write("curse: ulimit: " .. r[3] .. ": cannot modify limit: "
 					.. ffi.string(C.strerror(err)) .. "\n")
 				return false
+			end
+			if r[1] == 3 then -- (RLIMIT_STACK bounds the nesting depth: rt.nest_pcall)
+				rt.nest_reset()
 			end
 			if ctx and sethard then
 				ctx.vhard[r[1]] = nv

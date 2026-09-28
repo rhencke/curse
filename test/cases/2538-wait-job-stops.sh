@@ -14,7 +14,9 @@ kill -KILL %1; wait %1 2>/dev/null
 /bin/sh -c 'echo $$ > '"$d"'/p2; exec /bin/sleep 5' &
 stopper p2
 wait; echo "wait: $?"
-kill -KILL %?p2 2>/dev/null; wait 2>/dev/null
+# (waited for by name: a plain `wait` skips a stopped job, and bash's report of its death then
+# came with whichever command its SIGCHLD arrived at — line 22 or 23, run to run)
+kill -KILL %?p2 2>/dev/null; wait %?p2 2>/dev/null; wait 2>/dev/null
 echo "-- an async child has no jobs"
 /bin/sleep 0.3 &
 { echo "[$(jobs)]"; kill %1 2>/dev/null; echo "kill: $?"; wait %1 2>/dev/null; echo "wait: $?"; } &

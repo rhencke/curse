@@ -27,6 +27,7 @@
 #include <sys/un.h>
 #include <signal.h>
 #include <stdint.h>
+#include <dirent.h>
 
 /* The protocol: its version is in the socket's NAME (curse-v2.sock: a client and a daemon
  * of different versions never meet — the client finds no daemon and falls back) and in the
@@ -189,14 +190,32 @@ int main(int argc, char **argv, char **envp) {
             sigign |= 1u << (s - 1);
     }
     off = put_u32(buf, off, cap, sigign);
-    /* Trailer: the other fds the script inherits (3..63, open and not close-on-exec, not
-     * our own socket) — `cmd 3<&0` must see fd 3 — sent after 0,1,2 with their numbers. */
-    int extra[64];
+    /* Trailer: the other fds the script inherits (every one open and not close-on-exec,
+     * but our own socket — below the worker's own fds, FD_LIMIT) — `cmd 3<&0`, `>&70`
+     * must see them — sent after 0,1,2 with their numbers: the first FIRST_MAX with the
+     * request, the rest in 1-byte messages of SCM_MAX_FD fds each. */
+    enum { FD_LIMIT = 4096, FIRST_MAX = 250, CHUNK = 253 };
+    static int extra[FD_LIMIT];
     int nextra = 0;
-    for (int f = 3; f < 64; f++) {
-        if (f == fd) continue;
-        int fl = fcntl(f, F_GETFD);
-        if (fl >= 0 && !(fl & FD_CLOEXEC)) extra[nextra++] = f;
+    int dfd = open("/proc/self/fd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    DIR *d = dfd >= 0 ? fdopendir(dfd) : NULL;
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            char *end;
+            long f = strtol(de->d_name, &end, 10);
+            if (*end || end == de->d_name || f < 3 || f >= FD_LIMIT || f == fd || f == dfd) continue;
+            int fl = fcntl((int)f, F_GETFD);
+            if (fl >= 0 && !(fl & FD_CLOEXEC)) extra[nextra++] = (int)f;
+        }
+        closedir(d);
+    } else {
+        if (dfd >= 0) close(dfd);
+        for (int f = 3; f < 1024; f++) {
+            if (f == fd) continue;
+            int fl = fcntl(f, F_GETFD);
+            if (fl >= 0 && !(fl & FD_CLOEXEC)) extra[nextra++] = f;
+        }
     }
     off = put_u32(buf, off, cap, (uint32_t)nextra);
     for (int i = 0; i < nextra && off >= 0; i++)
@@ -204,9 +223,10 @@ int main(int argc, char **argv, char **envp) {
     if (off < 0) { close(fd); fallback(argv); } /* request too big -> run directly */
 
     /* Send the request with fds 0,1,2 (then the extras) attached as SCM_RIGHTS data. */
+    int nfirst = nextra < FIRST_MAX ? nextra : FIRST_MAX;
     struct iovec iov = { buf, (size_t)off };
     union {
-        char b[CMSG_SPACE(67 * sizeof(int))];
+        char b[CMSG_SPACE(CHUNK * sizeof(int))];
         struct cmsghdr align;
     } ctrl;
     memset(&ctrl, 0, sizeof ctrl);
@@ -215,17 +235,30 @@ int main(int argc, char **argv, char **envp) {
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
     msg.msg_control = ctrl.b;
-    msg.msg_controllen = CMSG_SPACE((3 + nextra) * sizeof(int));
+    msg.msg_controllen = CMSG_SPACE((3 + nfirst) * sizeof(int));
     struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
     cm->cmsg_level = SOL_SOCKET;
     cm->cmsg_type = SCM_RIGHTS;
-    cm->cmsg_len = CMSG_LEN((3 + nextra) * sizeof(int));
-    int passfds[67] = { 0, 1, 2 };
-    for (int i = 0; i < nextra; i++) passfds[3 + i] = extra[i];
-    memcpy(CMSG_DATA(cm), passfds, (3 + nextra) * sizeof(int));
+    cm->cmsg_len = CMSG_LEN((3 + nfirst) * sizeof(int));
+    int passfds[CHUNK] = { 0, 1, 2 };
+    for (int i = 0; i < nfirst; i++) passfds[3 + i] = extra[i];
+    memcpy(CMSG_DATA(cm), passfds, (3 + nfirst) * sizeof(int));
 
     fwd_install(sigign);
     if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) { close(fd); fwd_fallback(argv); }
+    for (int i = nfirst; i < nextra; i += CHUNK) { /* the rest of the extras */
+        int k = nextra - i < CHUNK ? nextra - i : CHUNK;
+        char one = '+';
+        struct iovec iov1 = { &one, 1 };
+        msg.msg_iov = &iov1;
+        msg.msg_controllen = CMSG_SPACE(k * sizeof(int));
+        cm = CMSG_FIRSTHDR(&msg);
+        cm->cmsg_level = SOL_SOCKET;
+        cm->cmsg_type = SCM_RIGHTS;
+        cm->cmsg_len = CMSG_LEN(k * sizeof(int));
+        memcpy(CMSG_DATA(cm), extra + i, k * sizeof(int));
+        if (sendmsg(fd, &msg, MSG_NOSIGNAL) < 0) break; /* (the worker gets fewer: as before) */
+    }
 
     /* Read the worker's pid (a negative int32), then the exit status (int32). If the
      * daemon closes before the pid, the request never started: run it directly. If it

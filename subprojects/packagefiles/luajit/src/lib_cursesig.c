@@ -367,11 +367,50 @@ void curse_sig_hold(int hold)
  * running trace's loop head to force the exit (as a trap signal does). SA_RESTART:
  * the tick must not EINTR the job's syscalls. */
 static volatile int curse_preempt_flag;
+/* A SIGVTALRM somebody SENT (kill, sigqueue, tgkill -- not the slice timer) is the
+ * script's own: while the tick's handler stands in for SIG_DFL it does what the shell's
+ * disposition would -- the default action (the process dies of it: bash's "Virtual timer
+ * expired", 154), or (curse_preempt_user(1): a daemon worker, or a shell with an EXIT
+ * trap, which catch the terminating signals) curse's handler, whose Lua side ends the
+ * shell (rt.termsig). The tick's handler used to swallow it (stress-attack S3). */
+static volatile int curse_preempt_catch;
+static void curse_preempt_onsignal(int s, siginfo_t *si, void *uc);
 
-static void curse_preempt_onsignal(int s)
+void curse_preempt_user(int catch_it)
 {
-  (void)s;
+  curse_preempt_catch = catch_it;
+  if (catch_it) {  /* (caught from now on, slices or not: the handler goes in over SIG_DFL) */
+    struct sigaction cur;
+    if (sigaction(SIGVTALRM, (struct sigaction *)0, &cur) == 0 && cur.sa_handler == SIG_DFL) {
+      struct sigaction sa;
+      memset(&sa, 0, sizeof sa);
+      sa.sa_sigaction = curse_preempt_onsignal;
+      sigemptyset(&sa.sa_mask);
+      sa.sa_flags = SA_RESTART | SA_SIGINFO;
+      sigaction(SIGVTALRM, &sa, (struct sigaction *)0);
+    }
+  }
+}
+
+static void curse_preempt_onsignal(int s, siginfo_t *si, void *uc)
+{
   if (curse_sig_down) return;
+  if (si && (si->si_code == SI_USER || si->si_code == SI_QUEUE || si->si_code == SI_TKILL)) {
+    if (curse_preempt_catch) {
+      curse_sig_onsignal(s, si, uc);
+    } else {
+      struct sigaction sa;
+      sigset_t one;
+      memset(&sa, 0, sizeof sa);
+      sa.sa_handler = SIG_DFL;
+      sigaction(s, &sa, (struct sigaction *)0);
+      sigemptyset(&one);
+      sigaddset(&one, s);
+      sigprocmask(SIG_UNBLOCK, &one, (sigset_t *)0);
+      raise(s);
+    }
+    return;
+  }
   curse_preempt_flag = 1;
 #ifdef CURSE_SIG_DESTRUCTIVE
   /* Only the running loop's head: the flag is re-read at every loop head,
@@ -398,13 +437,13 @@ int curse_preempt_arm(long usec)
   if (usec > 0) {
     struct sigaction cur;
     if (sigaction(SIGVTALRM, (struct sigaction *)0, &cur) != 0) return -1;
-    if (cur.sa_handler != curse_preempt_onsignal) {
+    if (cur.sa_sigaction != curse_preempt_onsignal) {
       struct sigaction sa;
       if (cur.sa_handler != SIG_DFL) return -1;
       memset(&sa, 0, sizeof sa);
-      sa.sa_handler = curse_preempt_onsignal;
+      sa.sa_sigaction = curse_preempt_onsignal;
       sigemptyset(&sa.sa_mask);
-      sa.sa_flags = SA_RESTART;
+      sa.sa_flags = SA_RESTART | SA_SIGINFO;
       if (sigaction(SIGVTALRM, &sa, (struct sigaction *)0) != 0) return -1;
     }
   }

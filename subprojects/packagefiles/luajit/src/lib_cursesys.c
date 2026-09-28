@@ -32,6 +32,7 @@ extern char curse_held_takeall[];
 extern char curse_ldfmt[];
 extern char curse_preempt_arm[];
 extern char curse_preempt_flagp[];
+extern char curse_preempt_user[];
 extern char curse_sig_catch[];
 extern char curse_sig_clearpending[];
 extern char curse_sig_default[];
@@ -190,6 +191,7 @@ static const curse_sym_t curse_syms[] = {
   { "curse_ldfmt", (void*)curse_ldfmt },
   { "curse_preempt_arm", (void*)curse_preempt_arm },
   { "curse_preempt_flagp", (void*)curse_preempt_flagp },
+  { "curse_preempt_user", (void*)curse_preempt_user },
   { "curse_sig_catch", (void*)curse_sig_catch },
   { "curse_sig_clearpending", (void*)curse_sig_clearpending },
   { "curse_sig_default", (void*)curse_sig_default },

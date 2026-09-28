@@ -917,7 +917,18 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 			if e > k and (nx == "(" or c == "`") then -- (a body numbers its lines from the
 				sh.cur_cline = rt.compiled_line(sh) or sh.cur_cline -- compiled caller's: rt.compiled_line)
 			end
-			local v = e > k and expand_word(sh, P.reword('"' .. chunk .. '"')) or chunk
+			local v = chunk
+			if e > k then -- (a bad substitution names the whole text, spaces kept: bash
+				-- expands it as ONE word — `(( ${} ))` is ` ${} : bad substitution`, fuzz F120)
+				local sw, sd = sh.bs_word, sh.bs_depth
+				sh.bs_word, sh.bs_depth = raw, sh.subdepth
+				local ok2, x2 = pcall(expand_word, sh, P.reword('"' .. chunk .. '"'))
+				sh.bs_word, sh.bs_depth = sw, sd
+				if not ok2 then
+					error(x2, 0)
+				end
+				v = x2
+			end
 			if e == k and c == "$" and depth > 0 and not depth0 then -- (a lone `$` in such a
 				v = "\\$" -- subscript is a literal character: quoted)
 			end
@@ -1203,7 +1214,15 @@ eval = function(sh, e)
 		return M.arith_textual_eval(sh, e.raw, sd)
 	end
 	if k == "xpandleaf" then -- an opaque ${…} operand: expand it; a non-numeric value must
-		local v = expand_word(sh, P.reword(e.raw)) -- take bash's textual substitution path
+		-- (a bad substitution names the whole expression, spaces kept — bash expands the
+		-- text as ONE word: `(( ${} ))` is ` ${} : bad substitution`, fuzz F120)
+		local sw, sd = sh.bs_word, sh.bs_depth
+		sh.bs_word, sh.bs_depth = e.whole, sh.subdepth
+		local ok, v = pcall(expand_word, sh, P.reword(e.raw)) -- take bash's textual substitution path
+		sh.bs_word, sh.bs_depth = sw, sd
+		if not ok then
+			error(v, 0)
+		end
 		if not looks_numeric(v) then
 			error({ __arith_textual = true })
 		end
@@ -1589,7 +1608,8 @@ array_key = function(sh, name, index_raw)
 				v = pe
 			end
 		end
-		if not (type(v) == "table" and v.__curse_matherr) then -- (an eval error already said so)
+		-- (an eval error, or an expansion's — `a[ ${} ]`'s bad substitution —, said so already)
+		if not (type(v) == "table" and (v.__curse_matherr or v.__curse_exit ~= nil)) then
 			io.stderr:write("curse: " .. P.arith_errmsg(index_raw, v) .. "\n")
 		end
 		-- an expansion error discards the rest of the top-level line (bash jump_to_top_level
@@ -1669,7 +1689,7 @@ local function expand_procsub(sh, p)
 	end, "procsub", false, false, nil, nil,
 		{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
 	C.close(theirs)
-	local fd = rt.fd_below(mine, 64)
+	local fd = rt.procsub_fd(sh, mine)
 	rt.fd_register(fd, sh) -- (only this shell's own spawns inherit it — and its later clones')
 	sh.procsub_files = sh.procsub_files or {}
 	sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
@@ -2580,6 +2600,14 @@ multi_elems = function(sh, p) -- returns element list, star?
 			end
 		elseif pe.op == "@" and pe.arg == "A" and pe.name ~= "@" and pe.name ~= "*" then
 			-- ${a[@]@A}: the whole array as the declaration that recreates it (one word)
+			local dn = sh:deref(pe.name)
+			local b = sh.vars[dn]
+			if b and not b.arr and not sh:declared_unset(dn) then
+				-- a scalar (or a nameref's scalar target): bash's get_var_and_type makes w[@]
+				-- the variable itself, so @A is ${w@A}'s `[declare -AT ]w='v'` (fuzz F122)
+				local at = sh:attr_string(dn)
+				return { (at ~= "" and ("declare -" .. at .. " ") or "") .. dn .. "=" .. rt.shell_quote(sh:get(dn) or "") }, star
+			end
 			local d = M._int.fmt_decl(sh, pe.name)
 			if sh:declared_unset(pe.name) and sh:attr_string(pe.name) == "" then
 				d = nil -- (`declare v` alone: nothing to recreate)
@@ -2917,16 +2945,21 @@ local exec_list -- forward
 -- Lowest free fd >= 10 (bash allocates named-fd redirs here); F_GETFD=1 on a
 -- closed fd returns -1 (EBADF).
 local nofile_rl = ffi.new("struct curse_rlimit[1]")
-local function alloc_fd()
-	for fd = 10, 250 do
+local function alloc_fd(sh)
+	local L = sh and rt.nofile_limit(sh)
+	if not L and C.getrlimit(7, nofile_rl) == 0 then
+		L = tonumber(nofile_rl[0].rlim_cur)
+	end
+	if L and L <= 10 then -- (bash's fcntl(F_DUPFD, 10) fails EINVAL past RLIMIT_NOFILE: `ulimit -n 6`)
+		ffi.errno(22)
+		return -1
+	end
+	for fd = 10, math.min(250, (L or 251) - 1) do
 		if C.fcntl(fd, 1) == -1 then
-			-- (bash's fcntl(F_DUPFD, 10) fails EINVAL past RLIMIT_NOFILE: `ulimit -n 6`)
-			if C.getrlimit(7, nofile_rl) == 0 and nofile_rl[0].rlim_cur <= fd then
-				return -1
-			end
 			return fd
 		end
 	end
+	ffi.errno(24) -- (none free below the limit: EMFILE)
 	return -1
 end
 local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
@@ -3047,10 +3080,11 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 				-- (redir.c: the target is opened/duplicated first — an open failure is the only
 				-- error — then moved to a free fd >= 10, and only then assigned: a readonly v
 				-- or a noassign array is reported after a successful open, the fd closed)
-				local nf = alloc_fd()
+				local nf = alloc_fd(sh)
 				if nf < 0 then
-					io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Invalid argument\n")
-					io.stderr:write("curse: " .. (r.target or "") .. ": Invalid argument\n")
+					local why = ffi.string(C.strerror(ffi.errno() == 24 and 24 or 22)) -- (EMFILE / EINVAL)
+					io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: " .. why .. "\n")
+					io.stderr:write("curse: " .. (r.target or "") .. ": " .. why .. "\n")
 					ok = false
 					break
 				end
@@ -3150,7 +3184,9 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					-- Validate the source fd is open BEFORE backing up the destination: a
 					-- dup-based backup would otherwise reuse a just-closed source fd number,
 					-- making a stale `>&N` spuriously succeed (fd N reopened as the backup).
-					if C.fcntl(m, 1) == -1 then -- F_GETFD on a closed fd returns -1 (EBADF)
+					if not fdnew and not rt.nofile_check(sh, nil, r.fd, tv) then
+						ok = false
+					elseif C.fcntl(m, 1) == -1 and not rt.input_dup_src(sh, m, backup) then -- (closed: EBADF)
 						-- (bash names the target as written: `$v: Bad file descriptor`)
 						local nm = r.target or tv
 						if fdnew
@@ -3402,7 +3438,8 @@ local function arrayassign_items(sh, st, isassoc, ntilde)
 		return items
 	end
 	for _, e in ipairs(elems) do
-		if e.key ~= nil and not (e.brace_bare and not isassoc) then
+		local bb = e.brace_bare or (e.brace_lazy and not isassoc and P.brace_elem_words(e.brace_lazy))
+		if e.key ~= nil and not (bb and not isassoc) then
 			-- keyed: an associative array (always keyed), or an indexed key with no brace.
 			-- Each word expands in order, its subscript then its value (arrayfunc.c): an
 			-- assoc key is the expanded text; an indexed subscript's expansions run now,
@@ -3410,10 +3447,24 @@ local function arrayassign_items(sh, st, isassoc, ntilde)
 			local xkey
 			if isassoc then
 				xkey = expand_word(sh, notilde(P.reword(e.key))) -- (a subscript: never a tilde)
-			elseif e.key:find("[%$`]") then
-				xkey = expand_word(sh, P.reword(e.key))
+				items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, nt(e.word)), src = e.word.src }
+			else
+				-- (bash expands an indexed `[k]=v` as ONE word, its brackets quoted: a bad
+				-- substitution in it names `\[k\]=v`)
+				local sw, sd = sh.bs_word, sh.bs_depth
+				sh.bs_word, sh.bs_depth = "\\[" .. e.key .. "\\]" .. e.op .. e.word.src, sh.subdepth
+				local ok, v = pcall(function()
+					if e.key:find("[%$`]") then
+						xkey = expand_word(sh, P.reword(e.key))
+					end
+					return expand_assign_word(sh, nt(e.word))
+				end)
+				sh.bs_word, sh.bs_depth = sw, sd
+				if not ok then
+					error(v, 0)
+				end
+				items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = v, src = e.word.src }
 			end
-			items[#items + 1] = { key = e.key, xkey = xkey, op = e.op, val = expand_assign_word(sh, nt(e.word)), src = e.word.src }
 		elseif isassoc then
 			-- a bare word in a keyed assoc literal: an error, reported as written and never
 			-- expanded (bash's assign_compound_array_list)
@@ -3421,7 +3472,7 @@ local function arrayassign_items(sh, st, isassoc, ntilde)
 		else
 			-- bare: a genuine bare element, OR an indexed keyed element whose value
 			-- brace-expands (bash de-keys it — `[k]=` becomes literal in each bare word).
-			for _, bw in ipairs(e.brace_bare or { e.word }) do
+			for _, bw in ipairs(bb or (e.bxlazy and P.brace_elem_words(e.bxlazy)) or { e.word }) do
 				for _, f in ipairs(expand_to_fields(sh, bw)) do
 					items[#items + 1] = { key = nil, op = "=", val = f }
 				end
@@ -4608,7 +4659,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		if f2 then
 			fn = f2
 		end
-		ok, err = pcall(fn, sh) -- a COMPILED function closure
+		ok, err = rt.nest_pcall(sh, fn, sh) -- a COMPILED function closure
 	else
 		-- a hot function in a cold run: its compiled version, once the tier has it
 		local def = sh.func_def and sh.func_def[cmd]
@@ -4617,9 +4668,9 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 			cfn = M.fn_hook(sh, cmd, def)
 		end
 		if cfn then
-			ok, err = pcall(cfn, sh)
+			ok, err = rt.nest_pcall(sh, cfn, sh)
 		else
-			ok, err = pcall(exec_list, sh, fn, hook, false)
+			ok, err = rt.nest_pcall(sh, exec_list, sh, fn, hook, false)
 		end
 		-- the tier compiled this function while a loop in it ran hot: the rest of THIS call
 		-- continues compiled from that loop (err.pc), in the frame already set up here
@@ -5503,10 +5554,7 @@ local function expand_args(sh, st, args, is_assign)
 		sh.arrayref_args = nil -- (the previous command's: see rt.mark_arrayref)
 	end
 	local unset_cmd = is_assign == "unset"
-	local words = st.words
-	if sh.opt_B == false then -- (`set +B`: no brace expansion)
-		words = P.unbrace_words(words)
-	end
+	local words = P.brace_words(st.words, sh.opt_B) -- (`set +B`: no brace expansion)
 	for wi, w in ipairs(words) do
 		local p1 = w.parts[1]
 		local ref = unset_cmd and wi > 1 and unset_arrayref(sh, w)
@@ -6384,7 +6432,7 @@ exec_stmt = function(sh, st, hook)
 		local ld0 = sh.loopdepth or 0
 		sh.loopdepth = ld0 + 1
 		local eok, eerr = pcall(function()
-			for _, w in ipairs(sh.opt_B == false and P.unbrace_words(st.words) or st.words) do
+			for _, w in ipairs(P.brace_words(st.words, sh.opt_B)) do
 				local fs = expand_to_fields(sh, w)
 				for k = 1, #fs do
 					list[#list + 1] = fs[k]
@@ -6464,7 +6512,7 @@ exec_stmt = function(sh, st, hook)
 		local ld0 = sh.loopdepth or 0 -- (counted before the list expands: execute_select_command)
 		sh.loopdepth = ld0 + 1
 		local eok, eerr = pcall(function()
-			for _, w in ipairs(st.words) do
+			for _, w in ipairs(P.brace_words(st.words, sh.opt_B)) do
 				local fs = expand_to_fields(sh, w)
 				for k = 1, #fs do
 					list[#list + 1] = fs[k]

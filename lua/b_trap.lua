@@ -143,7 +143,7 @@ return function(sh, cmd, args, hook, tcb)
 						if action == "-" then
 							if sh.sigtraps and sh.sigtraps[canon] then
 								sh.sigtraps[canon] = nil
-								rt.sig_untrapped(sh, num) -- (the default, or caught: rt.termsig)
+								rt.sig_untrapped(sh, num, true) -- (the default, or caught: rt.termsig)
 							end
 						else
 							sh.sigtraps = sh.sigtraps or {}
