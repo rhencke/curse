@@ -8350,8 +8350,11 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			if type(v) ~= "string" then
 				return
 			end
+			-- (called directly, or under the pcall of a loop's / function's break-continue-
+			-- return catcher: `pcall(rt.exec_dynamic, sh, …)` — stress-attack S4)
 			local ext = v:find("sh:exec(", 1, true) or v:find("sh:exec_t(", 1, true)
-				or v:find("rt.exec_dynamic(", 1, true)
+				or v:find("rt.exec_dynamic(", 1, true) or v:find("rt.exec_dynamic,", 1, true)
+				or v:find("sh.exec,", 1, true) or v:find("sh.exec_t,", 1, true)
 			-- (and a redirected one's: a signal `kill` sends the shell waits for them to go — b_kill)
 			if cx.cur_simple and (ext or (cx.cur_simple.redirs and #cx.cur_simple.redirs > 0)) then
 				pcline.tx = pcline.tx or {}
@@ -8359,7 +8362,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			end
 			-- (and the line a foreground job it runs is reported at, where not its own: jcx)
 			local jl = EF.cur_jl
-			if jl and jl ~= EF.cur_line and (ext or v:find("sh:run_pipeline(", 1, true)
+			if jl and jl ~= EF.cur_line and (ext or (pcline.tx and pcline.tx[k]) or v:find("sh:run_pipeline(", 1, true)
 				or v:find("sh:subshell_run(", 1, true)) then
 				pcline.jl = pcline.jl or {}
 				pcline.jl[k] = jl

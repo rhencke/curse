@@ -3084,7 +3084,7 @@ function M.job_line(sh)
 		local t = M.PCLINE[f]
 		if t then
 			local _, pc = getlocal(level, 2)
-			local l = t.jl and t.jl[pc]
+			local l = t.jl and t.jl[pc] or (t.jl_default and t.tx and t.tx[pc] and t.jl_default)
 			return l and t.trel and (sh.trap_base or 1) + l - 1 or l
 		end
 	end
@@ -5180,7 +5180,7 @@ local function iso_undo(sh, ctx)
 		end
 		o.traps, o.sigtraps = sv.traps, sv.sigtraps
 		for _, num in ipairs(untrapped or {}) do -- (the parent's untrapped disposition: the
-			M.sig_untrapped(o, num) -- default — or caught, by a daemon worker or for its EXIT trap)
+			M.sig_untrapped(o, num, true) -- default — or caught, by a daemon worker or for its EXIT trap)
 		end
 		M.exit_trap_inherited, o.err_trap_sp, o.in_exit_trap = sv.inh, sv.esp, sv.inexit
 		o.dbg_trap_sp, o.ret_trap_sp, o.err_trap_ps = sv.dsp, sv.rsp, sv.eps
@@ -5460,10 +5460,29 @@ end
 -- default back at exec, as bash's children do.
 M.TERMSIG = { [1] = true, [2] = true, [4] = true, [5] = true, [6] = true, [7] = true, [8] = true,
 	[10] = true, [11] = true, [12] = true, [13] = true, [14] = true, [15] = true, [24] = true,
-	[25] = true, [31] = true }
+	[25] = true, [26] = true, [31] = true }
+pcall(ffi.cdef, "void curse_preempt_user(int catch_it);")
 -- the disposition of an untrapped signal `num` (trap - SIG, or at startup)
-function M.sig_untrapped(sh, num)
+function M.sig_untrapped(sh, num, was_trapped)
 	local x = sh.traps and sh.traps.EXIT
+	if num == 26 then
+		-- (SIGVTALRM is the job time-slice tick's: its handler stands in for SIG_DFL and
+		-- does what this disposition would with one somebody sends — lib_cursesig.c. Only a
+		-- trap's own handler is taken down: the tick's may be armed right now)
+		local catch = (M.daemon_worker or x) and true or false
+		if was_trapped then
+			C.curse_sig_default(26)
+		end
+		pcall(function()
+			C.curse_preempt_user(catch and 1 or 0)
+		end)
+		if catch and not _G.__curse_sigrun then
+			_G.__curse_sigrun = function(s)
+				require("interp").run_signal(sh, s)
+			end
+		end
+		return
+	end
 	if num == 3 or (M.TERMSIG[num] and (M.daemon_worker or x)) then
 		C.curse_sig_catch(num)
 		if not _G.__curse_sigrun then

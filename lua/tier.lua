@@ -570,6 +570,23 @@ local function loop_fragment(st, sh)
 	end
 	code = with_bodies(code, srcs, st._s1)
 	local mod = M.compile_fragment(code, st.line, mode, nil, st._pst)
+	-- (compiled from its own text, the loop has lost the context its commands' job reports
+	-- name the line of — parser jcx: a loop inside a `{ … } | …` stage reports at the
+	-- group's end, not the command's own line. The body's is kept for the fragment's
+	-- blocks: rt.job_line)
+	if mod and mod.run then
+		local jl
+		for _, b in ipairs(st.body or {}) do
+			if b.jcx and b.jcx.l then
+				jl = b.jcx.l
+				break
+			end
+		end
+		local t = jl and require("runtime").PCLINE[mod.run]
+		if t then
+			t.jl_default = jl
+		end
+	end
 	if mod and st.t == "forin" then
 		-- entered at the loop's resume point, adopting the interpreter's list + position
 		-- (sh.forstate) under the fragment's own id for that loop: its first
