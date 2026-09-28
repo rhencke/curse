@@ -935,6 +935,11 @@ function M.arith_textual_eval(sh, raw, depth0)
 	if depth0 == 1 and text == "" and not in_expanded_text then -- (a subscript's expansions left
 		error({ __arith_emptysub = true }, 0) -- nothing: arith_key)
 	end
+	return M.arith_expanded_eval(sh, text, depth0)
+end
+-- Evaluate expansion OUTPUT as arithmetic (bash's evalexp on expand_arith_string's result):
+-- a `$`/`` ` `` left in it is no expansion but a bad token; a `$key` subscript still expands
+function M.arith_expanded_eval(sh, text, depth0)
 	local pok, ast = pcall(P.arith, text, "strict")
 	if not pok then
 		P.trap_flow(ast)
@@ -2839,9 +2844,9 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 						fb:multi(els, sp.q, star, nil, not sp.dqat)
 					else
 						local s = expand_part_str(sh, sp)
-						if k == 1 and sp.lit ~= nil and not sp.q then
-							s = tilde_prefix(sh, s)
-						end -- word-initial ~
+						if k == 1 and sp.lit ~= nil and not sp.q then -- word-initial ~
+							s = rt.tilde_split(sh, fb, s)
+						end
 						if sp.q then
 							fb:add(s, false)
 						else
@@ -3919,7 +3924,7 @@ local function printf_parse(fmt)
 						j = j + 1
 					end
 				end
-				local prec, dynp = nil, false
+				local prec, dynp, negp = nil, false, nil
 				if fmt:sub(j, j) == "." then
 					j = j + 1
 					prec = ""
@@ -3927,9 +3932,16 @@ local function printf_parse(fmt)
 						dynp = true
 						j = j + 1
 					else
+						if fmt:sub(j, j) == "-" then -- (a negative precision: bash skips the `-`
+							negp = "" -- and passes the spec on — see pf.negprec)
+							j = j + 1
+						end
 						while fmt:sub(j, j):match("%d") do
 							prec = prec .. fmt:sub(j, j)
 							j = j + 1
+						end
+						if negp then
+							negp, prec = prec, "0" -- (printstr's %b/%q/%s: `.` with no digit is 0)
 						end
 					end
 				end
@@ -3969,7 +3981,8 @@ local function printf_parse(fmt)
 					end
 				else
 					local conv = fmt:sub(j, j)
-					local tk = { conv = conv, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, lmod = lmod, grp = grp }
+					local tk = { conv = conv, spec = spec, width = width, dynw = dynw, prec = prec, dynp = dynp, lmod = lmod, grp = grp,
+						negp = negp }
 					-- (the conversion spec string.format takes: literal width/precision of
 					-- at most two digits; anything else is built per call)
 					if not (dynw or dynp) and #width <= 2 and #(prec or "") <= 2 then
@@ -4005,6 +4018,10 @@ end
 -- The printf helpers below live in one table (interp.lua's main chunk is near LuaJIT's
 -- local-variable limit); all but pf.str are off the common path.
 local pf = {}
+-- the conversions bash passes to printf(3) (a negative precision's glibc text): the
+-- argument kind and so bash's added length modifier (mklong: `l` / `L`)
+pf.NEGP = { d = "i", i = "i", o = "i", u = "i", x = "i", X = "i", e = "f", E = "f", f = "f", F = "f",
+	g = "f", G = "f", a = "f", A = "f", s = "s", c = "s" }
 -- A conversion's text as its pieces — strings and { char, count } runs of padding. A run
 -- too big to build (a `*` width or precision near INT_MAX: bash's printf writes it as it
 -- formats) is streamed to the shell's stdout in chunks, after the output pending before it
@@ -4332,7 +4349,31 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 					end
 				end
 				local conv = tk.conv
-				if conv == "s" then
+				if tk.negp and pf.NEGP[conv] then
+					-- a C-printf conversion with a negative precision (`%.-1d`): bash hands
+					-- `%.-1ld` to printf(3), and glibc prints an unknown `-` conversion as its
+					-- own spec text — then the rest (`1ld`) as plain text
+					local a = pf_next(ps)
+					local mod = ""
+					if pf.NEGP[conv] == "i" then
+						pf.intarg(ps, a, conv ~= "d" and conv ~= "i")
+						mod = "l"
+					elseif pf.NEGP[conv] == "f" then
+						local c1 = a:sub(1, 1)
+						local posix = not tk.lmod and rt.cur_shell and rt.cur_shell.opt_posix
+						local _, ok = printf_float(a)
+						if not ok and c1 ~= "'" and c1 ~= '"' then
+							pf.badnum(ps, a)
+						end
+						mod = posix and "" or "L"
+					end
+					local w = tonumber(width) or 0
+					local left = spec:find("-", 1, true)
+					out[#out + 1] = "%" .. (spec:find("#", 1, true) and "#" or "") .. (tk.grp and "'" or "")
+						.. (spec:find("+", 1, true) and "+" or spec:find(" ", 1, true) and " " or "")
+						.. (left and "-" or "") .. (not left and spec:find("0", 1, true) and "0" or "")
+						.. (w ~= 0 and tostring(w) or "") .. ".0-" .. tk.negp .. mod .. conv
+				elseif conv == "s" then
 					local a = pf_next(ps)
 					local pr_ = (width == "" and not prec) and a or pf.str(spec, width, prec, a) -- (a streamed pad empties `out` first)
 					out[#out + 1] = pr_
@@ -4402,11 +4443,16 @@ local function sh_printf(fmt, argv, start, nsets, fsh)
 					out[#out + 1] = pr_
 				elseif conv == "Q" then -- (a literal precision cuts the raw text; the quoted is whole)
 					local a = pf_next(ps)
-					if prec and prec ~= "" and not tk.dynp then
+					if tk.negp then -- (`%.-2Q`: printstr's precision is 0 — only the padding)
+						a = nil
+						out[#out + 1] = pf.str(spec, width, "0", "")
+					elseif prec and prec ~= "" and not tk.dynp then
 						a = a:sub(1, tonumber(prec))
 					end
-					local pr_ = pf.str(spec, width, nil, printf_q(a)) -- (a streamed pad empties `out` first)
-					out[#out + 1] = pr_
+					if a then
+						local pr_ = pf.str(spec, width, nil, printf_q(a)) -- (a streamed pad empties `out` first)
+						out[#out + 1] = pr_
+					end
 				elseif conv == "" then -- the format ended inside a conversion (`%10`)
 					pf.diag(ps, "`" .. tk.miss .. "': missing format character")
 					return table.concat(out), 1

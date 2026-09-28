@@ -308,6 +308,7 @@ local function arith(src, nodefer)
 		return (src:sub(i, i) == "=" and src:sub(i + 1, i + 1) ~= "=") or src:find("^[%+%-%*/%%&|%^]=", i) ~= nil
 			or src:find("^<<=", i) ~= nil or src:find("^>>=", i) ~= nil
 	end
+	local lookahead -- (below)
 	-- `asgn`: an assignment may start here — only at the head of a lowest-precedence
 	-- expression (bash: assignment binds loosest, so `0 && B=42` is an error)
 	local function primary(asgn)
@@ -320,7 +321,7 @@ local function arith(src, nodefer)
 				if asgn_next() then
 					aerr("attempted assignment to non-variable", e)
 				end
-				aerr("missing `)'", e)
+				aerr("missing `)'", lookahead(e))
 			end
 			e.paren = true -- (complete once its `)` is read: see spine)
 			return e
@@ -476,6 +477,51 @@ local function arith(src, nodefer)
 		return { k = "var", name = name, idx = idx, idxraw = ir, esrc = src, ep = ns0 }
 	end
 
+	-- A syntax error where a NAME is the unexpected token: bash's readtok had read that name
+	-- (its one-token lookahead) and — unless an `=` follows it — evaluated it right away
+	-- (expr_streval), in the context of the operand before it (a short-circuited one: noeval),
+	-- so its own error comes first (`p='*o*'; $(( 1 p ))`: operand expected at `*o*`).
+	-- `e`: the pre-error AST; returns it with that read attached at its right edge.
+	lookahead = function(e)
+		skip()
+		if not e or not src:find("^[%a_]", i) then
+			return e
+		end
+		local i0, lt0 = i, lasttp
+		local ok, v = pcall(function()
+			local ns0 = i
+			local name, idx, ir = nameSub()
+			skip()
+			if src:sub(i, i) == "=" and src:sub(i + 1, i + 1) ~= "=" then
+				return nil
+			end
+			return { k = "var", name = name, idx = idx, idxraw = ir, esrc = src, ep = ns0 }
+		end)
+		i, lasttp = i0, lt0
+		if not ok or not v then
+			return e
+		end
+		local function attach(x)
+			local k = x.k
+			if x.paren then
+			elseif k == "comma" or k == "bin" then
+				return { k = k, op = x.op, l = x.l, r = attach(x.r) }
+			elseif k == "tern" then
+				return { k = "tern", c = x.c, a = x.a, b = attach(x.b) }
+			elseif k == "asgn" then
+				local c = {}
+				for f, fv in pairs(x) do
+					c[f] = fv
+				end
+				c.e = attach(x.e)
+				return c
+			end
+			-- (an operand: its value, then the name read — `x + 0*name` keeps both in order)
+			return { k = "bin", op = "+", l = x, r = { k = "bin", op = "*", l = ZERO, r = v } }
+		end
+		return attach(e)
+	end
+
 	-- binary operators by precedence (higher binds tighter), matching bash
 	local BIN = {
 		["||"] = 1,
@@ -572,7 +618,7 @@ local function arith(src, nodefer)
 				if asgn_next() then
 					aerr("attempted assignment to non-variable", { k = "tern", c = c, a = a, b = ZERO })
 				end
-				aerr("`:' expected for conditional expression", { k = "tern", c = c, a = a, b = ZERO })
+				aerr("`:' expected for conditional expression", { k = "tern", c = c, a = lookahead(a), b = ZERO })
 			end
 			if peek() == "" then
 				aerr("expression expected", { k = "tern", c = c, a = a, b = ZERO })
@@ -638,7 +684,7 @@ local function arith(src, nodefer)
 				aerr("syntax error: invalid arithmetic operator", spine(e))
 			end
 		end
-		aerr("syntax error in expression", e)
+		aerr("syntax error in expression", lookahead(e))
 	end
 	return e
 end
