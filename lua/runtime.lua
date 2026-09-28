@@ -3442,6 +3442,10 @@ function M.nofile_spawn_post(sh, pid)
 end
 end
 local function spawn_argv(self, path, args, n, fa, hold, lvl)
+	local st0 = co_task()
+	if st0 then
+		st0.spawned = true -- (a real child: its SIGCHLD is real — M.sim_chld)
+	end
 	if next(M.internal_pids) then -- (a `ps` it runs must not see orphans that have ended)
 		M.reap_orphans()
 	end
@@ -4150,10 +4154,34 @@ local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd, lb, stp)
 	self.cur_cline, self.loopdepth, self.subdepth = cl, ld, sd
 	self.in_subprogram = self.in_subprogram - 1
 end
+-- bash forks a child for every `( … )`, `$(…)` and pipeline stage, and runs its CHLD trap
+-- once for each it reaps; curse runs them in-process: no child, no SIGCHLD — the trap missed
+-- them (stress-attack S22: `( : ); x=$(:); : | :` counted 0 where bash counts 4). Each such
+-- context ending in the shell that has a CHLD trap runs it as the reaping would, n times —
+-- unless a real child it ran sent a SIGCHLD of its own (its tail command, exec'd in place:
+-- the child bash would have reaped). (`&` jobs: co_resume, as they end.)
+function M.sim_chld(sh, nspawn0, n)
+	if nspawn0 and M.nspawn ~= nspawn0 then
+		return
+	end
+	local ctx = M.iso_cur(sh)
+	if ctx and not ctx.traps then -- (inside a subshell that set no trap: its CHLD is the default)
+		return
+	end
+	local h = sh.sigtraps and sh.sigtraps.SIGCHLD and sh.traps and sh.traps.SIGCHLD
+	if not h or h == "" then
+		return
+	end
+	local I = require("interp")
+	for _ = 1, n or 1 do
+		I.run_signal(sh, 17, true)
+	end
+end
 local cap_depth, cap_pid, flush_deferred, cap_enter, cap_leave -- (the signal hold: see M.defer_signal)
 function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	-- (signals are held from here to the end, the capture's state all undone — a trap run
 	-- in between would write into the capture, or into state about to be dropped)
+	local nsp0 = M.nspawn
 	cap_enter()
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	-- ($(…) inside a loop knows it — a break/continue there ends the substitution, as it
@@ -4294,6 +4322,11 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		C.kill(C.getpid(), 2)
 	end
 	flush_deferred(self)
+	if not ctx then -- (in a context of its own: counted once that has ended — capture_compiled_iso)
+		local stc = self.status
+		M.sim_chld(self, nsp0)
+		self.status = stc
+	end
 	return r
 end
 
@@ -5827,6 +5860,7 @@ end
 function Shell:subshell_run(runner, saves, paren, inplace)
 	-- (signals are held from here until the context is pushed, which holds them itself:
 	-- a trap run meanwhile would change the checkpointed state, dropped at the end)
+	local nsp0 = M.nspawn
 	cap_enter()
 	local s1, s2, s3, s4, s5, s6, s7, s8, s9 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
@@ -5933,6 +5967,10 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	end
 	if rethrow then error(rethrow) end
 	self.status = status
+	if paren and not self.pstage then -- (a pipeline stage's own `( … )` is the stage: counted there)
+		M.sim_chld(self, nsp0)
+		self.status = status
+	end
 end
 
 -- $BASH_SUBSHELL for a pipeline stage (bash): a `( … )` stage counts once (its own
@@ -6012,6 +6050,7 @@ end
 -- in_subprogram, cur_line, trailing-newline/NUL strip, exit/return→status); the heavy
 -- checkpoint wraps it. Returns the captured string.
 function Shell:capture_compiled_iso(cs_fn, backtick)
+	local nsp0 = M.nspawn
 	cap_enter() -- (held until the context is pushed: see subshell_run)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	local sv_foreign = self.foreign_pids
@@ -6029,6 +6068,9 @@ function Shell:capture_compiled_iso(cs_fn, backtick)
 	if not ok then
 		error(out, 0)
 	end
+	local stc = self.status
+	M.sim_chld(self, nsp0)
+	self.status = stc
 	return out
 end
 
@@ -7711,6 +7753,9 @@ local function co_resume(ctx, t)
 			co_cl(ctx, fd)
 		end
 		g.alive = g.alive - 1
+		if not g.bg and not t.spawned and t ~= g.lp then -- (a stage bash would have forked)
+			g.simchld = (g.simchld or 0) + 1
+		end
 		if g.alive == 0 and g.bg then -- a background job ended: its starting fds go too
 			fds_release(ctx, g.base.fd, 0, 9)
 			g.done = true
@@ -7720,7 +7765,7 @@ local function co_resume(ctx, t)
 			-- (a forked job's death is a SIGCHLD: its CHLD trap runs — here, unless a real
 			-- child it ran already sent one)
 			local ow = g.launcher
-			if ow and ow.sigtraps and ow.sigtraps.SIGCHLD and ow.traps.SIGCHLD ~= "" and M.nspawn == g.nspawn0 then
+			if ow and ow.sigtraps and ow.sigtraps.SIGCHLD and ow.traps.SIGCHLD ~= "" and not t.spawned then
 				C.kill(C.getpid(), 17)
 			end
 		end
@@ -7991,6 +8036,11 @@ function Shell:run_pipeline_co(stage_fns, inproc, lastpipe, upv_get, upv_set)
 	end
 	M.raise_task_held() -- (a signal that came while a stage ran: the shell's — held by
 	-- the caller until the pipeline is done: fg_hold_enter)
+	if g and g.simchld then
+		local st = self.status
+		M.sim_chld(self, nil, g.simchld)
+		self.status = st
+	end
 	return g ~= nil or nil
 end
 
