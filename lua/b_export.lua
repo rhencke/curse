@@ -881,8 +881,8 @@ return function(sh, cmd, args, hook, tcb)
 							end
 						else
 							sh.vars[a] = b
-							if b.s ~= nil and not b.arr then
-								b.arr = { [0] = b.s }
+							if (b.s ~= nil or b.n ~= nil) and not b.arr then
+								b.arr = { [0] = b.s or rt.i64_to_str(b.n) }
 								b.s = nil
 								b.n = nil
 								if b.exported then -- (an array is never in the environment)
