@@ -1336,3 +1336,26 @@ wired through `docker/run.sh`'s env passthrough.
   unbucketed pexp signatures, e.g. `${r+${w[*]@A}} ${lo:x}`); confirmed fresh with
   `harness-plain` before reduction, then reduced and reconfirmed with `cmp.sh` outside the
   target harness.
+
+## Campaign 4 (gram:glob + gram:regex, containerized), branch fuzz-night
+
+## F123. `BASH_REMATCH`'s `declare -p` drops one level of backslash-escaping for a captured value ending in a literal backslash
+
+    shopt -s nocasematch xpg_echo
+    s=$'x\x5c'
+    re=$'\x5cw\x5b\x5ea\x5d'
+    [[ $s =~ $re ]]
+    declare -p BASH_REMATCH
+
+(i.e. `s='x\'`, `re='\w[^a]'`: `\w` matches `x`, `[^a]` matches the backslash.)
+
+- bash: `declare -a BASH_REMATCH=([0]="x\\")` — the captured value `x\` (2 chars),
+  correctly double-escaped for `declare -p`'s re-parseable double-quoted form.
+- curse (all tiers): `declare -a BASH_REMATCH=([0]="x\")` — only one backslash: not valid
+  shell syntax fed back in (the trailing `\"` would escape the closing quote). Specific to
+  a regex-captured value: a plain array literal with the same value
+  (`a=('x\'); declare -p a`) prints correctly on both sides (`declare -a a=([0]="x\\")`),
+  so the capture path stores/prints the match differently from a normal assignment.
+  Found by `gram:regex`; confirmed fresh with `harness-plain`, then reduced with `cmp.sh`
+  (a same-value simplification with `x\\` written directly, no `\w`/`[^a]` regex classes
+  or `$'...\x..'` escapes, did not reproduce — those pieces matter, not just the value).
