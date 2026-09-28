@@ -10288,8 +10288,7 @@ function M.elem_read_check(sh, name, key)
 			M.report_exit(sh)
 		end
 	elseif M.neg_oob(sh, name, key) or M.neg_scalar(sh, name, key) then
-		io.stderr:write("curse: " .. M.badsub_name(sh, name) .. ": bad array subscript
-")
+		io.stderr:write("curse: " .. M.badsub_name(sh, name) .. ": bad array subscript\n")
 		M.report_exit(sh)
 	end
 end
