@@ -1,0 +1,3 @@
+#@ extglob
+@(foo|bar)*
+barbaz

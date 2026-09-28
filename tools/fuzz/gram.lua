@@ -1147,6 +1147,304 @@ local function classify(s)
 	return why
 end
 
+-- ---- the targeted fuzzers' input languages (GRAM_TARGET; harness FUZZ_TARGET, targets.lua) --
+-- Each target's input is a small text in one subsystem's language (targets.lua has the
+-- formats). A small generator per language, plus language-agnostic edits on the text:
+-- a random span replaced by a generated fragment / a dictionary token / a span of the splice
+-- partner, spans dropped or duplicated, digit runs set to boundary values, and the `#@`
+-- options header toggled. `parse` inputs are scripts: the script mutator above serves them.
+local TG = {}
+local TVARS = { "x", "y", "n", "i", "ii", "s", "r", "z", "h", "big", "u", "w", "e", "a", "A", "m", "up", "lo", "ref", "g", "p", "bs", "q", "nl", "t" }
+local HDRS = { "extglob", "nocasematch", "nocaseglob", "globasciiranges", "dotglob", "nullglob", "failglob", "xpg_echo", "posix", "utf8", "noglob", "nopatsub" }
+local function nosub(s) -- (targets.lua refuses these: never generate them)
+	return (s:gsub("%$%(", "$ ("):gsub("`", "'"):gsub("([<>])%(", "%1 ("))
+end
+local function tvar() return pick(TVARS) end
+local function tnum() return chance(0.6) and tostring(r(20) - 5) or pick(NUMS) end
+
+TG.arith = {}
+function TG.arith.frag(d)
+	d = d or 0
+	if d > 3 or chance(0.3) then
+		local k = r(10)
+		if k <= 3 then return tnum() end
+		if k <= 6 then return tvar() end
+		if k == 7 then return tvar() .. "[" .. TG.arith.frag(d + 1) .. "]" end
+		if k == 8 then return pick({ "a", "A", "m" }) .. "[" .. pick({ "0", "1", "-1", "k", "k2", "@", "*", "x", "i++", "$x", "\"k\"", "'k'", "" }) .. "]" end
+		if k == 9 then return pick({ "$x", "${x}", "${#w}", "$n", "${a[1]}", "${A[k]}", "$1", "$#", "\"1\"", "'1'", "$[1]", "$((1))" }) end
+		return pick({ "0x", "08", "09", "1#", "2#2", "37#1", "64#_", "64#@@", "10#", "#", "0b1", "1.5", "1e2", " ", "", "\t", "\n", "\\", "@", "é" })
+	end
+	local k = r(11)
+	if k <= 4 then
+		return TG.arith.frag(d + 1) .. pick({ "", " " }) .. pick({ "+", "-", "*", "/", "%", "**", "<<", ">>", "&", "|", "^", "&&", "||", "<", ">", "<=", ">=", "==", "!=", ",", "=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^=", "**=", "===", "=<", "<>", "!" }) .. pick({ "", " " }) .. TG.arith.frag(d + 1)
+	elseif k == 5 then
+		return pick({ "-", "+", "!", "~", "++", "--", "- -", "+ +", "!!", "~-" }) .. TG.arith.frag(d + 1)
+	elseif k == 6 then
+		return tvar() .. pick({ "++", "--", "[1]++", "[k]--" })
+	elseif k == 7 then
+		return TG.arith.frag(d + 1) .. " ? " .. TG.arith.frag(d + 1) .. " : " .. TG.arith.frag(d + 1)
+	elseif k == 8 then
+		return "(" .. TG.arith.frag(d + 1) .. ")"
+	elseif k == 9 then
+		return TG.arith.frag(d + 1) .. pick({ " ? ", " : ", "(", ")", "[", "]", "?:", "," })
+	elseif k == 10 then
+		return tvar() .. "=" .. TG.arith.frag(d + 1)
+	end
+	return pick({ "a[", "A[", "m[" }) .. TG.arith.frag(d + 1) .. "]" .. pick({ "", "=", "+=", "++", " = " .. TG.arith.frag(d + 1) })
+end
+function TG.arith.gen()
+	return (chance(0.15) and "=" or "") .. nosub(TG.arith.frag())
+end
+TG.arith.dict = { "+", "-", "*", "/", "%", "**", "<<", ">>", "?", ":", "(", ")", "[", "]", ",", "=", "++", "--", "#", "0x", "08", "64#", "9223372036854775807", "-9223372036854775808", "a[", "A[k]", "x", "u", " ", "$" }
+
+TG.pexp = {}
+local POPS = { "-", ":-", "=", ":=", "?", ":?", "+", ":+", "#", "##", "%", "%%", "/", "//", "/#", "/%", "^", "^^", ",", ",,", "~", "~~", ":", "@Q", "@E", "@P", "@A", "@a", "@U", "@u", "@L", "@K", "@k" }
+local PSUB = { "", "", "", "[@]", "[*]", "[0]", "[1]", "[-1]", "[k]", "[k2]", "[x+1]", "[$n]", "[\"k\"]", "[' ']", "[]", "[@", "[9223372036854775807]" }
+function TG.pexp.pword(d)
+	d = d or 0
+	local k = r(12)
+	if d > 2 or k <= 3 then
+		return pick({ "a", "*", "?", "[ab]", "o", "l*", "\\*", "'x y'", "\"$w\"", "$p", "${g}", "", " ", "&", "\\&", "\\/", "/", "}", "\\}", "@(o|l)", "+(l)", "!(x)", "*(o)", "[[:space:]]", "[^a]", "[!a-m]", "é", "\\", "'", "\"", "${x}", "$1", "$@", "${a[@]}", "\"${a[@]}\"", "~", "\t" })
+	end
+	if k <= 7 then return TG.pexp.expn(d + 1) end
+	return TG.pexp.pword(d + 1) .. TG.pexp.pword(d + 1)
+end
+function TG.pexp.expn(d)
+	d = d or 0
+	local nm = chance(0.85) and tvar() or pick({ "@", "*", "#", "1", "2", "3", "0", "?", "-", "x y", "", "!", "9", "10" })
+	local sub = pick(PSUB)
+	local k = r(10)
+	if k == 1 then return "$" .. nm end
+	if k == 2 then return "${" .. pick({ "#", "!", "" }) .. nm .. sub .. "}" end
+	local op = pick(POPS)
+	local arg = ""
+	if op == ":" then
+		arg = pick({ "0", "1", "-1", " -2", "(-1)", "1:2", "x", "$n", "2:-1", "n:1", "-3:-1", "9223372036854775807", "1:", ":", "a[1]", "1 ? 1 : 0" })
+	elseif op:sub(1, 1) == "@" then
+		arg = ""
+	elseif op == "/" or op == "//" or op == "/#" or op == "/%" then
+		arg = TG.pexp.pword(d) .. pick({ "", "/", "/" .. TG.pexp.pword(d) })
+	elseif op == "^" or op == "^^" or op == "," or op == ",," or op == "~" or op == "~~" then
+		arg = pick({ "", "a", "[a-m]", "?", "*", "[[:upper:]]", "o" })
+	else
+		arg = TG.pexp.pword(d)
+	end
+	return "${" .. nm .. sub .. op .. arg .. "}"
+end
+function TG.pexp.gen()
+	local parts = {}
+	for _ = 1, 1 + r(3) do
+		local e = TG.pexp.expn()
+		local k = r(4)
+		if k == 1 then e = "\"" .. e .. "\"" elseif k == 2 then e = "x" .. e .. "'y'" end
+		parts[#parts + 1] = e
+	end
+	return nosub(concat(parts, " "))
+end
+TG.pexp.dict = { "${", "}", "\"", "'", "[@]", "[*]", ":-", ":=", "#", "##", "%", "%%", "//", "/#", "/%", "^^", ",,", "@Q", "@E", "@A", "@a", "@K", ":1:2", "$@", "$*", "${!", "${#", "\\", "*", "?", "[", "]", "&" }
+
+TG.printf = {}
+local CONV = { "d", "i", "o", "u", "x", "X", "e", "E", "f", "F", "g", "G", "a", "A", "c", "s", "b", "q", "Q", "(%Y-%m-%d)T", "(%s)T", "n", "%", "y", "", "ld", "lld", "hd", "zu", "jd", "Lf", "hhd" }
+function TG.printf.fmt()
+	local out = {}
+	for _ = 1, 1 + r(4) do
+		local k = r(6)
+		if k <= 3 then
+			out[#out + 1] = "%" .. (chance(0.4) and pick({ "-", "+", " ", "#", "0", "'", "-0", "+ ", "#0", "--" }) or "")
+				.. (chance(0.4) and pick({ "5", "*", "0", "12", "-3", "99999999999", "1$", "2$*", "*1$" }) or "")
+				.. (chance(0.35) and pick({ ".", ".0", ".3", ".*", ".99", ".-1" }) or "") .. pick(CONV)
+		elseif k == 4 then
+			out[#out + 1] = pick({ "\\n", "\\t", "\\\\", "\\x41", "\\x4", "\\xg", "\\0101", "\\101", "\\u263a", "\\U0001F600", "\\c", "\\e", "\\a", "\\'", "\\\"", "\\?", "\\", "\\q", "\\x", "\\u", "%%" })
+		else
+			out[#out + 1] = pick({ "a", "x=", " ", "|", "é", "\xff", "-", "\t" })
+		end
+	end
+	return concat(out)
+end
+local PARGS = { "0", "1", "-1", "42", "3.14159", "-0", "1e3", "0x1F", "0X1f", "010", "08", "'a", "\"é", "'", "\"", "", " 12", "12 ", "abc", "9223372036854775807", "9223372036854775808", "-9223372036854775809", "18446744073709551615", "inf", "-inf", "nan", "1.5e308", "1e-320", "\\n", "a\\cb", "\\0101", "%s", "0.5", "+7", "--1", "1,5", "0x", "1a" }
+function TG.printf.gen()
+	local l = { TG.printf.fmt() }
+	for _ = 1, r(4) - 1 do
+		l[#l + 1] = pick(PARGS)
+	end
+	return concat(l, "\n")
+end
+TG.printf.dict = { "%", "%s", "%d", "%b", "%q", "%Q", "%c", "%x", "%(%s)T", "%*d", "%.*s", "%-5s", "\\", "\\x", "\\0", "\\u", "\\c", "\n", "'a", "0x", "9223372036854775807" }
+
+TG.glob = {}
+function TG.glob.pat(d)
+	d = d or 0
+	local out = {}
+	for _ = 1, 1 + r(3) do
+		local k = r(12)
+		if k <= 3 then
+			out[#out + 1] = pick({ "a", "b", "ab", "x", ".", "-", "é", "A", " ", "]", "!", "^", "/", "\\", "\xff" })
+		elseif k <= 5 then
+			out[#out + 1] = pick({ "*", "?", "**", "*?", "\\*", "\\?", "\\[", "\\\\" })
+		elseif k <= 8 then
+			local body = pick({ "ab", "a-c", "!a", "^a", "]a", "!]", "a-", "-a", "[:alpha:]", "[:digit:][:space:]", "[:foo:]", "[.a.]", "[=a=]", "\\]", "z-a", "é", "[", "a\\-z", "![:upper:]", "" })
+			out[#out + 1] = "[" .. body .. (chance(0.9) and "]" or "")
+		elseif d < 2 then
+			local alts = {}
+			for _ = 1, 1 + r(3) do alts[#alts + 1] = TG.glob.pat(d + 1) end
+			out[#out + 1] = pick({ "@(", "*(", "+(", "?(", "!(" }) .. concat(alts, "|") .. (chance(0.92) and ")" or "")
+		else
+			out[#out + 1] = "a"
+		end
+	end
+	return concat(out)
+end
+function TG.glob.str()
+	local out = {}
+	for _ = 1, r(6) - 1 do
+		out[#out + 1] = pick({ "a", "b", "ab", "x", ".", "-", "é", "A", " ", "]", "[", "!", "*", "?", "/", "\\", "\xff", "abab", "aaa", "B", "(", "|", ")" })
+	end
+	return concat(out)
+end
+function TG.glob.gen()
+	return TG.glob.pat() .. "\n" .. TG.glob.str()
+end
+TG.glob.dict = { "*", "?", "[", "]", "[!", "[^", "[:alpha:]", "[:upper:]", "@(", "*(", "+(", "?(", "!(", "|", ")", "\\", "-", "é" }
+
+TG.read = {}
+function TG.read.gen()
+	local ifs = chance(0.2) and "U" or "=" .. pick({ "", " ", ":", " :", " \t", ":,", "x", "\\", " x ", "::", "\t", "é", " \t:" })
+	local opts = {}
+	for _ = 1, r(4) - 1 do
+		local o = pick({ "-r", "-s", "-a", "-d", "-n", "-N" })
+		if o == "-d" then o = o .. " " .. pick({ ":", "x", "", "\\", " " }) end
+		if o == "-n" or o == "-N" then o = o .. " " .. pick({ "0", "1", "3", "-1", "9223372036854775807", "99" }) end
+		opts[#opts + 1] = o
+	end
+	local data = {}
+	for _ = 1, 1 + r(5) do
+		data[#data + 1] = pick({ "a", "b c", " ", "\t", ":", "::", "a:b", "\\", "\\ ", "\\:", "\\\n", "\n", "x", "é", "  lead", "trail  ", "a,b" })
+	end
+	return ifs .. "\n" .. concat(opts, " ") .. "\n" .. concat(data)
+end
+TG.read.dict = { "U", "=", "-r", "-a", "-d", "-n", "-N", "\\", "\n", " ", "\t", ":" }
+
+TG.regex = {}
+function TG.regex.re(d)
+	d = d or 0
+	local out = {}
+	for _ = 1, 1 + r(3) do
+		local k = r(12)
+		if k <= 3 then
+			out[#out + 1] = pick({ "a", "b", "ab", "x", "é", "A", " ", "-", "/", "]", "}", "{", "\\" })
+		elseif k <= 5 then
+			out[#out + 1] = pick({ ".", "^", "$", "\\.", "\\1", "\\2", "\\w", "\\b", "\\<", "\\n", "\\(", "\\" })
+		elseif k <= 7 then
+			out[#out + 1] = "[" .. pick({ "ab", "a-c", "^a", "]a", "[:alpha:]", "[:digit:]", "[:foo:]", "[.a.]", "[=a=]", "a-", "\\]", "z-a", "é" }) .. (chance(0.9) and "]" or "")
+		elseif k <= 9 then
+			out[#out + 1] = pick({ "*", "+", "?", "{2}", "{1,}", "{,2}", "{2,1}", "{", "*?", "**", "+*", "{99999}", "{1,3}" })
+		elseif d < 2 then
+			local alts = {}
+			for _ = 1, 1 + r(2) do alts[#alts + 1] = TG.regex.re(d + 1) end
+			out[#out + 1] = "(" .. concat(alts, "|") .. (chance(0.9) and ")" or "")
+		else
+			out[#out + 1] = "()"
+		end
+	end
+	return concat(out)
+end
+function TG.regex.gen()
+	local re = TG.regex.re()
+	if chance(0.5) then
+		local lit = {}
+		for c in re:gmatch(".") do lit[#lit + 1] = c end
+		-- literal form: some chars quoted, a variable spliced in, shell-special chars escaped
+		local out = {}
+		for _, c in ipairs(lit) do
+			if c:match("[ ;&|<>]") then c = "\\" .. c end
+			out[#out + 1] = c
+		end
+		local s = concat(out)
+		local k = r(4)
+		if k == 1 then s = "\"" .. s .. "\""
+		elseif k == 2 then s = s .. "\".\"" .. pick({ "$p", "$g", "${w}", "'x*'" })
+		elseif k == 3 then s = "'" .. s:gsub("'", "") .. "'" .. s end
+		return "l " .. nosub(s) .. "\n" .. TG.glob.str()
+	end
+	return "v " .. re .. "\n" .. TG.glob.str()
+end
+TG.regex.dict = { "(", ")", "|", "*", "+", "?", "{", "}", "[", "]", "^", "$", ".", "\\", "[:alpha:]", "\"", "'", "$p", "l ", "v " }
+
+-- language-agnostic edits
+local function span(s)
+	local i = r(#s + 1)
+	return i, math.min(#s, i + r(8) - 1)
+end
+local function tone(tg, s, add)
+	local L = TG[tg]
+	local hdr, body = s:match("^(#@[^\n]*\n)(.*)$")
+	hdr, body = hdr or "", hdr and body or s
+	local k = r(100)
+	if k <= 12 or #body == 0 then
+		return hdr .. L.gen(), "t-gen"
+	elseif k <= 20 then
+		local opts = {}
+		for _ = 1, r(3) do opts[#opts + 1] = pick(HDRS) end
+		return (chance(0.2) and "" or "#@ " .. concat(opts, " ") .. "\n") .. body, "t-hdr"
+	end
+	local i, j = span(body)
+	local pre, mid, post = body:sub(1, i - 1), body:sub(i, j), body:sub(j + 1)
+	if k <= 45 then -- a span -> a generated fragment of the language
+		local f = L.frag and L.frag() or L.gen()
+		f = f:gsub("\n.*", "")
+		return hdr .. pre .. f .. post, "t-frag"
+	elseif k <= 60 then
+		return hdr .. pre .. pick(L.dict) .. (chance(0.5) and mid or "") .. post, "t-dict"
+	elseif k <= 68 then
+		return hdr .. pre .. post, "t-drop"
+	elseif k <= 74 then
+		return hdr .. pre .. mid .. mid .. post, "t-dup"
+	elseif k <= 82 and add and #add > 0 then
+		local a, b = r(#add), r(#add)
+		if a > b then a, b = b, a end
+		return hdr .. pre .. add:sub(a, math.min(b, a + 16)) .. post, "t-splice"
+	elseif k <= 90 then
+		local d0, d1 = body:find("%-?%d+")
+		if d0 then
+			return hdr .. body:sub(1, d0 - 1) .. pick(NUMS) .. body:sub(d1 + 1), "t-num"
+		end
+		return hdr .. pre .. tnum() .. post, "t-num"
+	elseif k <= 95 then
+		return hdr .. pre .. pick({ "\n", "\\", "'", "\"", "\0", "\xff", "é", "\t", " ", "}", "{", "$" }) .. post, "t-byte"
+	end
+	return hdr .. body:sub(1, r(#body + 1) - 1), "t-trunc"
+end
+local function tmutate(tg, s, add, max)
+	STATS.calls = STATS.calls + 1
+	local n = chance(0.6) and 1 or (1 + r(3))
+	local out, descs = s, {}
+	for _ = 1, n do
+		local o, d = tone(tg, out, add)
+		if o then
+			out = nosub(o)
+			descs[#descs + 1] = d
+			count(d)
+		end
+	end
+	max = math.min(max, 2048)
+	if #out > max then
+		out = out:sub(1, max)
+	end
+	return out, concat(descs, "+")
+end
+local TARGET = os.getenv("GRAM_TARGET")
+if TARGET and not TG[TARGET] then
+	TARGET = nil -- (parse, or a script mode: the script mutator)
+end
+if TARGET then
+	mutate = function(s, add, max)
+		return tmutate(TARGET, s, add, max)
+	end
+	classify = function()
+		return "ok"
+	end
+end
+
 -- ---- the protocol -----------------------------------------------------------------------
 -- request:  "M" u32 seed u32 max u32 len <len bytes> u32 addlen <addlen bytes>
 -- response: u32 len <len bytes> u8 dlen <dlen bytes>

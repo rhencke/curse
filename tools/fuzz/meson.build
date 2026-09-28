@@ -5,11 +5,11 @@ afl_fuzz = find_program('afl-fuzz', required: false)
 fuzz_sh  = files('fuzz.sh')
 if afl_cc.found() and afl_fuzz.found()
   fuzz_harness = custom_target('fuzz-harness',
-    input:   [files('build.sh', 'harness.c', 'afl_glue.c', 'sandbox.h', 'sbx.c'), curse_bundle_c, libluajit],
-    output:  ['harness', 'harness-plain', 'sbx'],
+    input:   [files('build.sh', 'harness.c', 'afl_glue.c', 'sandbox.h', 'sbx.c', 'bashco.h'), curse_bundle_c, libluajit],
+    output:  ['harness', 'harness-target', 'harness-plain', 'sbx'],
     command: ['sh', '@INPUT0@', afl_cc, meson.get_compiler('c').cmd_array()[0],
       meson.current_source_dir(), meson.project_build_root() / 'luajit-build' / 'src',
-      '@INPUT5@', '@INPUT6@', meson.current_build_dir()],
+      '@INPUT6@', '@INPUT7@', meson.current_build_dir()],
     build_by_default: false)
   gram_mutator = shared_module('gram_mutator', files('gram_mutator.c'),
     name_prefix: '',
