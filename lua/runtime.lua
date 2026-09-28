@@ -7300,9 +7300,14 @@ end
 -- pushParams, so a stage gets fresh ones.
 function Shell:stage_clone()
 	local c = setmetatable({}, getmetatable(self))
+	-- (no trap may run in the middle of the copy: one that adds a field to the shell — its
+	-- wait_sig, a counter — makes pairs' traversal skip keys, and the clone came out without
+	-- its `traps` — the stage's iso_undo then indexed nil (leftovers P3, under a signal storm))
+	cap_enter()
 	for k, v in pairs(self) do
 		c[k] = type(v) == "table" and shallowcopy(v) or v
 	end
+	cap_leave()
 	c.subdepth = (self.subdepth or 0) + 1 -- (a stage is a subshell)
 	c.clone_parent, c.clone_gen = self, M.fd_gen -- (the fds it inherits: M.fd_register)
 	c.subenv = true -- (subshell_environment, even where $BASH_SUBSHELL doesn't count it)
@@ -7327,6 +7332,7 @@ function Shell:stage_clone()
 	c.paren_sp = nil -- (a stage is a subshell of its own, not the `( … )` it may sit in)
 	c.loopdepth = 0
 	c.capturing = nil
+	flush_deferred(self) -- (a trap held during the copy runs now)
 	return c
 end
 local function env_copy(envp)
