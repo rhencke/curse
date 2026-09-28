@@ -2324,9 +2324,18 @@ end
 -- prefix, in posix mode) is FORCE_EOF in a non-interactive shell — exit 1, 127 for the
 -- -c string (run_one_command) — else DISCARD, the rest of the line abandoned (a script
 -- and a -c string alike).
+-- The status a FORCE_EOF jump ends the shell with: 127 for the -c string's top level
+-- (shell.c run_one_command), else `base` (1) — a subshell's or $(…)'s own top level catches
+-- it first (bash's forked child: `( : ${x?} )` is 1 under -c too). sh.subtop: such a top
+-- level is in force — execute_in_subshell (`( … )`, a compound pipeline stage or async list)
+-- or command_substitute; a simple command bash forks straight from execute_simple_command
+-- (a pipeline stage, `cmd &`) jumps to the -c string's own.
+function M.feof_st(sh, base)
+	return sh.opt_c and not sh.subtop and 127 or base or 1
+end
 function M.assign_jump(sh, force)
 	if force and sh.opt_posix and not sh.opt_i then
-		error({ __curse_exit = sh.opt_c and 127 or 1 })
+		error({ __curse_exit = M.feof_st(sh) })
 	end
 	error({ __curse_exit = 1, __curse_lineabort = true })
 end
@@ -2376,6 +2385,20 @@ function M.redir_undo(saves)
 	if M.jobnote then -- (a job report waiting for the command's redirections to go)
 		M.jobnote_flush()
 	end
+	if M.sig_defer then -- (a signal the command sent the shell: its trap runs now)
+		local dsh = M.sig_defer
+		M.self_sig_release(dsh ~= true and dsh or nil)
+	end
+end
+-- An error raised out of a compiled command run under its redirections (EF.redir_wrap):
+-- the fds come back before it propagates — bash's cleanup_redirects unwind-protect (a
+-- special builtin's usage error abandoning the line, `return`, break/continue). A plain
+-- `exit` keeps them: in a script, bash's jump to the top level runs the EXIT trap first.
+function M.redir_unwind(saves, err)
+	if not (type(err) == "table" and err.__curse_exit and not err.__curse_lineabort) then
+		M.redir_restore(saves)
+	end
+	error(err, 0)
 end
 function M.redir_restore(saves) -- (a compiled command's)
 	io.flush()
@@ -2854,7 +2877,14 @@ do
 	-- Inside a trap handler the async delivery can't run another trap until the handler is
 	-- done (the VM hook doesn't nest), but bash runs it right away, nested — even the same
 	-- signal's own. So there, take the pending signal off the queue and run its trap here.
-	function M.self_sig_release(sh)
+	-- (`defer`: the kill command's own redirections are in place — bash runs the trap once
+	-- the command is done, after execute_simple_command undid them: released by redir_undo)
+	function M.self_sig_release(sh, defer)
+		if held and defer then
+			M.sig_defer = sh or true
+			return
+		end
+		M.sig_defer = nil
 		if held then
 			held = false
 			local h = sh and (sh.in_trap or 0) > 0 and sh.traps
@@ -3510,12 +3540,14 @@ local function subprog_enter(self)
 	self.shlvl_tail = nil
 	self.in_subprogram = (self.in_subprogram or 0) + 1
 	self.subdepth = (sd or 0) + 1
+	local stp = self.subtop
+	self.subtop = true -- (its own top level: M.feof_st)
 	-- (and $!: a job the subprogram starts is its own — bash's forked child sets its
 	-- own last_asynchronous_pid, the parent's is untouched)
-	return al, ln, cc, tl, cl, ld, sd, self.last_bg_pid -- (the saved state as values: no table)
+	return al, ln, cc, tl, cl, ld, sd, self.last_bg_pid, stp -- (the saved state as values: no table)
 end
-local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd, lb)
-	self.last_bg_pid = lb
+local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd, lb, stp)
+	self.last_bg_pid, self.subtop = lb, stp
 	self.aliases, self.cur_line, self.cur_cmd, self.shlvl_tail = al, ln, cc, tl
 	self.cur_cline, self.loopdepth, self.subdepth = cl, ld, sd
 	self.in_subprogram = self.in_subprogram - 1
@@ -3525,7 +3557,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	-- ($(…) inside a loop knows it — a break/continue there ends the substitution, as it
 	-- ends a `( … )` (bash) — so its loopdepth stays)
-	local s1, s2, s3, s4, s5, s6, s7, s8 = subprog_enter(self)
+	local s1, s2, s3, s4, s5, s6, s7, s8, s9 = subprog_enter(self)
 	local buf, tmp, save1
 	if capfd then
 		io.flush()
@@ -3597,7 +3629,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		end
 		M.iso_restore_fds(ctx) -- (`exec 4>&1` in the body: undone while fd 1 is still the capture)
 	end
-	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7, s8)
+	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7, s8, s9)
 	self.hashcache, self.hashpath = sv_hc, sv_hp
 	self.opt_e = savede
 	self.capturing = saved_cap
@@ -4718,7 +4750,7 @@ function M.lua_overflow(sh, err)
 	return { __curse_exit = 1 }
 end
 function Shell:subshell_run(runner, saves, paren, inplace)
-	local s1, s2, s3, s4, s5, s6, s7, s8 = subprog_enter(self)
+	local s1, s2, s3, s4, s5, s6, s7, s8, s9 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
 	local sv_out, sv_ne = self.out, self.noerr
 	local sv_psp = self.paren_sp -- (a `( … )`: the subprogram level that is one — exec.def's SUBSHELL_PAREN)
@@ -4787,7 +4819,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.bgp_cleared = sv_bgpc
 	if saves then M.redir_restore(saves) end
 	self.out, self.noerr, self.paren_sp = sv_out, sv_ne, sv_psp
-	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7, s8)
+	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7, s8, s9)
 	sub_restore(self, cp)
 	flush_deferred(self) -- (the parent's signals: its traps run in its own state)
 	if killed then -- the parent's report of its child that a signal killed (a `( … )`: its text)
@@ -6258,7 +6290,8 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 	-- (a lastpipe last stage IS the shell: it writes the capture directly, as the shell does —
 	-- its fds are adopted at the end, so a drain pipe on its fd 1 would never see EOF)
 	local drain_r, drain_out
-	local bufcap = self.capturing and self.out ~= io.write and not CO_OUTS[self.out]
+	-- (not when the launcher gave it a stdout of its own: a <(…)'s pipe — bg_launch)
+	local bufcap = self.capturing and self.out ~= io.write and not CO_OUTS[self.out] and not base.own1
 	if bufcap and not lastpipe then
 		if M.pipe_hi(pst) ~= 0 then
 			return fail()
@@ -6378,6 +6411,9 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 			local kind = inproc[i]
 			if kind == "flat" or kind == "sflat" then -- ($BASH_SUBSHELL: a `( … )` stage counts
 				sh.subdepth = sh.subdepth - 1 -- once; a simple command running no shell code, not at all)
+			end
+			if kind ~= "sflat" and kind ~= "simple" then
+				sh.subtop = true -- (a compound stage: execute_in_subshell's top level — M.feof_st)
 			end
 			if kind == "sflat" or kind == "simple" then
 				sh.loopdepth = self.loopdepth -- (see stage_kind)
@@ -7079,6 +7115,7 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 		co_cl(ctx, base.fd[k])
 		base.fd[k] = co_cx(ctx, fd)
 	end
+	base.own1 = opts.fds and opts.fds[1] and true
 	if not self.opt_m and (self.stdin_redir or 0) == 0 and not piped and not opts.keepstdin
 		and not (opts.fds and opts.fds[0]) then -- (async: stdin </dev/null)
 		co_cl(ctx, base.fd[0])
@@ -7101,12 +7138,16 @@ function Shell:bg_launch(fn, cmdstr, flat, simple, upv_get, upv_set, opts)
 			M.vpid_tasks[vpid] = t -- (`kill $!` before it has even run)
 		end
 	end
+	-- (…unless its stdout is a pipe of its own: a <(…) writes there, never into the capture)
 	local bufcap = self.capturing and self.out ~= io.write and not CO_OUTS[self.out]
+		and not (opts.fds and opts.fds[1])
 	for _, t in pairs(ctx.bycoro) do
 		if t.g == g and t.sh then
 			t.sh.in_pipestage = (t.sh.in_pipestage or 1) - 1 -- (not a pipeline stage: an async list)
 			t.sh.in_subprogram = (t.sh.in_subprogram or 0) + 1
 			t.sh.loopdepth = g.simple and self.loopdepth or 0 -- (a simple job keeps it: stage_kind)
+			-- (a compound job: execute_in_subshell's top level; a simple one's is the launcher's — M.feof_st)
+			t.sh.subtop = not g.simple or self.subtop
 			t.jc = jc -- (job control: its process group takes every signal — task_kill_job)
 			if not opts.nojob then -- (an async child's without_job_control: delete_all_jobs —
 				-- `jobs` lists none, %1 is no such job, `wait PID` isn't its child; a <()/>()
@@ -9116,7 +9157,7 @@ function Shell:attr_string_u(name)
 	local has = b and (b.s ~= nil or b.n ~= nil or (b.arr and next(b.arr) ~= nil))
 	if self.opt_u and not has and self:special_get(name) == "" then
 		io.stderr:write("curse: " .. name .. ": unbound variable\n")
-		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+		error({ __curse_exit = M.feof_st(self), __curse_lineabort = self.opt_i or nil })
 	end
 	return self:attr_string(name)
 end
@@ -9294,7 +9335,7 @@ function M.assign_word(sh, w)
 end
 function M.posix_arith_fatal(sh, err)
 	if sh.opt_posix and not sh.opt_i and err.__curse_matherr then
-		error({ __curse_exit = sh.opt_c and 127 or 1 }, 0)
+		error({ __curse_exit = M.feof_st(sh) }, 0)
 	end
 end
 -- `kill -l` / `trap -l`: bash's display_signal_list — `%2d) SIGNAME` five to a line,
@@ -9454,7 +9495,8 @@ end
 function M.too_many(sh, cmd)
 	io.stderr:write("curse: " .. cmd .. ": too many arguments\n")
 	sh.status = 1
-	error({ __curse_exit = 1, __curse_lineabort = not sh.opt_c or nil })
+	-- (no_args: top_level_cleanup + DISCARD — past an eval's or a sourced file's containment)
+	error({ __curse_exit = 1, __curse_lineabort = not sh.opt_c or nil, __curse_discard = not sh.opt_c or nil })
 end
 -- bash's internal_getopt rejection: `CMD: -X: invalid option` + the usage line, status 2.
 -- (word: the option word — a `--help` there is internal_getopt's GETOPT_HELP: the builtin's
@@ -9603,7 +9645,7 @@ function M.last_bg_u(sh, braced)
 	local v = sh.last_bg_pid
 	if v == nil and sh.opt_u then
 		io.stderr:write("curse: " .. (braced and "!" or "$!") .. ": unbound variable\n")
-		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+		error({ __curse_exit = M.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 	end
 	return v or ""
 end
@@ -9612,7 +9654,7 @@ end
 function Shell:param_u(n, braced)
 	if self.opt_u and n > self.nparams then
 		io.stderr:write("curse: " .. (braced and "" or "$") .. n .. ": unbound variable\n")
-		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+		error({ __curse_exit = M.feof_st(self), __curse_lineabort = self.opt_i or nil })
 	end
 	return self:param(n)
 end
@@ -9632,7 +9674,7 @@ function Shell:get_u(name)
 	end
 	if self.opt_u and unset and self:special_get(name) == "" and name ~= "@" and name ~= "*" then
 		io.stderr:write("curse: " .. name .. ": unbound variable\n")
-		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+		error({ __curse_exit = M.feof_st(self), __curse_lineabort = self.opt_i or nil })
 	end
 	return self:get(name)
 end
@@ -10826,7 +10868,7 @@ function M.array_count_u(sh, name, shown)
 		if (b == nil and c == 0 and sh:special_get(name) == "") -- (nil but counted: a virtual array)
 			or (b and (not b.arr or (b.empty_decl and next(b.arr) == nil))) then
 			io.stderr:write("curse: " .. (shown or name) .. ": unbound variable\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = M.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 	end
 	return c
@@ -13993,7 +14035,7 @@ function M.elem_len_pre(sh, name)
 	-- read as it's found: `${#RANDOM[1]}` steps the generator, as bash's find_variable does)
 	if sh.opt_u and not (seen and (sh.vars[sh:deref(name)] or {}).arr) then
 		io.stderr:write("curse: " .. name .. ": unbound variable\n")
-		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+		error({ __curse_exit = M.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 	end
 	if not seen then
 		return "0"
@@ -14299,7 +14341,7 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	then
 		local lbl = pe.uname or (op == "len" and name) or M.pe_label(pe)
 		io.stderr:write("curse: " .. lbl .. ": unbound variable\n")
-		error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+		error({ __curse_exit = M.feof_st(self), __curse_lineabort = self.opt_i or nil })
 	end
 	-- := / = write back to the SAME target that was read: an array element when
 	-- subscripted (${a[0]=x} must populate a[0]), else the scalar variable.
@@ -14353,14 +14395,14 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 	if op == ":?" then
 		if val == "" then -- (no word at all: bash's own words)
 			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": " .. ((arg == nil or arg == "") and "parameter null or not set" or A()) .. "\n")
-			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+			error({ __curse_exit = M.feof_st(self), __curse_lineabort = self.opt_i or nil })
 		end
 		return val
 	end
 	if op == "?" then
 		if not isset then
 			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": " .. ((arg == nil or arg == "") and "parameter not set" or A()) .. "\n")
-			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+			error({ __curse_exit = M.feof_st(self), __curse_lineabort = self.opt_i or nil })
 		end
 		return val
 	end
@@ -14381,7 +14423,7 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 		local b = self.opt_u and not isset and (arg == "a" or arg == "A") and not index and self.vars[self:deref(name)]
 		if self.opt_u and not isset and not (b and b.arr and next(b.arr) ~= nil) then
 			io.stderr:write("curse: " .. (pe.uname or M.pe_label(pe)) .. ": unbound variable\n")
-			error({ __curse_exit = self.opt_c and 127 or 1, __curse_lineabort = self.opt_i or nil })
+			error({ __curse_exit = M.feof_st(self), __curse_lineabort = self.opt_i or nil })
 		end
 		-- @a reports the VARIABLE's attributes (e.g. `A` for a declared assoc array),
 		-- so it's non-empty even when the scalar view (a[0]) is unset; the other
@@ -15478,14 +15520,14 @@ function M.parse_error_stmt(sh, st, label)
 		sh.in_perr_force = true
 		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
 		sh.in_perr_force = nil
-		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = sh.opt_c and 127 or 2 })
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = M.feof_st(sh, 2) })
 	end
 	-- (a sourced file's FORCE_EOF ends the shell as an eval's does, status 1)
 	if st.forceeof and not tl and (sh.sourcedepth or 0) > 0 and not sh.in_perr_force then
 		sh.in_perr_force = true
 		local _, pe = pcall(M.parse_error_stmt, sh, st, label)
 		sh.in_perr_force = nil
-		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true })
+		error(type(pe) == "table" and pe.__curse_perrexit and pe or { __curse_exit = M.feof_st(sh), __curse_perrexit = true })
 	end
 	-- (under -c every FORCE_EOF reaches run_one_command's top level: status 127 — shell.c)
 	if (label or sh.perr_label) == "eval" and (st.forceeof -- (FORCE_EOF: ends the shell, status 1)
@@ -15554,7 +15596,7 @@ function M.parse_error_stmt(sh, st, label)
 	-- FORCE_EOF rather than DISCARD — it ends, status 1)
 	if st.discard and st.status == 1 and sh.opt_posix and not sh.opt_i then
 		sh.status = 1
-		error({ __curse_exit = sh.opt_c and 127 or 1, __curse_perrexit = true }) -- (past eval/source's containment)
+		error({ __curse_exit = M.feof_st(sh), __curse_perrexit = true }) -- (past eval/source's containment)
 	end
 	-- (the reader's own input — script, stdin, -c — keeps a failed last command's status;
 	-- an eval'd or sourced text's parse returns 2)
@@ -16345,7 +16387,7 @@ end
 -- under -c/posix, else line-abort), exactly as interp's expand_param.
 function M.param_error(sh, name, msg)
 	io.stderr:write("curse: " .. name .. ": " .. msg .. "\n")
-	error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+	error({ __curse_exit = M.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 end
 
 -- ${a[@]OP}/${a[*]OP} per-element string-op for the compiled tier: map apply_str_op
@@ -17089,10 +17131,10 @@ end
 -- set -x of a QUOTED [[ == ]] pattern text: every character backslashed, as bash's
 -- quote_string_for_globbing shows it (`"ab"` → \a\b)
 function M.xglob_quote(s)
-	if M.mbx and s:find("[\128-\255]") then
-		return M.mb_quote(s) -- (Big5/GBK/SJIS: by the locale's characters)
+	if lc_mb_cur_max > 1 and s:find("[\128-\255]") then
+		return M.mb_quote(s) -- (by the locale's characters: a stray byte is one of its own)
 	end
-	return (s:gsub("[%z\1-\127\194-\244][\128-\191]*", "\\%0"))
+	return (s:gsub(".", "\\%0")) -- (a single-byte locale, or ASCII: every byte a character)
 end
 function M.xtilde(sh, tok) -- (a pattern's leading ~prefix, traced: its directory reads as quoted)
 	local d = M.tilde_prefix(sh, tok)

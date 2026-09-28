@@ -291,6 +291,9 @@ local function scan_program(node, acc)
 	local w1 = node.t == "simple" and node.words and node.words[1]
 	local c1 = w1 and w1.parts[1] and w1.parts[1].lit -- (the first word's first part)
 	local lit1 = c1 and #w1.parts == 1 and c1 -- (the first word, all literal)
+	if node.t == "select" then
+		acc.select = true -- (an empty list leaves a loop level counted: EF.select_leak)
+	end
 	if c1 == "enable" then
 		acc.enable = true -- `enable -n` disables builtins: compiled builtin calls check (H.simple)
 	end
@@ -898,7 +901,52 @@ end
 -- A command body run under redirections r (a redir_conds expression): a failed one is
 -- $?=1 and nothing runs; either way the fds are restored after. bi: a builtin's body — a
 -- write error it flags (full disk) is judged by rt.CHKWRITE (bash's sh_chkwrite callers).
+-- A body that is ONE call (`rt.builtin(sh, __a, __noop); io.flush()`, `rt.run_prefix(…)`)
+-- runs under pcall — no closure, so no captured locals: an error it raises past the command
+-- (a special builtin's usage error abandoning the line, `return`, a loop control) restores
+-- the fds on its way out, as bash's cleanup_redirects unwind-protect does (rt.redir_unwind).
+local function one_call(body)
+	local f, rest = body:match("^([%w_%.]+)(%(.*)$")
+	local m
+	if not f then
+		m, rest = body:match("^sh:([%w_]+)(%(.*)$")
+		if not m then
+			return nil
+		end
+	end
+	local depth, close = 0, nil
+	for i = 1, #rest do
+		local c = rest:sub(i, i)
+		if c == "(" then
+			depth = depth + 1
+		elseif c == ")" then
+			depth = depth - 1
+			if depth == 0 then
+				close = i
+				break
+			end
+		elseif c == '"' or c == "'" or c == "[" then
+			return nil -- (a string or long bracket: not scanned)
+		end
+	end
+	if not close then
+		return nil
+	end
+	local tail = rest:sub(close + 1)
+	if tail ~= "" and tail ~= "; io.flush()" then
+		return nil
+	end
+	local args = rest:sub(2, close - 1)
+	if m then
+		return ("pcall(sh.%s, sh%s)"):format(m, args ~= "" and ", " .. args or ""), tail
+	end
+	return ("pcall(%s%s)"):format(f, args ~= "" and ", " .. args or ""), tail
+end
 function EF.redir_wrap(r, body, bi)
+	local pc, tail = one_call(body)
+	if pc then
+		body = ("local __ok, __e = %s%s; if not __ok then rt.redir_unwind(__rs, __e) end"):format(pc, tail)
+	end
 	return ("do local __rs = {}; if %s then %s%s else sh.status = rt.redir_failst(sh) end; rt.redir_restore(__rs)%s end"):format(r,
 		bi and "sh.write_err = nil; " or "", body, bi and "; if sh.write_err then rt.chkwrite_late(sh, __a) end" or "")
 end
@@ -927,6 +975,7 @@ function EF.xta(lhs, v) -- an assignment `lhs` (`x=`, `a[i]+=`) of the expanded 
 	return EF.xtrace and ("if sh.opt_x then %srt.xtrace_assign(sh, %q, %s) end "):format(EF.xln(), lhs, v) or ""
 end
 EF.trap_loopctl = false -- a trap handler may break/continue → loops check sh.loopctl (flatten_list)
+EF.select_leak = false -- an empty select may leave a loop level counted (see emit)
 EF.LC_LOOP = { forc = true, whilec = true, forin = true, select = true }
 EF.has_return = false -- program may set a RETURN trap → compiled calls fire it (fnwrap)
 EF.bash_command = false -- program reads $BASH_COMMAND → each command records its text (dbg)
@@ -1032,7 +1081,7 @@ local function fnwrap(cmd, line, s)
 		pre = pre .. ("local __dbg = rt.debug_enter(sh, %q); "):format(cmd)
 		post = post .. "; rt.debug_leave(sh, __dbg)"
 	end
-	if EF.trap_loopctl then -- (a function starts outside any loop: bash's loop_level)
+	if EF.trap_loopctl or EF.select_leak then -- (a function starts outside any loop: bash's loop_level)
 		pre = "local __ld, __lc = sh.loopdepth, sh.lc_depth; sh.loopdepth, sh.lc_depth = 0, 0; " .. pre
 		post = post .. "; sh.loopdepth, sh.lc_depth = __ld, __lc"
 	end
@@ -5368,6 +5417,21 @@ EF.simple_native = function(cx, st, after, cmd)
 	if st.line and not EF.trapline then
 		xt = xt .. "; sh.cur_line = " .. st.line
 	end
+	-- (a $(…) in a NAME=(…) literal or a prefix value the runner expands numbers its body
+	-- from this command's line — capture_src's cur_cline, as fb_step sets it)
+	if (st.arrayargs or bind) and not (EF.trapline and not EF.cur_infunc) then
+		local cs = false
+		for _, aa in ipairs(st.arrayargs or {}) do
+			cs = cs or (aa.src or ""):find("$(", 1, true) or (aa.src or ""):find("`", 1, true)
+		end
+		for _, a in ipairs(st.assigns or {}) do
+			local sx = a.rhs and a.rhs.src or a.raw or ""
+			cs = cs or sx:find("$(", 1, true) or sx:find("`", 1, true)
+		end
+		if cs then
+			xt = xt .. ("; sh.cur_cline = %d"):format(EF.cur_cline or EF.cur_line or st.line or 0)
+		end
+	end
 	return cx.dispatch(st, after, {
 		prelude = table.concat(out, "; ") .. xt,
 		callee = "rt.simple_run",
@@ -5896,8 +5960,14 @@ simple_compiled = function(cx, st, after)
 		if st.assigns then
 			local ec = errchk(st)
 			local pr = cx.newpc()
-			cx.blocks[pr] = ("do local __rs = {}; if not (%s) then sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d"):format(
-				redir_apply or "true", ec ~= "" and ("; " .. ec) or "", after)
+			if require("runtime").null_forks(st.redirs) then -- (bash forks for these: rt.null_forks — the
+				-- child does the redirections and exits, a {v} is never set here; as interp's)
+				cx.blocks[pr] = ("rt.null_redirs_fork(sh, %s[1])%s; pc = %d"):format(EF.konst({ ser(st.redirs) }),
+					ec ~= "" and ("; " .. ec) or "", after)
+			else
+				cx.blocks[pr] = ("do local __rs = {}; if not (%s) then sh.status = 1 end; rt.redir_restore(__rs) end%s; pc = %d"):format(
+					redir_apply or "true", ec ~= "" and ("; " .. ec) or "", after)
+			end
 			return H.assignlist(cx, { t = "assignlist", list = st.assigns, line = st.line, negate = true }, pr)
 		end
 		local p = cx.newpc()
@@ -7161,7 +7231,7 @@ H.select = function(cx, st, after)
 	if EF.xtrace then
 		xh = EF.xtl(("%q"):format(htext)) .. xh
 	end
-	parts[#parts + 1] = ("%sif #__l == 0 then sh.status = 0; pc = %d else sh.forstate[%d] = __l; rt.select_menu(sh, __l); pc = %d end"):format(
+	parts[#parts + 1] = ("%sif #__l == 0 then sh.loopdepth = (sh.loopdepth or 0) + 1; sh.status = 0; pc = %d else sh.forstate[%d] = __l; rt.select_menu(sh, __l); pc = %d end"):format(
 		xh, after, st.id, advp)
 	local sv_line = EF.cur_line -- (the list expands at the `select` line: H.forin's init)
 	EF.cur_line = st.line or sv_line
@@ -7881,7 +7951,8 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			end
 			local ext = v:find("sh:exec(", 1, true) or v:find("sh:exec_t(", 1, true)
 				or v:find("rt.exec_dynamic(", 1, true)
-			if cx.cur_simple and ext then
+			-- (and a redirected one's: a signal `kill` sends the shell waits for them to go — b_kill)
+			if cx.cur_simple and (ext or (cx.cur_simple.redirs and #cx.cur_simple.redirs > 0)) then
 				pcline.tx = pcline.tx or {}
 				pcline.tx[k] = cx.cur_simple
 			end
@@ -8558,6 +8629,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 						cx.blocks[p] = d .. ("error({ __curse_%s = %d })"):format(cf_op, lvl)
 					elseif cx.frag_loop == "loop" then -- (the stage/job it is ends: nothing to say)
 						cx.blocks[p] = d .. ("sh.status = 0; pc = %d"):format(after)
+					elseif EF.select_leak and not cx.frag_loop then -- (a level an empty select left: EF.select_leak)
+						cx.blocks[p] = d .. ("if (sh.loopdepth or 0) == 0 then if not sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d else sh.status = 0; error({ __curse_%s = math.min(%d, sh.loopdepth) }) end"):format(
+							"curse: " .. cf_op .. ": only meaningful in a `for', `while', or `until' loop\n", after, cf_op, lvl)
 					else -- outside any loop: bash says so (status 0) and carries on
 						cx.blocks[p] = d .. ("if %snot sh.opt_posix then io.stderr:write(%q) end; sh.status = 0; pc = %d"):format(
 							cx.frag_loop and "(sh.loopdepth or 0) == 0 and " or "",
@@ -9351,6 +9425,10 @@ function M.emit(ast, opts)
 	EF.trap_loopctl = EF.lm or (not EF.fragment and scan.trap_lc)
 		or (EF.fragment and (scan.trap_lc or (opts and opts.trap_lc))) or false
 	EF.lc_rel = EF.trap_loopctl and EF.fragment and not EF.lm or false
+	-- (bash 5.2's execute_select_command counts a loop level it never uncounts when the list
+	-- is empty: a later break/continue outside every loop then ends the input's commands —
+	-- one the program's own select, or eval/source code's, may leave: checked at run time)
+	EF.select_leak = scan.select or scan.dyncode or false
 	-- (in line mode the live reader already expanded this line's aliases)
 	local alias_kind = EF.lm and "none" or scan_alias(ast.stmts)
 	if alias_kind == "dynamic" or (alias_kind == "static" and scan.dyncode) then

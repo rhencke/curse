@@ -821,7 +821,7 @@ local function arith_nounset(sh, name)
 		if (b == nil or (b.arr == nil and b.s == nil and b.n == nil) or (b.empty_decl and b.arr and next(b.arr) == nil))
 			and sh:special_get(name) == "" then
 			io.stderr:write("curse: " .. name .. ": unbound variable\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil, __curse_unbound = true })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil, __curse_unbound = true })
 		end
 	end
 end
@@ -1674,7 +1674,7 @@ local function expand_pexp(sh, p, assign)
 	if pe.op == "badsubst" then -- ${x|html} and other unrecognized ${…} forms
 		if pe.fatal then
 			sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		if pe.xform then -- ${x@Z}: nothing to transform on an unset x; else FATAL (bash)
 			local set
@@ -1688,7 +1688,7 @@ local function expand_pexp(sh, p, assign)
 				return ""
 			end
 			sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		sherr(sh, "curse: " .. M.bs_text(sh, pe) .. ": bad substitution\n")
 		error({ __curse_exit = 1, __curse_lineabort = true }) -- discards the rest of the line (bash)
@@ -1873,13 +1873,13 @@ expand_part_str = function(sh, p, assign)
 		end
 		if sh.opt_u and unset and sh:special_get(p.var) == "" then
 			io.stderr:write("curse: " .. (p.uname or p.var) .. ": unbound variable\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		return sh:get(p.var)
 	elseif p.param then
 		if sh.opt_u and p.param > sh.nparams then
 			io.stderr:write("curse: " .. (p.braced and "" or "$") .. p.param .. ": unbound variable\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		return sh:param(p.param)
 	elseif p.special then
@@ -2254,7 +2254,7 @@ indirect_part = function(sh, pe, quiet)
 		end
 		io.stderr:write("curse: " .. (pe.name and rt.pe_label(pe) or "") .. ": invalid indirect expansion\n")
 		if sh.opt_u then
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
@@ -2527,7 +2527,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			local msg = pe.arg and pe.arg ~= "" and expand_word(sh, M.lazy_word(pe.arg))
 				or (pe.op == "?" and "parameter not set" or "parameter null or not set")
 			io.stderr:write("curse: " .. rt.pe_label(pe) .. ": " .. msg .. "\n")
-			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
+			error({ __curse_exit = rt.feof_st(sh), __curse_lineabort = sh.opt_i or nil })
 		elseif (pe.op == "=" or pe.op == ":=") and #els == 0 then
 			-- ${@=x} / ${a[@]=x}: nothing to assign to — bash aborts the line. An ASSOC
 			-- takes `@`/`*` as a literal key (bash: ${A[@]:=foo} sets A[@])
@@ -5158,9 +5158,9 @@ local function eval_dbracket(sh, node)
 				xr = { rt.xglob_quote(r) }
 			end
 		end
-		if sh.opt_x then -- (an empty operand traces as '')
-			r = xr and xr[1] or r
-			dbracket_trace(sh, (l == "" and "''" or l) .. " " .. op .. " " .. (r == "" and "''" or r))
+		if sh.opt_x then -- (an empty operand traces as ''; the traced text isn't the operand)
+			local tr = xr and xr[1] or r
+			dbracket_trace(sh, (l == "" and "''" or l) .. " " .. op .. " " .. (tr == "" and "''" or tr))
 		end
 		local ic = sh.shopt.nocasematch and true or nil -- shopt -s nocasematch: case-insensitive
 		if op == "==" or op == "=" then
@@ -6410,7 +6410,8 @@ exec_stmt = function(sh, st, hook)
 		if not eok then
 			error(eerr, 0)
 		end
-		if #list == 0 then
+		if #list == 0 then -- (bash 5.2's execute_select_command returns here past its
+			sh.loopdepth = ld0 + 1 -- loop_level++, never undone: the level stays counted — rt.select_leak)
 			sh.status = 0
 			return
 		end
@@ -6792,6 +6793,11 @@ local function finish(sh, ok, err)
 			sh.status = err.__curse_exit
 		elseif type(err) == "table" and err.__curse_return then
 			sh.status = err.__curse_return
+		elseif type(err) == "table" and (err.__curse_break or err.__curse_continue) then
+			-- (a break/continue out past every loop — a level an empty `select` left counted:
+			-- bash's `breaking` then skips each command to the end of the input)
+			sh.status = err.__curse_status or sh.status
+			ok = true
 		else
 			error(err)
 		end
