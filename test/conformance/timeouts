@@ -18,3 +18,4 @@ cases     2524-wait-killed-jobs-order.sh 40 # ~4-7s unloaded (18.7s of bash seen
 cases     3343-glob-many-stars-variants.sh 30 # ~0.4s for bash, ~3.5s for curse: 100000-star patterns through the faithful matcher (smatch)
 cases     3345-subshell-cpu-limit-variants.sh 40 # ~6s of pure CPU in every shell: five subshells spin until their CPU-time limit (1-3s) ends them
 cases     3348-term-during-inproc-subshell.sh 30 # ~4s: four runs, each spinning 1s before its SIGTERM
+cases     3365-brace-expansion-no-cap.sh 30 # ~5s: bash expands 150 brace ranges of 100001 words (the loop the case needs) plus ~1M more words

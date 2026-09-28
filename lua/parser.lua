@@ -3091,10 +3091,11 @@ end
 -- brace groups); ranges stay symbolic (a,b,step), never materialized. Combinations
 -- are produced by an odometer that STREAMS each result to a callback — so a huge
 -- expansion never builds a giant intermediate. Consumers decide the policy:
--- for-in streams lazily (unbounded — `for i in {1..1e9}` runs in O(1) memory,
--- better than bash which OOMs); argv materialization caps at BRACE_CAP (an argv
--- can't be infinite). Nothing is a fatal error and nothing is silently dropped
--- to literal — the expansion always happens, just lazily when it's large.
+-- a command's or a for/select list's word bigger than BRACE_CAP words stays ONE lazy
+-- word (bxlazy) that M.brace_words expands in full each time the command runs, as bash
+-- does at execution (a huge one in code that never runs costs nothing). Nothing is ever
+-- capped or dropped: every word is produced (stress-attack S9; a word list too big for
+-- memory ends the shell as bash's xmalloc failure does — rt.oom).
 local BRACE_CAP = 100000
 
 -- The unit at `i` in `s` that brace syntax is inert inside, copied whole (braces.c
@@ -3435,17 +3436,23 @@ local AFTER_COMPOUND = {
 }
 
 local INTWORD = {} -- (integer -> its literal word: ranges repeat, and allocation dominates)
-local function add_word(words, w)
+local function add_word(words, w, lazy)
 	local factors = brace_factors(w)
 	if not factors then
 		words[#words + 1] = parse_word(w)
+		return
+	end
+	if lazy and count_str(w) > BRACE_CAP then
+		local pw = parse_word(w)
+		words[#words + 1] = { k = pw.k, parts = pw.parts, src = w, plain = false, bxlazy = w } -- (not plain: no literal fast path)
+		words.bxlazy = true
 		return
 	end
 	local r = #factors == 1 and factors[1].range
 	if r and not r.char and not r.width and type(r.a) == "number" and type(r.b) == "number"
 		and math.abs(r.a) < 1e14 and math.abs(r.b) < 1e14 then
 		-- a lone numeric range ({0..N}, {9..1..2}): its words straight from the loop
-		local cnt = math.min(range_count(r), BRACE_CAP)
+		local cnt = range_count(r)
 		local step = r.a <= r.b and r.step or -r.step
 		local v = r.a
 		local nw = #words
@@ -3483,13 +3490,48 @@ local function add_word(words, w)
 			words[#words + 1] = { k = pw.k, parts = pw.parts, src = n == 0 and w or false }
 		end
 		n = n + 1
-		return n >= BRACE_CAP -- true -> stop the stream
 	end)
 	if words[first] then -- (`set +B` at run time: the n words go back to the one raw word)
 		words[first].bx = { raw = w, n = n }
 	end
 end
 M.add_word = add_word -- (compgen -W brace-expands each of its words the same way)
+-- An array literal's huge brace element (bxlazy / brace_lazy), expanded as it runs: its
+-- element words
+function M.brace_elem_words(raw)
+	local out = {}
+	stream_factors(brace_factors(raw), function(x)
+		out[#out + 1] = elem_word(bq_word(x))
+	end)
+	return out
+end
+-- A command's word list as it runs: its lazy (huge) brace words expanded in full — or,
+-- under `set +B` (optB false), every brace-expanded run back to its one raw word.
+function M.brace_words(words, optB)
+	if optB == false then
+		return M.unbrace_words(words)
+	end
+	if not words.bxlazy then
+		return words
+	end
+	local out = {}
+	for _, w in ipairs(words) do
+		if w.bxlazy then
+			local first = #out + 1
+			add_word(out, w.bxlazy)
+			if w.plainarg then -- (a command's argument: see parse_simple's plainarg)
+				for k = first, #out do
+					if not out[k].fresh then
+						out[k].plainarg = true
+					end
+				end
+			end
+		else
+			out[#out + 1] = w
+		end
+	end
+	return out
+end
 -- A word list as parsed with brace expansion OFF (`set +B`, which bash consults at
 -- expansion time): each brace-expanded run collapses back to its one literal word.
 local unbraced = setmetatable({}, { __mode = "k" })
@@ -5026,11 +5068,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if keyraw == nil then
 					-- bare element: brace-expand into multiple elements ({1..9}, {a,b})
 					local factors = brace_factors(rhs)
-					if factors then
+					if factors and count_str(rhs) > BRACE_CAP then -- (huge: expanded as it runs)
+						local lw = elem_word(parse_word(rhs))
+						lw.bxlazy, lw.bxelem = rhs, true
+						elems[#elems + 1] = { key = nil, op = "=", word = lw, bxlazy = rhs }
+					elseif factors then
 						stream_factors(factors, function(x)
 							local bw = elem_word(bq_word(x))
 							elems[#elems + 1] = { key = nil, op = "=", word = bw }
-							return #elems >= BRACE_CAP
 						end)
 					else
 						local bw = elem_word(parse_word(rhs))
@@ -5045,12 +5090,13 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					-- words of the whole token and let do_arrayassign pick (indexed -> bare).
 					local elem = { key = keyraw, op = eop, word = parse_word(rhs) }
 					local factors = brace_factors(w)
-					if factors then
+					if factors and count_str(w) > BRACE_CAP then -- (huge: expanded as it runs)
+						elem.brace_lazy = w
+					elseif factors then
 						elem.brace_bare = {}
 						stream_factors(factors, function(x)
 							local bw = elem_word(bq_word(x))
 							elem.brace_bare[#elem.brace_bare + 1] = bw
-							return #elem.brace_bare >= BRACE_CAP
 						end)
 					end
 					elems[#elems + 1] = elem
@@ -5435,7 +5481,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if w == "" then
 						break
 					end
-					add_word(words, w)
+					add_word(words, w, true)
 				end
 			else
 				words = { parse_word('"$@"') } -- `for NAME; do …` iterates the positional params
@@ -6057,7 +6103,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if w == "" then
 						break
 					end
-					add_word(words, w)
+					add_word(words, w, true)
 				end
 			end
 		end
@@ -6093,7 +6139,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				if w.fresh then
 					w.plainarg = true
 				else
-					words[k] = { k = w.k, parts = w.parts, src = w.src, plainarg = true, plain = w.plain, bx = w.bx }
+					words[k] = { k = w.k, parts = w.parts, src = w.src, plainarg = true, plain = w.plain, bx = w.bx, bxlazy = w.bxlazy }
 				end
 			end
 		end

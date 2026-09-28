@@ -3426,7 +3426,8 @@ local function arrayassign_items(sh, st, isassoc, ntilde)
 		return items
 	end
 	for _, e in ipairs(elems) do
-		if e.key ~= nil and not (e.brace_bare and not isassoc) then
+		local bb = e.brace_bare or (e.brace_lazy and not isassoc and P.brace_elem_words(e.brace_lazy))
+		if e.key ~= nil and not (bb and not isassoc) then
 			-- keyed: an associative array (always keyed), or an indexed key with no brace.
 			-- Each word expands in order, its subscript then its value (arrayfunc.c): an
 			-- assoc key is the expanded text; an indexed subscript's expansions run now,
@@ -3459,7 +3460,7 @@ local function arrayassign_items(sh, st, isassoc, ntilde)
 		else
 			-- bare: a genuine bare element, OR an indexed keyed element whose value
 			-- brace-expands (bash de-keys it — `[k]=` becomes literal in each bare word).
-			for _, bw in ipairs(e.brace_bare or { e.word }) do
+			for _, bw in ipairs(bb or (e.bxlazy and P.brace_elem_words(e.bxlazy)) or { e.word }) do
 				for _, f in ipairs(expand_to_fields(sh, bw)) do
 					items[#items + 1] = { key = nil, op = "=", val = f }
 				end
@@ -5541,10 +5542,7 @@ local function expand_args(sh, st, args, is_assign)
 		sh.arrayref_args = nil -- (the previous command's: see rt.mark_arrayref)
 	end
 	local unset_cmd = is_assign == "unset"
-	local words = st.words
-	if sh.opt_B == false then -- (`set +B`: no brace expansion)
-		words = P.unbrace_words(words)
-	end
+	local words = P.brace_words(st.words, sh.opt_B) -- (`set +B`: no brace expansion)
 	for wi, w in ipairs(words) do
 		local p1 = w.parts[1]
 		local ref = unset_cmd and wi > 1 and unset_arrayref(sh, w)
@@ -6422,7 +6420,7 @@ exec_stmt = function(sh, st, hook)
 		local ld0 = sh.loopdepth or 0
 		sh.loopdepth = ld0 + 1
 		local eok, eerr = pcall(function()
-			for _, w in ipairs(sh.opt_B == false and P.unbrace_words(st.words) or st.words) do
+			for _, w in ipairs(P.brace_words(st.words, sh.opt_B)) do
 				local fs = expand_to_fields(sh, w)
 				for k = 1, #fs do
 					list[#list + 1] = fs[k]
@@ -6502,7 +6500,7 @@ exec_stmt = function(sh, st, hook)
 		local ld0 = sh.loopdepth or 0 -- (counted before the list expands: execute_select_command)
 		sh.loopdepth = ld0 + 1
 		local eok, eerr = pcall(function()
-			for _, w in ipairs(st.words) do
+			for _, w in ipairs(P.brace_words(st.words, sh.opt_B)) do
 				local fs = expand_to_fields(sh, w)
 				for k = 1, #fs do
 					list[#list + 1] = fs[k]

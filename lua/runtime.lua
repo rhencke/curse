@@ -5118,6 +5118,9 @@ end
 -- running it — the script, or a subshell / $(…) / job running in-process — stops with this
 -- diagnostic, status 1, as a crashed child would stop alone. Any other error: itself.
 function M.lua_overflow(sh, err)
+	if type(err) == "string" and err:find("not enough memory$") then
+		return M.oom(sh)
+	end
 	if type(err) ~= "string" or not err:find("stack overflow$") then
 		return err
 	end
@@ -5126,6 +5129,26 @@ function M.lua_overflow(sh, err)
 	io.stderr:write("curse: stack overflow\n")
 	sh.force_line = fl
 	return { __curse_exit = 1 }
+end
+-- Out of memory (LuaJIT's LUA_ERRMEM, once the failed work has unwound): bash's xmalloc /
+-- xrealloc failure — fatal_error, `NAME: xmalloc: cannot allocate N bytes` (no line), and
+-- sh_exit(2): that shell (a subshell: only it) ends with status 2, no EXIT trap
+-- (stress-attack S18). N is bash's own request size, which curse's allocator doesn't
+-- have: it reports the heap it held (docs/bash-ub.md).
+function M.oom(sh)
+	local held = math.floor(collectgarbage("count") * 1024)
+	collectgarbage()
+	local ok, name = pcall(M.err_where, sh)
+	pcall(function()
+		io.stderr:write((ok and name or "bash") .. ": xmalloc: cannot allocate " .. held .. " bytes\n")
+	end)
+	if not M.iso_cur(sh) and not M.daemon_worker then
+		-- the shell itself: exit(2) now — its variables still fill the heap, and going on
+		-- (the exit path, the EXIT trap) would run out again
+		pcall(io.flush)
+		C._exit(2)
+	end
+	return { __curse_exit = 2, __curse_noexittrap = true }
 end
 function Shell:subshell_run(runner, saves, paren, inplace)
 	-- (signals are held from here until the context is pushed, which holds them itself:
@@ -8076,6 +8099,29 @@ end
 -- also in a trap handler that runs at the top level (return.def: no return_catch_flag)
 -- An array literal element's fields (a word the compiled engine can't render) from the
 -- shared one-word expander, as {val=…} items for rt.arrayassign_stmt
+-- A huge brace word (parser bxlazy) as its command runs: every word it makes, expanded
+-- (split, globbed) — or, under `set +B`, the raw word alone
+-- (elem: an array literal's element — its words as the literal's own)
+function M.brace_fields(sh, raw, plainarg, elem)
+	local P = require("parser")
+	local pw = P.parse_word(raw)
+	local w = { k = pw.k, parts = pw.parts, src = raw, plain = pw.plain, bxlazy = raw, plainarg = plainarg or nil }
+	local I = require("interp")
+	local out = {}
+	local ws
+	if elem and sh.opt_B ~= false then
+		ws = P.brace_elem_words(raw)
+	else
+		ws = P.brace_words({ w, bxlazy = true }, sh.opt_B)
+	end
+	for _, bw in ipairs(ws) do
+		local fs = I.expand_to_fields(sh, bw.bxlazy and pw or bw)
+		for k = 1, #fs do
+			out[#out + 1] = fs[k]
+		end
+	end
+	return out
+end
 function M.aa_fields(sh, w, into)
 	local fs = require("interp").expand_to_fields(sh, w)
 	for k = 1, #fs do

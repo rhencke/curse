@@ -1183,6 +1183,9 @@ end
 -- unquoted expansion (would word-split) or unquoted glob char (would path-expand)
 -- — those need the shared field engine (a separate compiled path).
 local function word_safe(w, arith_ok)
+	if w.bxlazy then -- (a huge brace word: many fields, made as it runs — emit_fields_into)
+		return false
+	end
 	if not emitable_word(w) then
 		return false
 	end -- pexp / side-effecting arith
@@ -3239,6 +3242,10 @@ local function emit_fields_into(tbl, w, lifted, wrap)
 	local function W(x)
 		return wrap and wrap:format(x) or x
 	end
+	if w.bxlazy then -- a huge brace word: its words made (and expanded) as the command runs
+		return EF.aa_wrap(("do local __f = rt.brace_fields(sh, %q, %s, %s); for __i=1,#__f do %s[#%s+1]=%s end end"):format(
+			w.bxlazy, tostring(w.plainarg or false), tostring(w.bxelem or false), tbl, tbl, W("__f[__i]")), w, lifted)
+	end
 	if arith_guard(w) then -- (one field unless $IFS holds a digit or '-': see arith_guard)
 		local segs = {}
 		for i, p in ipairs(w.parts) do
@@ -3586,7 +3593,7 @@ end
 -- An array element word's fields appended to `into` as {val=…} items: natively when the
 -- field engine takes it, else through the shared one-word expander (rt.aa_fields)
 function EF.aa_fields(into, w, lifted)
-	if aa_fieldable(w, lifted) then
+	if w.bxlazy or aa_fieldable(w, lifted) then
 		return emit_fields_into(into, w, lifted, "{val=%s}")
 	end
 	return EF.aa_wrap(("rt.aa_fields(sh, %s[1], %s)"):format(EF.konst({ ser(w) }), into), w, lifted)
@@ -3606,7 +3613,7 @@ local function arrayassign_decl_ok(st, lifted, allow_nameref)
 	-- its value) compiles. (After a bare first word a `[k]=v` is one plain word: rt.arrayassign.)
 	local kvfirst = st.elems[1] and st.elems[1].key == nil
 	for _, e in ipairs(st.elems) do
-		if e.brace_bare then
+		if e.brace_bare or e.brace_lazy or e.bxlazy then
 			return false
 		end -- `[k]=` value brace-expands (de-keyed): interp
 		if e.key == nil and not kvfirst and not e.word.src:match("^[%w_./,:@%%+=-]+$") then
@@ -6472,7 +6479,7 @@ simple_compiled = function(cx, st, after)
 	if st.assigns == nil then
 		-- (a long argv — `echo {1..70000}` — goes through the argv table too: one argument
 		-- per word would overflow LuaJIT's call slots and jump range; field_argv chunks it)
-		local bigargv = #st.words > 200 and not as_local
+		local bigargv = (#st.words > 200 or st.words.bxlazy) and not as_local -- (bxlazy: a huge brace word)
 		local anyfield = bigargv
 		-- A `local`/in-function `declare` VALUE word (j>1) never word-splits or globs
 		-- (assignment context), so a merely-renderable value (`local x=$y`) is NOT a
@@ -7821,6 +7828,7 @@ H.arrayassign = function(cx, st, after)
 		cx.blocks[p] = dbg(st) .. ("rt.arrayassign_member(sh, %q, %q); pc = %d"):format(st.name, st.index, after)
 		return p
 	end
+
 	do
 		local p = cx.newpc()
 		local parts = { "local __it = {}" }
@@ -7868,6 +7876,12 @@ H.arrayassign = function(cx, st, after)
 					-- substitution in it names `\[k\]=v` — interp's arrayassign_items)
 					item = ("rt.with_bs_word(sh, not sh:is_assoc(%q) and %q, function() %s end)"):format(st.name,
 						"\\[" .. e.key .. "\\]" .. e.op .. (e.word and e.word.src or ""), item)
+				end
+				if e.brace_lazy then -- (the same, huge: its words made as it runs)
+					asq()
+					local pw = require("parser").parse_word(e.brace_lazy)
+					local lw = { k = pw.k, parts = pw.parts, bxlazy = e.brace_lazy, bxelem = true }
+					item = ("if __as then %s else %s end"):format(item, EF.aa_fields("__it", lw, cx.lifted))
 				end
 				if e.brace_bare then -- an INDEXED target de-keys it: `[k]=` literal in each brace word
 					asq()
