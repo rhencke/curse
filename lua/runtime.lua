@@ -8854,7 +8854,36 @@ end
 -- A compiled function (fn_x) in a program with traps: a trap handler's `return N` raised
 -- while its body runs natively ends this call with status N (interp's run_function and the
 -- delegated-statement wrappers catch it the same way). bash: execute_function's return_catch.
-function M.catch_return(f)
+-- (noarm: the function can't arm a trap itself — emit's noarm_funcs — so a call made with
+-- no DEBUG/ERR/signal trap set can't be interrupted by a handler's `return`: no pcall)
+local NO_TRAPS = {}
+-- A compiled call of an inlinable function may be spliced in (emit's EF.inl_guard) while no
+-- trap that could fire inside it — DEBUG, ERR, RETURN, a signal's — is set, and no
+-- $FUNCNEST limit (a spliced call makes no frame to count).
+function M.hooks_idle(sh)
+	local t = sh.traps or NO_TRAPS
+	return not (t.DEBUG or t.ERR or t.RETURN or (sh.sigtraps and next(sh.sigtraps)) or sh.vars.FUNCNEST)
+end
+function M.catch_return(f, noarm)
+	if noarm then
+		return function(sh, pc)
+			local t = sh.traps or NO_TRAPS
+			if not (t.DEBUG or t.ERR or (sh.sigtraps and next(sh.sigtraps))) then
+				f(sh, pc)
+				return
+			end
+			local ne0 = sh.noerr
+			local ok, e = pcall(f, sh, pc)
+			if not ok then
+				if type(e) == "table" and e.__curse_return ~= nil then
+					sh.noerr = ne0
+					sh.status = e.__curse_return
+				else
+					error(e, 0)
+				end
+			end
+		end
+	end
 	return function(sh, pc)
 		local ne0 = sh.noerr
 		local ok, e = pcall(f, sh, pc)
