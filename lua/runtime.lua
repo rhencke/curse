@@ -10032,8 +10032,8 @@ function M.arr_next(sh, name)
 	if not b then
 		return 0
 	end
-	if b.s ~= nil and not b.arr then
-		b.arr = { [0] = b.s }
+	if (b.s ~= nil or b.n ~= nil) and not b.arr then
+		b.arr = { [0] = b.s or i64_to_str(b.n) }
 		b.s = nil
 		b.n = nil
 		if b.exported then -- (an array is never in the environment — bash)
@@ -10174,15 +10174,21 @@ function M.line_aborted(sh, status, pf0, err) -- (pf0: the <()/>() count before 
 end
 -- ${a[-N]} past the start: bash warns (`a: bad array subscript`) and expands to nothing
 -- (an empty associative key too: bash's get_array_value, `${E['']}`)
+-- (the variable a bad subscript names: a nameref's target — bash reports the variable
+-- the lookup landed on, `w: bad array subscript` for `declare -n ref=w; ${ref[-9]}`)
+function M.badsub_name(sh, name)
+	local d = sh:deref(name)
+	return d ~= "" and d or name
+end
 function M.elem_read_check(sh, name, key)
 	if key == "" then
 		local b = sh.vars[sh:deref(name)]
 		if b and b.assoc then
-			io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+			io.stderr:write("curse: " .. M.badsub_name(sh, name) .. ": bad array subscript\n")
 			M.report_exit(sh)
 		end
 	elseif M.neg_oob(sh, name, key) then
-		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		io.stderr:write("curse: " .. M.badsub_name(sh, name) .. ": bad array subscript\n")
 		M.report_exit(sh)
 	end
 end
@@ -10236,6 +10242,8 @@ function Shell:array_set(name, key, val, append, raw)
 		b.arr = {}
 		if b.s then
 			b.arr[0] = b.s
+		elseif b.n ~= nil then -- (an integer scalar's value lives in b.n: `declare -i n=3;
+			b.arr[0] = i64_to_str(b.n) -- n[1]=5` keeps [0]="3")
 		end
 		b.s = nil
 		b.n = nil
@@ -14046,7 +14054,7 @@ function M.arith_badkey(sh, name, key, how)
 	local rbad = not (b and b.arr) or M.neg_oob(sh, name, key)
 	local wbad = M.neg_oob(sh, name, key)
 	if how ~= "w" and rbad then
-		io.stderr:write("curse: " .. name .. ": bad array subscript\n")
+		io.stderr:write("curse: " .. M.badsub_name(sh, name) .. ": bad array subscript\n")
 		M.report_exit(sh) -- (err_badarraysub: report_error)
 	end
 	if how ~= "r" and wbad then
@@ -15921,11 +15929,12 @@ end
 -- genuinely dynamic (the value isn't known at compile time), so it is the bootstrap.
 -- (only forms that can't fail: `08`, `2#44`, `0#4`… take the validating parse, which
 -- reports bash's errors)
+-- (blanks as expr.c's cr_whitespace: space, tab, newline — a \f \v \r is a bad character)
 function M.looks_numeric(s)
-	return s:match("^%s*[+-]?[1-9]%d*%s*$")
-		or s:match("^%s*[+-]?0%s*$")
-		or s:match("^%s*[+-]?0[xX]%x+%s*$")
-		or s:match("^%s*[+-]?0[0-7]+%s*$")
+	return s:match("^[ \t\n]*[+-]?[1-9]%d*[ \t\n]*$")
+		or s:match("^[ \t\n]*[+-]?0[ \t\n]*$")
+		or s:match("^[ \t\n]*[+-]?0[xX]%x+[ \t\n]*$")
+		or s:match("^[ \t\n]*[+-]?0[0-7]+[ \t\n]*$")
 end
 local _acache = {} -- value-string -> compiled fn(sh) | false (uncompilable; keep the seam)
 function M.arith_read(sh, name)
@@ -15983,7 +15992,7 @@ function M.arith_read_slow(sh, name, s)
 	-- compiled code, not a tree-walk. Only the word-engine-free subset compiles (no
 	-- $-expansion, no array subscript); $-forms/subscripts/unset/blank stay the interp
 	-- bootstrap (their value/parse is dynamic, not reducible to monomorphic native ops).
-	if s ~= nil and not s:match("^%s*$") and not (sh.arithfault and sh.in_arithcmd) then
+	if s ~= nil and not s:match("^[ \t\n]*$") and not (sh.arithfault and sh.in_arithcmd) then
 		local fn = _acache[s]
 		if fn == nil then
 			fn = require("emit").compile_arith_value(s) or false
@@ -16278,7 +16287,7 @@ function M.var_is_set(sh, nm, expanded)
 			key = M.to_arr_key(M.arith_str(sh, sub))
 		end
 		if M.neg_oob(sh, base, key) then -- (negative counts from the end; before the start: bash's
-			io.stderr:write("curse: " .. base .. ": bad array subscript\n") -- get_array_value error)
+			io.stderr:write("curse: " .. M.badsub_name(sh, base) .. ": bad array subscript\n") -- get_array_value error)
 			M.report_exit(sh) -- (err_badarraysub: report_error)
 			return false
 		end

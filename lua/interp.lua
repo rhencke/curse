@@ -740,7 +740,7 @@ local sherr = rt.Shell.errmsg -- error-message writer, capture-aware for `2>&1` 
 -- integer literal short-circuits (the hot path); a recursion guard bounds cycles.
 local looks_numeric = rt.looks_numeric -- shared with the compiled tier (one source in runtime)
 arith_resolve = function(sh, s, e)
-	if s == nil or s:match("^%s*$") then
+	if s == nil or s:match("^[ \t\n]*$") then
 		return i64(0)
 	end -- unset/blank value -> 0 (bash)
 	if looks_numeric(s) then
@@ -1411,7 +1411,7 @@ M.eval = eval
 function M.arith_read(sh, name)
 	arith_nounset(sh, name) -- set -u: unbound in arith is FATAL (throws, aborts — bash)
 	local s = sh:get(name)
-	if s == nil or s:match("^%s*$") then
+	if s == nil or s:match("^[ \t\n]*$") then
 		return i64(0)
 	end
 	if looks_numeric(s) then

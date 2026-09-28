@@ -52,7 +52,7 @@ local function arith(src, nodefer)
 	src = src:gsub("\\\n", "")
 	-- An empty (or all-whitespace) arithmetic expression is 0 in bash: `$(( ))` -> 0,
 	-- `(( ))` -> value 0 -> status 1.
-	if src:match("^%s*$") then
+	if src:match("^[ \t\n]*$") then -- (cr_whitespace: \f \v \r are not blank to bash)
 		return { k = "num", v = "0" }
 	end
 	-- Arith bodies may embed expansions the arith grammar can't parse: ${x:-5},
@@ -85,10 +85,26 @@ local function arith(src, nodefer)
 					indq = not indq
 				end
 				qdollar = qdollar or c == "$" and indq
-				if not (c == "$" and not indq and src:sub(k + 1, k + 1):match("[\"']")) then
-					out[#out + 1] = c
+				local ce -- (a $'…' in SOURCE arithmetic: its closing quote, past `\'` escapes)
+				if c == "$" and not indq and src:byte(k + 1) == 39 and nodefer ~= "strict" and nodefer ~= "expanded" then
+					local j = k + 2
+					while j <= n and src:byte(j) ~= 39 do
+						j = j + (src:byte(j) == 92 and 2 or 1)
+					end
+					ce = j <= n and j
 				end
-				k = k + 1
+				if ce then
+					-- bash's parse_matched_pair translates it and single-quotes the result:
+					-- `(( $'\f' ))` reads `'<FF>'` (still a bad token, as bash's errors show)
+					local t = require("runtime").ansi_unescape(src:sub(k + 2, ce - 1), true)
+					out[#out + 1] = "'" .. t:gsub("'", "'\\''") .. "'"
+					k = ce + 1
+				else
+					if not (c == "$" and not indq and src:sub(k + 1, k + 1):match("[\"']")) then
+						out[#out + 1] = c
+					end
+					k = k + 1
+				end
 			end
 		end
 		if qdollar and not nodefer then -- (its text is bash's: expanded — the quotes removed,
@@ -126,8 +142,11 @@ local function arith(src, nodefer)
 	-- (`let`'s arguments were already expanded and quote-removed: bash strips nothing
 	-- more — `let 'x="1"+2'` is an error and an assoc_expand_once key keeps its quotes)
 	local qtxt = dtxt -- (the quote-stripped text: what bash's errors show, `1 + '2' `)
+	-- (nor does any text that is expansion OUTPUT — "strict", "expanded": the quotes a value
+	-- holds are just characters, `e='2**"1"'; $(( $e ))` is an operand-expected error)
 	if nodefer == "let" then
 		nodefer = "strict"
+	elseif nodefer == "strict" or nodefer == "expanded" then -- luacheck: ignore 542
 	elseif src:find('"', 1, true) then
 		local o, open = {}, false
 		for k = 1, #src do
@@ -146,7 +165,7 @@ local function arith(src, nodefer)
 		end
 		src = table.concat(o)
 		qtxt = src
-		if src:match("^%s*$") then -- (`$(( "" ))`, a quoted blank subscript: 0 too)
+		if src:match("^[ \t\n]*$") then -- (`$(( "" ))`, a quoted blank subscript: 0 too)
 			return { k = "num", v = "0" }
 		end
 	end
@@ -270,23 +289,12 @@ local function arith(src, nodefer)
 			end
 		end
 		if starts("[") then
+			-- the `]` as bash's readtok finds it (expr_skipsubscript -> skipsubscript: quotes,
+			-- `\`, nested `[ ]` and $( ) ${ } skipped); none -> "bad array subscript" naming the
+			-- text from the name on (`p[++${'k]}]`: the unclosed quote runs past every `]`)
 			local rs = i + 1
-			local depth, j = 1, i + 1
-			while j <= n and depth > 0 do
-				local ch = src:sub(j, j)
-				if ch == "\\" then
-					j = j + 1 -- (an escaped char, e.g. a quoted `\]` in an expanded key)
-				elseif ch == "[" then
-					depth = depth + 1
-				elseif ch == "]" then
-					depth = depth - 1
-					if depth == 0 then
-						break
-					end
-				end
-				j = j + 1
-			end
-			if depth ~= 0 then
+			local j = subscript_close(src, i)
+			if not j then
 				error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
 			end
 			local raw = src:sub(rs, j - 1)
@@ -313,6 +321,11 @@ local function arith(src, nodefer)
 	local function primary(asgn)
 		skip()
 		local c = src:sub(i, i)
+		if (c == "+" or c == "-" or c == "!") and src:byte(i + 1) == 61 then
+			-- `+=`, `-=`, `!=` are single tokens to bash's readtok (an assignment operator, NEQ),
+			-- never a sign or `!` before `=`: where an operand belongs, the error names them whole
+			aerr("syntax error: operand expected")
+		end
 		if c == "(" then
 			i = i + 1
 			local e = parseComma()
@@ -617,15 +630,16 @@ local function arith(src, nodefer)
 			-- starts no token is ITS error (`x⏎y@`: invalid arithmetic operator at `@`)
 			local j = i
 			while true do
-				local _, ne = src:find("^[%a_][%w_]*", j)
-				if not ne then
+				local ns, ne = src:find("^[%a_][%w_]*", j)
+				if not ns then
 					break
 				end
 				j = ne + 1
 				if src:sub(j, j) == "[" then
 					local cl = M.subscript_close(src, j)
-					if not cl then
-						break
+					if not cl then -- (readtok's expr_skipsubscript found no `]`: that name is
+						-- the token in error — `y[t]y[|`)
+						error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
 					end
 					j = cl + 1
 				end
@@ -1703,7 +1717,11 @@ subscript_close = function(s, i)
 			i = dq_end(s, i, true)
 		elseif b == 36 and (s:byte(i + 1) == 40 or s:byte(i + 1) == 123) then -- $( ${
 			local ok, e = pcall(expansion_end, s, i, false, true)
-			i = ok and e or i + 1
+			if not ok then -- (one the text never closes runs to its end: skip_matched_pair's
+				trap_flow(e)
+				return nil -- extract_dollar_brace_string / extract_delimited_string — `q[${x]`)
+			end
+			i = e
 		else
 			if b == 91 then
 				d = d + 1
