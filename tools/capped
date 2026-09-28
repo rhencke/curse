@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# capped CMD...: run CMD in a systemd user scope with ONE memory and task limit for its whole
+# process tree, and first in line for the OOM killer.
+#
+# Why: a per-process `ulimit -v` can't stop a tree of many small processes — a recursive
+# `( … )` in bash forks thousands of 16 MB shells — and one such experiment filled the
+# host's 15 GB and forced a hard restart (2026-09-28). A cgroup limit bounds the tree:
+# past MemoryMax the kernel OOM-kills inside the scope only; past TasksMax fork() fails.
+# `choom -n 1000` makes anything under this the OOM killer's first choice host-wide too.
+#
+# Every capped scope also lives in ONE user slice, curse-work.slice, whose own limit
+# (CAP_SLICE_MEM, default 10G; tasks 8192) bounds them ALL together — meson runs several
+# harnesses at once, and separate per-scope caps could still add up past the host's RAM.
+# That leaves ~5 GB for the Claude session and the OS whatever runs under here.
+# Env: CAP_MEM (default 6G), CAP_TASKS (default 4096). Swap is off inside.
+# (a --scope runs CMD in systemd-run's own environment.) CAPPED=1 is set inside, so a script can re-exec itself under the cap exactly once.
+set -u
+[ $# -gt 0 ] || { echo "usage: capped CMD [ARG...]" >&2; exit 2; }
+if [ -n "${CAPPED:-}" ]; then exec "$@"; fi # (already inside a cap)
+if ! command -v systemd-run >/dev/null || ! systemctl --user show -p Version >/dev/null 2>&1; then
+	echo "capped: no systemd user instance; running under ulimit only" >&2
+	ulimit -v 2097152 2>/dev/null
+	CAPPED=ulimit exec choom -n 1000 -- "$@"
+fi
+slice=curse-work.slice unit=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/curse-work.slice
+want="[Slice]
+MemoryMax=${CAP_SLICE_MEM:-10G}
+MemorySwapMax=0
+TasksMax=8192"
+if [ "$(cat "$unit" 2>/dev/null)" != "$want" ]; then
+	mkdir -p "${unit%/*}" && printf '%s\n' "$want" >"$unit" && systemctl --user daemon-reload
+fi
+CAPPED=1 exec systemd-run --user --scope --quiet --collect --slice="$slice" \
+	-p MemoryMax="${CAP_MEM:-6G}" -p MemorySwapMax=0 -p TasksMax="${CAP_TASKS:-4096}" \
+	-p CPUWeight=50 \
+	-- choom -n 1000 -- "$@"

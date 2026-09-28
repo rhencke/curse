@@ -66,6 +66,10 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# The whole run lives under ONE memory + task limit (tools/capped: a cgroup scope in the
+# shared curse-work.slice): a runaway test's process tree — not just one process — is
+# killed there, never the host (a recursive-subshell probe once filled 15 GB).
+if [ -z "${CAPPED:-}" ] && [ "${1:-}" != --run-unit ]; then exec "$REPO/tools/capped" "$0" "$@"; fi
 [ -n "${H_DIFF_DIR:-}" ] && [ "${1:-}" != --run-unit ] && { rm -rf "$H_DIFF_DIR"; mkdir -p "$H_DIFF_DIR"; } # (this run's failures only: stale ones read as current)
 
 # ---- internal worker: run ONE unit (all shells) and write its result rows ----
