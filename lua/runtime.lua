@@ -8141,6 +8141,27 @@ function M.procsub_waitall(sh, intr)
 end
 -- Run every background job to its end (the script is over; bash would leave them
 -- running — in-process they must finish before this process can).
+-- The script is over but in-process background jobs still run: bash's shell would exit at
+-- once, its jobs (processes of their own) going on — the caller sees the status now and a
+-- job may wait for what the caller does next (stress-attack S6: `sh -c '(…) & exit 7'`
+-- waited for the job). The shell forks ONCE here: the parent exits with the status, the
+-- child runs the jobs to their end (M.sched_drain) and exits quietly. (A daemon worker
+-- replies first and drains after: daemon.lua.)
+function M.fork_at_exit(sh)
+	if M.daemon_worker or CO or not sched_live() or M.tasks_all_stuck() then
+		return
+	end
+	real_flush()
+	io.stderr:flush()
+	pid_cache = pid_cache or tonumber(C.getpid()) -- ($$ stays the shell's in its jobs)
+	local pid = C.fork()
+	if pid > 0 then
+		C._exit((sh and sh.status or 0) % 256)
+	elseif pid == 0 then
+		M.exit_trap_inherited = true -- (its EXIT trap ran in the shell: never again here)
+	end
+	-- (fork failed: the shell drains the jobs itself, as before)
+end
 function M.sched_drain(sh)
 	M.jobs_exit_hangup(sh or M.cur_shell)
 	if sched_live() and not CO then
