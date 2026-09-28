@@ -471,6 +471,154 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   (2533: bash `cat > out`). Each is `deparse` target output vs bash on the named
   test/cases file; minimise one before fixing it.
 
+## Found by the in-loop oracles' first containerized campaigns (fuzz-ruthless validation)
+
+Each was found by a targeted fuzzer (9-min campaigns in `fuzz-docker`, FUZZ_INSTANCES
+`gram:TARGET`) and re-checked, reduced by hand, with `cmp.sh` in the container: bash
+5.2.21 vs curse interp / compiled / tiered / static. Unless noted, every tier gives the
+curse result shown ("all tiers").
+
+## F99. Arithmetic: a compound assignment with no lvalue loses the operator's first byte in the error token
+
+    e='+=*63-1'; echo "$(( $e ))"
+
+- bash: `operand expected (error token is "+=*63-1 ")`; curse (all tiers): `(error token is "=*63-1 ")`.
+  Same for `2*+=3-1`, `2**+=-1`. (arith target)
+
+## F100. Arithmetic: a bad subscript through a nameref names the nameref
+
+    w=x; declare -n ref=w; e='ref[-10]'; echo "$(( $e ))"
+
+- bash: `S: line 1: w: bad array subscript`, then `0`; curse (all tiers): `ref: bad array subscript`. (arith)
+
+## F101. Arithmetic: a double-quoted operand in an expanded expression is accepted
+
+    e='2**"1"'; echo "$(( $e ))"; e='up="1"'; echo "$(( $e ))"
+
+- bash: `syntax error: operand expected (error token is ""1" ")`, status 1.
+- curse (all tiers): `2` / `1` (the quotes are removed). `e='"1"A[1]'`: bash the same
+  operand-expected error, curse `1A: value too great for base`. (arith)
+
+## F102. Arithmetic: `y[t]y[|` — bash's "bad array subscript"
+
+    e='y[t]y[|'; echo "$(( $e ))"
+
+- bash: `y[t]y[| : bad array subscript (error token is "y[| ")`; curse (all tiers):
+  `syntax error: invalid arithmetic operator (error token is "[| ")`. (arith)
+
+## F103. Arithmetic: `v[1]++` on an integer scalar drops its value as element 0
+
+    declare -i ii=3; e='ii[1]++'; echo "$(( $e ))"; declare -p ii
+
+- bash: `declare -ai ii=([0]="3" [1]="1")`; curse (all tiers): `declare -ai ii=([1]="1")`. (arith)
+
+## F104. Arithmetic: a form feed is whitespace to curse, not to bash
+
+    e=$'\f\f'; echo "$(( $e ))"
+
+- bash: `syntax error: operand expected (error token is "<FF><FF> ")`, status 1; curse (all
+  tiers): `0`, status 0. (arith)
+
+## F105. Arithmetic: `x='x-[AB)1'; $(( x ))` — recursion vs syntax error (compiled: no line)
+
+    x='x-[AB)1'; echo "$(( x ))"
+
+- bash: `x-[AB)1: expression recursion level exceeded (error token is "x-[AB)1")`.
+- curse interp / tiered / static: `S: line 1: x-[AB)1: syntax error in expression`;
+  compiled: the same without `line 1: `. (arith)
+
+## F106. Arithmetic: a quote-broken `${` inside a subscript of an expanded value escapes as a Lua error
+
+    e="p[++\${'k]}]2*A["; echo "$(( $e ))"      # fuzz input: 2*p[++${'k]}]2*A[
+
+- curse (harness-plain, each of 14 inputs of this shape): the run's pcall fails with
+  `interp:… b_eval:… interp:5760: interp:1144: parser:756: unexpected EOF while looking
+  for matching `'`' (the F2/F5 class through the arithmetic subscript path). (arith; not
+  yet reduced outside the harness)
+
+## F107. `${v:OFF:+$@}`-style substring offsets containing `$@`
+
+    set -- p1 'p 2' '' '*'; p='*o*'; t=$'\t x \t'; echo ${t:gggg:+$@}
+
+- bash: `S: line 1: t: *o*: syntax error: operand expected (error token is "*o*")`.
+- curse (all tiers): `t: +p1 p 2  *: syntax error in expression (error token is "p 2  *")`
+  — the offset is expanded differently before evaluation. (pexp)
+
+## F108. `${a:+~}` unquoted with an empty `$HOME`: bash keeps an empty field
+
+    HOME=; a=(one); printf '<%s>' ${a:+~} x; echo
+
+- bash: `<><x>`; curse (all tiers): `<x>`. (pexp)
+
+## F109. printf: a negative precision in the format (`%.-1d`) is printed, not an error
+
+    printf '[%.-1d]\n' 5
+
+- bash: `[%.0-1ld]`, status 0 (bash rewrites the spec and passes the rest through);
+  curse (all tiers): `[` + `printf: `-': invalid format character`, status 1. Every
+  `%…-…` shape the fuzzer made (`%--.-1x`, `%*.-1y`, `%5.-1A`) is this. (printf)
+
+## F110. Pattern matching: an unclosed extglob group matches in bash, not in curse
+
+    shopt -s extglob; p='**([[:'; s=; [[ $s == $p ]]; echo $?      # also p='*!(Q'
+
+- bash: `0`; curse (all tiers): `1` (also without extglob on). (glob)
+
+## F111. Pattern matching: `[]a[.a.F]` against `]`
+
+    p='[]a[.a.F]'; s=']'; [[ $s == $p ]]; echo $?; case $s in $p) echo c1;; *) echo c0;; esac
+
+- bash: `1`, `c0` (an invalid collating symbol makes the bracket fail); curse (all tiers):
+  `0`, `c1`. (glob)
+
+## F112. `read -N N -a arr` splits the text; bash stores it whole
+
+    read -N 99 -a arr <<< 'a b'; declare -p arr
+
+- bash: `declare -a arr=([0]=$'a b\n')`; curse (all tiers): `([0]="a" [1]="b")`. (read)
+
+## F113. `read -N 1 -r -a arr` of an IFS-whitespace character
+
+    read -N 1 -r -a arr <<< $' \t'; declare -p arr
+
+- bash: `declare -a arr=([0]=" ")`; curse (all tiers): `declare -a arr=()`. (read)
+
+## F114. `read -d '\'` (backslash delimiter, no -r): the status at end of input
+
+    read -d '\' x <<< 'ab c\'; echo "st=$? [$x]"
+
+- bash: `st=1 [ab c]`; curse (all tiers): `st=0 [ab c]`. (read)
+
+## F115. `[[ … =~ … ]]`: bash's parse errors for `;` in a bracket and a trailing `\ `
+
+    [[ x =~ ^[^;]+ ]]; echo $?
+    [[ x =~ ab\  ]]; echo $?
+
+- bash: `syntax error in conditional expression: unexpected token `;'`, `syntax error near
+  `;]'` (`;'`), the line, status 2; curse (all tiers): `0` / `1` — the regex is accepted.
+  `[[ x =~ ^(a|b^ ]]`: bash `unexpected EOF while looking for matching `)'`, curse `…
+  looking for `]]'`. (regex: curse's parser passed the gate, bash's didn't)
+
+## F116. Parser: constructs bash rejects run in curse
+
+    eval '<<<'; echo st=$?
+    eval ']] &'; echo st=$?
+
+- bash: `syntax error near unexpected token `newline'` / `` `]]' ``, st=2; curse (all
+  tiers): `st=0` / `]]: command not found`, st=0. (parse)
+
+## F117. Parser: the unexpected token named in a syntax error
+
+| input (eval) | bash | curse (all tiers) |
+|---|---|---|
+| `}(x` | `` `}' `` | `` `x' `` |
+| `for  #3` | `` `newline' `` | `` `#' `` |
+| `ech<<<<<<<<` | `` `<<<' `` | `` `newline' `` |
+| `: $(( ${#a` | EOF looking for `` `)' `` | EOF looking for `` `}' `` |
+| `&>$(x`, `+($(x`, `$\`⏎`(x` | EOF looking for `` `)' `` (line+1) | `` `&' `` / `` `$' `` / `` `x' `` |
+
+(parse; `time --` under `set -n` printing timings is F96.)
+
 ## Variants of known entries (not new)
 
 - `x=a; echo ${x/${/}}` and `if 0&break;then select H in ${0[0]/${/}} do 0;done;fi`

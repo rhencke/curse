@@ -30,7 +30,11 @@ elif l=$(printf '%s\n' "$o" | grep -a -m1 -E '^FUZZ-ORACLE (tiers:|target )'); [
   lt=$(printf '%s\n' "$o" | grep -a -m1 '^FUZZ-ORACLE < ' | cut -c15-)
   gt=$(printf '%s\n' "$o" | grep -a -m1 '^FUZZ-ORACLE > ' | cut -c15-)
   k=$(printf '%s' "$l" | sed -E 's/^FUZZ-ORACLE tiers: ([a-z]+) ([a-z]+) differs.*/tiers:\1:\2/; s/^FUZZ-ORACLE tiers: the ([a-z]+) worker crashed.*/tiers:\1:crash/; s/^FUZZ-ORACLE target ([a-z]+): ([a-z]+) differs.*/target:\1:\2/')
-  sig=$(printf '%s|< %s|> %s' "$k" "$lt" "$gt" | sed -E "s#$D/[^ :]*#S#g; s/line [0-9]+/line N/g; s/[0-9]+/N/g")
+  # (an error line keeps its message and drops the echoed input: `S: line N: X: msg`,
+  # `(error token is X)` -- else every input is its own signature)
+  fold() { printf '%s' "$1" | sed -E "s#$D/[^ :]*#S#g; s/line [0-9]+/line N/g; s/\(error token is .*\)$/(error token is X)/;
+    s/^(S: (eval: )?line N: )(.*: )?([^:]*: )([^:]+)$/\1X: \5/; s/[0-9]+/N/g"; }
+  sig=$(printf '%s|< %s|> %s' "$k" "$(fold "$lt")" "$(fold "$gt")")
   sig=${sig:0:240}
 else
   # (escaped: that line; stderr oracle: the first line with a Lua-internal message)

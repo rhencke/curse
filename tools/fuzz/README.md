@@ -130,9 +130,14 @@ exactly one `__w …` / `[[ … ]]` command with no redirection, and no `$(`, ba
 or `>(` appears anywhere in the text.
 
 Exec rates (host, one input repeated, coverage hook on; `FUZZ_BENCH=N
-[FUZZ_BENCH_PERSIST=1]`): persistent 1.1-1.7 ms/exec (arith 0.9, pexp 1.2, printf 1.1,
+[FUZZ_BENCH_PERSIST=1]`): persistent 0.9-1.9 ms/exec (arith 0.9, pexp 1.2, printf 1.1,
 glob 1.3, read 1.7, regex 1.1, parse 1.9 ms); a fork per input 2.4-4.5 ms. bash's side is
-most of it: its `( … )` fork alone is ~0.45 ms on this host.
+most of it: its `( … )` fork alone is ~0.45 ms on this host. Under afl-fuzz in the
+container (two instances sharing its 2 CPUs, 9 minutes each, 2026-09-28): pexp 970/s,
+regex 790/s, read 510/s, arith 420/s, parse 290/s, deparse 240/s, glob 140/s, printf
+135/s; `tiers` 160/s. AFL's stability is 30-70% for the targets (curse's module-level
+caches -- the eval parse cache, compiled patterns -- carry over in the persistent loop),
+94% for `tiers`.
 
 ### Checking an oracle (planted bugs)
 

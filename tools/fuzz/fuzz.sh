@@ -175,6 +175,12 @@ bucket() { # SIG FILE -> ID, ID:FIXED (matched a since-fixed finding's *-fixed f
   while IFS=$'\t' read -r id field re re2; do
     case $id in ''|'#'*) continue ;; esac
     base=${field%-fixed}; hit=0
+    # (an in-loop differential's signature -- target:… / tiers:… -- quotes bash's own
+    # wording; only rules written for it (a sig regex naming target:/tiers:) and NOISE/UB
+    # apply, not the script modes' loose error-text patterns)
+    case $sig in target:*|tiers:*)
+      case $id:$re in NOISE:*|UB*|*:*target:*|*:*tiers:*) ;; *) continue ;; esac ;;
+    esac
     case $base in
       sig) printf '%s\n' "$sig" | grep -qE -- "$re" && hit=1 ;;
       src) grep -qaE -- "$re" "$f" && hit=1 ;;
