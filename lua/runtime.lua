@@ -118,6 +118,273 @@ function M.pcline(f, t, name)
 	M.PCLINE[f] = t
 	M.PCNAME[f] = name
 end
+-- ---- lifted registers seen by runtime TEXT evaluation --------------------------------
+-- Compiled code holds hot integer variables in Lua registers (run()'s locals, a function's
+-- `local N=INT` registers, a fragment's own copies) and module upvalues; sh.vars has the
+-- value only at sync points. TEXT the runtime evaluates — a variable's value read in
+-- arithmetic (`x='i*2'; $((x))`), a [[ -gt ]] operand, a subscript, let, a declare -i
+-- value — may name any variable, so before it runs every live register is written to sh
+-- and after it every one is read back (the text may assign: `x='i++'`). Zero cost on the
+-- fast path: each compiled frame registers (M.pclift) where its registers sit on the Lua
+-- stack — `first`: the local slot of names[1], the rest in order — plus `so`, the slot of
+-- its `__syo` marker: set while a synced call is out (emit's lsync: sh holds the live
+-- values then, the frame reloads after), false otherwise; and `upv`, its module's upvalue
+-- set ({names, get, set}). M.ltext walks the stack from the innermost frame out; the
+-- innermost holder of a name decides (a frame synced out for it leaves sh authoritative).
+-- While the text runs every frame it flushed is marked synced out, so a nested evaluation
+-- (a value naming a value) or compiled code entered from the text sees sh as the truth.
+M.PCLIFT = setmetatable({}, { __mode = "k" })
+M.LNAMES = {} -- (every name some loaded compiled code lifts: a nameref to one, M.lift_one)
+function M.pclift(f, names, first, so, upv, anames, aslot)
+	M.PCLIFT[f] = { names = names, first = first, so = so, upv = upv, anames = anames, aslot = aslot }
+	for _, l in ipairs({ names, anames or {}, upv and upv.names or {}, upv and upv.anames or {} }) do
+		for _, n in ipairs(l) do
+			M.LNAMES[n] = true
+		end
+	end
+end
+-- A frame's / module's spilled registers (emit's overflow pass): one int64_t[] each
+do
+	local arr_t = ffi.typeof("int64_t[?]")
+	function M.i64arr(n)
+		return arr_t(n)
+	end
+	function M.i64dup(a) -- (a saved copy: the isolation swap's snapshot)
+		local n = ffi.sizeof(a) / 8
+		local c = arr_t(n)
+		ffi.copy(c, a, n * 8)
+		return c
+	end
+	function M.i64put(a, c)
+		ffi.copy(a, c, ffi.sizeof(a))
+	end
+end
+do -- (a block: the main chunk's locals are near LuaJIT's 200)
+local function so_has(so, n)
+	return so == true or (type(so) == "string" and so:find(" " .. n .. " ", 1, true) ~= nil)
+end
+-- (levels: lift_pull and lift_push are both called straight from M.ltext, so a level
+-- recorded by one is the same frame for the other)
+local function lift_pull(sh)
+	local getinfo, getlocal, setlocal = debug.getinfo, debug.getlocal, debug.setlocal
+	local seen, rec, upvs = {}, nil, nil
+	for level = 3, 100000 do
+		local info = getinfo(level, "f")
+		if not info or info.func == M.ltext then -- (an enclosing text evaluation's frame:
+			break -- it handled everything outside it — and marked those frames synced out)
+		end
+		local L = M.PCLIFT[info.func]
+		if L then
+			local so = false
+			if L.so then
+				so = select(2, getlocal(level, L.so))
+			end
+			local took = false
+			for k, n in ipairs(L.names) do
+				if not seen[n] then
+					seen[n] = true
+					if not so_has(so, n) then
+						local _, v = getlocal(level, L.first + k - 1)
+						if type(v) == "cdata" or type(v) == "number" then
+							sh:aset(n, v)
+							rec = rec or {}
+							rec[#rec + 1] = { level, L.first + k - 1, n }
+							took = true
+						end
+					end
+				end
+			end
+			if L.anames then -- (its spilled registers: the __L array)
+				local _, a = getlocal(level, L.aslot)
+				if type(a) == "cdata" then
+					for k, n in ipairs(L.anames) do
+						if not seen[n] then
+							seen[n] = true
+							if not so_has(so, n) then
+								sh:aset(n, a[k - 1])
+								rec = rec or {}
+								rec[#rec + 1] = { "a", a, k - 1, n }
+								took = true
+							end
+						end
+					end
+				end
+			end
+			local U = L.upv
+			if U and not (upvs and upvs[U]) then
+				upvs = upvs or {}
+				upvs[U] = true
+				local vals, any = { U.get() }, false
+				for k, n in ipairs(U.names) do
+					if not seen[n] then
+						seen[n] = true
+						if not so_has(so, n) and vals[k] ~= nil then
+							sh:aset(n, vals[k])
+							any = true
+						end
+					end
+				end
+				if U.anames then -- (the module's spilled ones: __U)
+					for k, n in ipairs(U.anames) do
+						if not seen[n] then
+							seen[n] = true
+							if not so_has(so, n) then
+								sh:aset(n, U.arr[k - 1])
+								rec = rec or {}
+								rec[#rec + 1] = { "a", U.arr, k - 1, n }
+								took = true
+							end
+						end
+					end
+				end
+				if any then
+					rec = rec or {}
+					rec[#rec + 1] = { false, U }
+					took = true
+				end
+			end
+			if took and L.so then
+				rec[#rec + 1] = { level, L.so, so, true }
+				setlocal(level, L.so, true)
+			end
+		end
+	end
+	return rec
+end
+local function lift_push(sh, rec)
+	local setlocal = debug.setlocal
+	for k = #rec, 1, -1 do
+		local r = rec[k]
+		if r[1] == "a" then
+			r[2][r[3]] = sh:aget(r[4])
+		elseif r[1] == false then
+			local U = r[2]
+			local vals = { U.get() }
+			local nv = #U.names + (U.anames and 1 or 0)
+			for j, n in ipairs(U.names) do
+				if vals[j] ~= nil then
+					vals[j] = sh:aget(n)
+				end
+			end
+			U.set(unpack(vals, 1, nv))
+		elseif r[4] then
+			setlocal(r[1], r[2], r[3]) -- (the frame's __syo as it was)
+		else
+			setlocal(r[1], r[2], sh:aget(r[3]))
+		end
+	end
+end
+local function lt_id(...)
+	return ...
+end
+local function lt_ret(rec, sh, ok, ...)
+	lift_push(sh, rec)
+	if not ok then
+		error((...), 0)
+	end
+	return ...
+end
+-- One lifted variable reached through a NAMEREF (`declare -n r=i` made at run time — eval,
+-- source): its live copy is where the innermost holder keeps it. "pull" puts it in sh
+-- (before a read through the reference: Shell:deref), "push" puts sh's value back there
+-- (after a write through it: Shell:set_str / aset).
+function M.lift_one(sh, name, push)
+	if M.lift_busy then
+		return
+	end
+	M.lift_busy = true
+	local getinfo, getlocal, setlocal = debug.getinfo, debug.getlocal, debug.setlocal
+	local ok, err = pcall(function()
+		for level = 4, 100000 do
+			local info = getinfo(level, "f")
+			if not info then
+				return
+			end
+			local L = M.PCLIFT[info.func]
+			if L then
+				local so = L.so and select(2, getlocal(level, L.so)) or false
+				local function hit()
+					return so_has(so, name)
+				end
+				for k, n in ipairs(L.names) do
+					if n == name then
+						if hit() then
+							return
+						end
+						if push then
+							setlocal(level, L.first + k - 1, sh:aget(name))
+						else
+							local _, v = getlocal(level, L.first + k - 1)
+							sh:aset(name, v)
+						end
+						return
+					end
+				end
+				for k, n in ipairs(L.anames or {}) do
+					if n == name then
+						if hit() then
+							return
+						end
+						local _, a = getlocal(level, L.aslot)
+						if push then
+							a[k - 1] = sh:aget(name)
+						else
+							sh:aset(name, a[k - 1])
+						end
+						return
+					end
+				end
+				local U = L.upv
+				if U then
+					for k, n in ipairs(U.names) do
+						if n == name then
+							if hit() then
+								return
+							end
+							local vals = { U.get() }
+							if push then
+								vals[k] = sh:aget(name)
+								U.set(unpack(vals, 1, #U.names + (U.anames and 1 or 0)))
+							elseif vals[k] ~= nil then
+								sh:aset(name, vals[k])
+							end
+							return
+						end
+					end
+					for k, n in ipairs(U.anames or {}) do
+						if n == name then
+							if hit() then
+								return
+							end
+							if push then
+								U.arr[k - 1] = sh:aget(name)
+							else
+								sh:aset(name, U.arr[k - 1])
+							end
+							return
+						end
+					end
+				end
+			end
+		end
+	end)
+	M.lift_busy = nil
+	if not ok then
+		error(err, 0)
+	end
+end
+-- f(...) run with the live lifted registers in sh around it (see above)
+function M.ltext(sh, f, ...)
+	if next(M.PCLIFT) == nil then
+		return f(...)
+	end
+	local rec = lift_pull(sh)
+	if not rec then
+		return lt_id(f(...)) -- (not a tail call: this frame bounds a nested one's walk)
+	end
+	return lt_ret(rec, sh, pcall(f, ...))
+end
+end
 -- the line of a registered pc: a trap handler's (trel) counts from the trapped line
 local function pc_line(sh, t, pc)
 	local ln = t[pc]
@@ -571,6 +838,35 @@ function Shell:pushParams(...)
 	self.params = a
 	self.nparams = n
 end
+-- t[i..#t] as a new table (unpack caps the count: LuaJIT's ~8000)
+function M.tslice(t, i)
+	local r = {}
+	for k = i, #t do
+		r[k - i + 1] = t[k]
+	end
+	return r
+end
+-- pushParams with the arguments as t[from..#t] (a long list can't be unpacked: LuaJIT caps it)
+function Shell:pushParamsT(t, from)
+	local d = self.pd + 1
+	self.pd = d
+	self.paramstack[d] = self.params
+	self.npstack[d] = self.nparams
+	local a = self.argpool[d]
+	if not a then
+		a = {}
+		self.argpool[d] = a
+	end
+	local n = #t - from + 1
+	if n < 0 then
+		n = 0
+	end
+	for i = 1, n do
+		a[i] = t[from + i - 1]
+	end
+	self.params = a
+	self.nparams = n
+end
 function Shell:popParams()
 	local fc = self.ifs_fc
 	if fc and fc[3] ~= M.locale_gen then -- (pop_context's sv_ifs: M.ifs_first)
@@ -639,6 +935,13 @@ function Shell:pushCall(...)
 	self:pushParams(...)
 	self.savedstack[self.pd] = false
 	if self.shopt.extdebug then -- (BASH_ARGV/BASH_ARGC: this call's arguments, as passed)
+		M.bav_push(self, self.params, 1, self.nparams, self.pd)
+	end
+end
+function Shell:pushCallT(t, from)
+	self:pushParamsT(t, from)
+	self.savedstack[self.pd] = false
+	if self.shopt.extdebug then
 		M.bav_push(self, self.params, 1, self.nparams, self.pd)
 	end
 end
@@ -3030,11 +3333,11 @@ end
 -- ERR trap (the subshell's own, or kept by errtrace), its own EXIT trap or caught signal.
 -- sh.shlvl_tail: the call depth that tail command runs at (a function it calls is deeper),
 -- as -1 - depth for the conditional kind.
-function M.exec_tail_lvl(sh, ...)
+function M.exec_tail_lvl(sh, args) -- (args: the argv TABLE — a long one can't be unpacked)
 	local tl = sh.shlvl_tail
 	sh.shlvl_tail = nil
 	if sh.in_trap and sh.in_trap > 0 then -- (a DEBUG trap's command before it: not this one)
-		local eok, err = pcall(sh.exec, sh, ...)
+		local eok, err = pcall(sh.exec_t, sh, args)
 		sh.shlvl_tail = tl
 		if not eok then
 			error(err, 0)
@@ -3060,7 +3363,7 @@ function M.exec_tail_lvl(sh, ...)
 		end
 	end
 	if not ok then
-		return sh:exec(...)
+		return sh:exec_t(args)
 	end
 	-- Exec'd in place, the command's process IS the subshell's: a signal that kills it
 	-- kills the subshell, which its parent reports (M.fg_ended -> ctx.tailx: subshell_run).
@@ -3074,16 +3377,13 @@ function M.exec_tail_lvl(sh, ...)
 	end
 	local sx = sh.tail_x
 	sh.tail_x = ctx
-	local eok, err = pcall(sh.exec, sh, ...)
+	local eok, err = pcall(sh.exec_t, sh, args)
 	M.shlvl_delta, sh.tail_x = d, sx
 	if not eok then
 		error(err, 0)
 	end
 end
 function Shell:exec(...)
-	if self.shlvl_tail then
-		return M.exec_tail_lvl(self, ...)
-	end
 	return self:exec_t({ ... })
 end
 -- Shell:exec with the argv as a table (a long one — `cmd {1..70000}` — can't be unpacked
@@ -3093,7 +3393,7 @@ function Shell:exec_t(args)
 		M.jobs_cleanup_waited(self)
 	end
 	if self.shlvl_tail then
-		return M.exec_tail_lvl(self, unpack(args))
+		return M.exec_tail_lvl(self, args)
 	end
 	local n = #args
 	if n == 0 then
@@ -3120,7 +3420,11 @@ function Shell:exec_t(args)
 			-- `%job` as a command is `fg %job` (`bg` when async), the words its operands —
 			-- unless already forked, as a pipeline stage is (execute_simple_command)
 			local b = self.bg_cd and "bg" or "fg"
-			return require("b_fg")(self, b, { b, unpack(args, 1, n) })
+			local fa = { b }
+			for k = 1, n do
+				fa[k + 1] = args[k]
+			end
+			return require("b_fg")(self, b, fa)
 		end
 		if not execpath then
 			-- bash: a defined command_not_found_handle runs instead, in a separate execution
@@ -3129,7 +3433,11 @@ function Shell:exec_t(args)
 				self.in_cnf_handle = true -- (a miss inside the handler itself is just reported)
 				local ok, err = pcall(self.subshell_run, self, function(sh)
 					sh.subdepth = sh.subdepth - 1 -- (the forked child of a simple command: no new level)
-					require("interp")._int.exec_simple(sh, { "command_not_found_handle", unpack(args, 1, n) }, function() end)
+					local ca = { "command_not_found_handle" }
+					for k = 1, n do
+						ca[k + 1] = args[k]
+					end
+					require("interp")._int.exec_simple(sh, ca, function() end)
 				end)
 				self.in_cnf_handle = nil
 				if not ok then
@@ -9104,6 +9412,9 @@ function Shell:deref(name)
 		seen = seen or {}
 		seen[name] = true
 		name = tname
+		if M.LNAMES[tname] then -- (a reference to a variable compiled code holds in a
+			M.lift_one(self, tname) -- register: its live value first)
+		end
 	end
 	return ""
 end
@@ -9962,6 +10273,9 @@ function Shell:set_str(name, s)
 	elseif dn == "TEXTDOMAIN" or dn == "TEXTDOMAINDIR" then
 		M.bind_textdomain(self)
 	end -- track the locale live, like bash
+	if dn ~= name and M.LNAMES[dn] then -- (written through a reference: compiled code
+		M.lift_one(self, dn, true) -- holding it in a register gets the new value)
+	end
 end
 -- bash's setup_glob_ignore (sv_globignore): a GLOBIGNORE with patterns turns dotglob ON,
 -- an unset one turns it OFF (even if `shopt -s dotglob` set it), an empty one leaves it.
@@ -10135,6 +10449,9 @@ function Shell:aset(name, n, acmd)
 	if b.exported or self.opt_a then -- (set -a: bind_variable marks it; keep the env in sync)
 		b.exported = true
 		C.setenv(dn, i64_to_str(b.n), 1)
+	end
+	if dn ~= name and M.LNAMES[dn] then -- (through a reference: see set_str)
+		M.lift_one(self, dn, true)
 	end
 	return b.n
 end
@@ -14163,6 +14480,40 @@ end
 
 -- A compiled module's deeply nested constant (emit's ser_flat): its tables as a list, each
 -- nested one a `{__r=N}` reference — linked up, the first returned.
+-- A segmented frame's pc -> segment table (emit's assemble): `bounds` the first pc of
+-- each segment, in order
+function M.seg_index(bounds, npc)
+	local b = {}
+	for x in bounds:gmatch("%d+") do
+		b[#b + 1] = tonumber(x)
+	end
+	local t, k = {}, 0
+	for p = 0, npc - 1 do
+		while b[k + 1] and b[k + 1] <= p do
+			k = k + 1
+		end
+		t[p] = k
+	end
+	return t
+end
+-- A compiled case's literal-arm table: key -> the pc of its first arm (emit's H.case)
+function M.case_map(keys, pcs)
+	local t, i = {}, 1
+	local ps = {}
+	for p in pcs:gmatch("[^,]+") do
+		ps[#ps + 1] = tonumber(p)
+	end
+	for k in (keys .. "\n"):gmatch("([^\n]*)\n") do
+		t[k] = ps[i]
+		i = i + 1
+	end
+	return t
+end
+-- (emit's module-wide node pool: every entry resolved, the list itself returned)
+function M.unflat_all(list)
+	M.unflat(list)
+	return list
+end
 function M.unflat(list)
 	for _, t in ipairs(list) do
 		for k, v in pairs(t) do
@@ -15212,6 +15563,17 @@ function Shell:echo_cmd(...)
 	end
 end
 -- …and $_ = its last argument (for a program that reads $_)
+-- echo_cmd with the words in a table (a long list can't be unpacked: the builtin takes it)
+function Shell:echo_cmd_t(t)
+	if #t < 4000 then
+		return self:echo_cmd(unpack(t))
+	end
+	local a = { "echo" }
+	for k = 1, #t do
+		a[k + 1] = t[k]
+	end
+	return M.builtin(self, a, nil)
+end
 function Shell:echo_cmd_u(...)
 	local n = select("#", ...)
 	self:echo_cmd(...)
@@ -15831,7 +16193,7 @@ function M.eval_run(sh, argv)
 		return require("b_eval")(sh, "eval", argv, _noop, nil) -- (the usage error: b_eval's)
 	end
 	local start = (a2 == "--") and 3 or 2
-	local code = table.concat({ unpack(argv, start) }, " ")
+	local code = table.concat(argv, " ", start)
 	if not code:match("%S") then
 		sh.status = 0
 		return
@@ -16174,6 +16536,10 @@ function M.arith_read(sh, name)
 	if s ~= nil and M.looks_numeric(s) then
 		return M.arith_num(s)
 	end -- native fast path
+	return M.ltext(sh, M.arith_read_text, sh, name, s)
+end
+-- (arith_read of a value that is TEXT: it may name lifted variables — rt.ltext)
+function M.arith_read_text(sh, name, s)
 	local P = require("parser")
 	if sh.in_arithcmd and P.arith_cmd == nil then -- (a compiled `(( ))`: its errors say `((: `)
 		P.arith_cmd = "(("
@@ -16279,10 +16645,10 @@ function M.db_arith_text(sh, src, expanded)
 	local I = require("interp")
 	local ok, v = true, expanded
 	if not expanded then
-		ok, v = pcall(I._int.arith_expand_text, sh, src)
+		ok, v = pcall(M.ltext, sh, I._int.arith_expand_text, sh, src)
 	end
 	if ok then
-		ok, v = pcall(I.dbracket_arith, sh, v, true)
+		ok, v = pcall(M.ltext, sh, I.dbracket_arith, sh, v, true)
 	end
 	if ok then
 		return v
@@ -16295,7 +16661,7 @@ function M.db_arith_text(sh, src, expanded)
 end
 -- …its $((…))-style expansion (interp's arith_expand_text: a traced operand's value)
 function M.arith_text(sh, src)
-	return require("interp")._int.arith_expand_text(sh, src)
+	return M.ltext(sh, require("interp")._int.arith_expand_text, sh, src)
 end
 -- …an operand whose subscripts the parser quoted (parser.cond_arith_word: `[[:a:]]` read as
 -- `[\[:a:\]]`), its word value `v` read the same way
@@ -16309,7 +16675,7 @@ function M.db_arith(sh, s)
 	if M.looks_numeric(s) then
 		return M.arith_num(s)
 	end
-	local ok, v = pcall(require("interp").dbracket_arith, sh, s)
+	local ok, v = pcall(M.ltext, sh, require("interp").dbracket_arith, sh, s)
 	if ok then
 		return v
 	end
@@ -16379,6 +16745,9 @@ function M.arith_str(sh, s)
 	if M.looks_numeric(s) then
 		return M.arith_num(s)
 	end
+	return M.ltext(sh, M.arith_str_text, sh, s)
+end
+function M.arith_str_text(sh, s)
 	local fn = _acache[s]
 	if fn == nil then
 		local cok, f = pcall(require("emit").compile_arith_value, s)
@@ -17247,7 +17616,7 @@ end
 -- Textual substitution of a non-numeric $name value into arithmetic (bash re-parses
 -- the value's TEXT). Dynamic — deferred to the interpreter bootstrap.
 function M.arith_textual(sh, raw)
-	return require("interp").arith_textual(sh, raw)
+	return M.ltext(sh, require("interp").arith_textual, sh, raw)
 end
 
 -- xtrace (`set -x`): before running a command, write `$PS4<cmd words>` to the trace fd,

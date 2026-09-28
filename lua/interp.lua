@@ -749,6 +749,10 @@ arith_resolve = function(sh, s, e)
 	if looks_numeric(s) then
 		return rt.arith_num(s)
 	end
+	-- (TEXT: it may name a variable compiled code holds in a register — rt.ltext)
+	return rt.ltext(sh, M.arith_resolve_text, sh, s, e)
+end
+M.arith_resolve_text = function(sh, s, e) -- (its non-numeric half)
 	-- a value naming itself (x=x, or a=b b=a): bash's expression recursion limit, checked
 	-- as evalexp starts on the value (pushexp) — before it is read — and reported in the
 	-- ENCLOSING expression, at the variable's token (e: its var node: `(x)` → "x)")
@@ -4543,7 +4547,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		sh.fntail_arm = nil
 	end
 	sh.calldepth = sh.calldepth + 1 -- OSR gate: no handoff inside a call
-	sh:pushCall(unpack(args, 2))
+	sh:pushCallT(args, 2)
 	-- Tempenv bindings applied as THIS call's prefix (`x=v func`) belong to this new
 	-- frame — tag them so a `local x` in the body absorbs its own call's tempenv
 	-- (but not an outer/eval tempenv). See Shell:localVar.
@@ -5117,7 +5121,7 @@ local function exec_simple(sh, args, hook, no_func)
 			if usep and (kd == "file" or not kd) then -- (not a builtin: find it along the
 				sh.path_lookup = std_path() -- standard path — for this one lookup)
 			end
-			local ok, err = pcall(exec_simple, sh, { unpack(args, j) }, hook, true)
+			local ok, err = pcall(exec_simple, sh, rt.tslice(args, j), hook, true)
 			sh.path_lookup = sv_pl
 			sh.via_command, sh.ign_ee = svc, iee
 			if not ok then

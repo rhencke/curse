@@ -314,6 +314,10 @@ function M.run_compiled(mod, sh, pc, nested)
 	local pd0, cd0, fs0, ne0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0, sh.noerr
 	local ffo, lastff = sh._ff, false
 	local lrun, lupv, grabbed = mod.lrun, mod.lupv, nil
+	local larr = mod.larr -- (run()'s spilled registers: its __L, the local after lrun's)
+	if larr and not lrun then
+		lrun = {}
+	end
 	local handler = (lrun or lupv) and function(e)
 		if lrun and type(e) == "table" and e.__curse_lineabort then
 			local run = mod.run
@@ -327,6 +331,12 @@ function M.run_compiled(mod, sh, pc, nested)
 					for k = 1, #lrun do
 						local _, v = dgetlocal(l, 2 + k)
 						grabbed[k] = v
+					end
+					if larr then
+						local _, a = dgetlocal(l, 3 + #lrun)
+						for k = 1, #larr do
+							grabbed[#lrun + k] = a[k - 1]
+						end
 					end
 					break
 				end
@@ -367,11 +377,18 @@ function M.run_compiled(mod, sh, pc, nested)
 					for k, n in ipairs(lrun) do
 						sh:aset(n, grabbed[k])
 					end
+					for k, n in ipairs(larr or {}) do
+						sh:aset(n, grabbed[#lrun + k])
+					end
 				end
 				if lupv then
 					local vals = { mod.upvget() }
 					for k, n in ipairs(lupv) do
 						sh:aset(n, vals[k])
+					end
+					local ua = mod.lupva and vals[#lupv + 1]
+					for k, n in ipairs(mod.lupva or {}) do
+						sh:aset(n, ua[k - 1])
 					end
 				end
 			end

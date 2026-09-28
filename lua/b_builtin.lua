@@ -19,7 +19,7 @@ return function(sh, cmd, args, hook, tcb)
 			-- (not a special builtin through `builtin`: its errors aren't fatal — execute_cmd)
 			local svc = sh.via_command
 			sh.via_command = true
-			local ok, e = pcall(exec_simple, sh, { unpack(args, j) }, hook, true) -- skip functions
+			local ok, e = pcall(exec_simple, sh, rt.tslice(args, j), hook, true) -- skip functions
 			sh.via_command = svc
 			if not ok then
 				error(e, 0)

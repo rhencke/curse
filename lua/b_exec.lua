@@ -128,7 +128,7 @@ return function(sh, st, args, hook, viacmd)
 	if rt.restricted(sh, "exec: restricted") then
 		return
 	end
-	local rest = { unpack(args, k) }
+	local rest = rt.tslice(args, k)
 	local name = rest[1]
 	-- search_for_command: the name along $PATH ONLY (a function or builtin of that name
 	-- is bypassed); one with a slash is taken as is. Then its full pathname.
@@ -177,7 +177,7 @@ return function(sh, st, args, hook, viacmd)
 	rt.env_drop_us = true
 	local stx = sh.tail_x -- (the subshell it replaces dies if the command does: rt.fg_ended)
 	sh.tail_x = rt.iso_cur(sh)
-	local eok, eerr = pcall(sh.exec, sh, unpack(rest))
+	local eok, eerr = pcall(sh.exec_t, sh, rest)
 	rt.shlvl_delta, rt.env_drop_us, sh.tail_x = sd, snu, stx
 	sh.exec_argv0, sh.exec_builtin, sh.exec_noenv, sh.exec_script_a0 = sv_a0, sv_eb, sv_ne, sv_sa0
 	if env0 then -- (only a failed exec that the shell survives needs these back)
