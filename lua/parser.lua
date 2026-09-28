@@ -41,6 +41,7 @@ local POSIX_DQ = false
 local MBX = false -- (else the LC_CTYPE name: the text's lexing depends on its charset)
 local MB_BSL = nil -- (mb_hide's placeholder for a trail byte `\`, handed to the next make_parser)
 
+local dq_end, expansion_end, subscript_close -- forward (defined past scan_cmdsub)
 -- ---- arithmetic expression parser (precedence climbing over a string) ----
 -- AST: {k="num",v}, {k="var",name}, {k="bin",op,l,r}, {k="un",op,e},
 --      {k="asgn",name,op,e}, {k="post",name,d}, {k="pre",name,d}
@@ -364,15 +365,12 @@ local function arith(src, nodefer)
 				-- Consume the balanced braces and defer JUST this leaf — at eval it is
 				-- word-expanded and arith-resolved, so the surrounding arithmetic is parsed
 				-- once (and memoized) instead of re-parsing the expanded string each pass.
-				local depth, j = 1, i + 1
-				while j <= n and depth > 0 do
-					local ch = src:sub(j, j)
-					if ch == "{" then
-						depth = depth + 1
-					elseif ch == "}" then
-						depth = depth - 1
-					end
-					j = j + 1
+				-- (its end as the reader finds it — quotes and nested expansions included; one
+				-- the text never closes (`$[${]`) is no leaf: the textual path reports it)
+				local ok, j = pcall(expansion_end, src, i - 1, false, true)
+				if not ok then
+					trap_flow(j)
+					aerr("syntax error: operand expected")
 				end
 				local raw = src:sub(i - 1, j - 1) -- "$" … "}"
 				i = j
@@ -785,13 +783,20 @@ local function split_subst(s)
 			i = quote_end(s, i, true)
 		elseif c == "/" and i > 1 then
 			return s:sub(1, i - 1), s:sub(i + 1)
+		elseif c == "`" or (c == "$" and (s:byte(i + 1) == 40 or s:byte(i + 1) == 123)) then
+			-- (bash's skip_to_delim: a `/` inside a nested ${…} / $(…) / `…` doesn't split —
+			-- `${x/${/}}` is the pattern `${/}`; one left open runs to the end)
+			local ok, e = pcall(expansion_end, s, i, false, true)
+			if not ok then
+				trap_flow(e)
+			end
+			i = ok and e or n + 1
 		else
 			i = i + 1
 		end
 	end
 	return s, ""
 end
-local dq_end, expansion_end, subscript_close -- forward (defined past scan_cmdsub)
 local function scan_braces(s, bi, dq)
 	local i, ns, depth = bi + 1, #s, 1
 	local sq_lit = dq and POSIX_DQ
@@ -1354,8 +1359,10 @@ local function dparen_close(s, j, strict) -- (strict: a quote or expansion left 
 			j = dq_end(s, j, not strict)
 		elseif b == 36 and s:byte(j + 1) == 39 then -- $'…'
 			j = quote_end(s, j + 1, true, strict)
-		elseif b == 36 or b == 96 then -- $… `…`
+		elseif b == 96 or (b == 36 and s:byte(j + 1) == 40) then -- `…` $(…)
 			j = expansion_end(s, j, false, not strict)
+		elseif b == 36 then -- (a ${ or $[ nests nothing here: parse_matched_pair's P_ARITH
+			j = j + 1 -- nests only a $( — `$(( ${x:-)} ))` ends at that `)`, `$(( ${ ))` reads)
 		elseif b == 40 then
 			d = d + 1
 			j = j + 1
@@ -1729,6 +1736,11 @@ local function parse_dollar(w, i, add, q)
 		return ni
 	elseif nx == "[" then -- $[expr]: deprecated arithmetic, an alias of $(( ))
 		local j = bracket_close(w, i + 1, true)
+		if j > #w then -- (one the text never closes — a here-document body read as it expands:
+			-- extract_arithmetic_subst runs off it, "bad substitution: no closing `]' in TEXT")
+			add({ nulcut = w, nocl = "]", q = true })
+			return #w + 1
+		end
 		add({ arith = w:sub(i + 2, j - 1), q = q, bracket = true })
 		return j + 1
 	elseif nx == "(" then
@@ -1873,6 +1885,14 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 				add({ cserr = M.open_comsub_err(inner:sub(i + 3) .. '"'), q = true })
 				return
 			end
+			-- a $( a here-document body never closes: expanding the body runs what precedes
+			-- it, then fails there (parse_comsub's EOF error, reported at the line the body
+			-- ends on — csnl: its newlines — then DISCARD)
+			if heredoc == true and inner:byte(i + 1) == 40 and not (inner:byte(i + 2) == 40 and dparen_is_arith(inner, i + 3))
+				and not pcall(scan_cmdsub, inner, i + 2) then
+				add({ cserr = M.open_comsub_err(inner:sub(i + 2)), csnl = select(2, inner:gsub("\n", "")), q = true })
+				return
+			end
 			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
 			-- "…" one in posix mode)
 			i = parse_dollar(inner, i, (heredoc or POSIX_DQ) and function(p)
@@ -1888,8 +1908,13 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			-- within a backtick INSIDE double quotes, `\` also escapes `"` (unlike the
 			-- `$()` form) — bash unwraps `\"`→`"`, so `"`echo \"hi\"`"` runs `echo "hi"`
 			-- (not in a heredoc body or a prompt: `\"` reaches the command as is).
-			local body
+			local body, i0 = nil, i
 			body, i = bq_body(inner, i, bt_keep and "[`$\\]" or '[`$\\"]')
+			if i > #inner + 1 then -- (one the text never closes — a here-document body read as
+				-- it expands: "bad substitution: no closing "`" in `…", the rest of the text)
+				add({ bterr = inner:sub(i0), q = true })
+				return
+			end
 			add({ cmdsub = body, q = true, backtick = true, aenv = ALIAS_ENV })
 		else
 			local s, e = inner:find("^[^$\\`]+", i)
@@ -4112,6 +4137,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- (its body has its own quoting / case syntax; a here-document opened in it
 				-- reads its body from the following lines, as a $(…)'s does)
 				local je, hdp = scan_cmdsub(src, i + 2, hdwarn_for(start, line0))
+				-- (bash 5.2 reads the body with parse_comsub too: a syntax error in it fails
+				-- the whole line as the word is read — the $( … ) check below)
+				local cbody = src:sub(i + 2, je - 2)
+				if not hdp and not cbody:find('$"', 1, true)
+					and (not cbody:find("<<", 1, true) or cbody:find("<<%-?[ \t]*$") or cbody:find("<<%-?[ \t]*[\n;&|)]"))
+					and not alias_touch(cbody) then
+					comsub_check(cbody, je)
+				end
 				if hdp then
 					local dl
 					je, dl = hdp_splice(je, hdp)
@@ -4274,6 +4307,33 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	end
 	-- A function definition, with any trailing redirects (`f() { … } >&2`) that apply
 	-- to the whole body on every call.
+	-- the end of the WORD at src[k] as the reader takes it (quotes, escapes and expansions
+	-- whole; an unclosed one runs to the end), for a function name read raw
+	local function raw_word_end(k)
+		while k <= n do
+			local c = src:sub(k, k)
+			if c == "\\" then
+				k = k + 2
+			elseif c == "'" then
+				k = quote_end(src, k, false)
+			elseif c == '"' then
+				k = dq_end(src, k, true)
+			elseif c == "$" and src:sub(k + 1, k + 1) == "'" then
+				k = quote_end(src, k + 1, true)
+			elseif c == "$" or c == "`" then
+				local ok, e = pcall(expansion_end, src, k, false, true)
+				if not ok then
+					trap_flow(e)
+				end
+				k = ok and e or n + 1
+			elseif c:match("[ \t\n;&|()<>]") then
+				break
+			else
+				k = k + 1
+			end
+		end
+		return math.min(k, n + 1)
+	end
 	local function funcdef_node(nm, dstart, dline)
 		-- rline: the line the definition's redirections are applied at — execute_function's
 		-- line_number = tc->line (make_function_def's function_bstart: the `{` line, or for
@@ -4682,7 +4742,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			return { t = "assign", name = name, index = subidx, append = (op == "+="), rhs = parse_word("") }
 		end
 		local raw = word(true) -- stop at unquoted ) so `(x=2)` closes the subshell
-		if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))" then
+		if not subidx and op == "=" and raw:sub(1, 3) == "$((" and raw:sub(-2) == "))"
+			and dparen_close(raw, 4) == #raw - 1 then -- (the `))` at the end closes THIS `$((`:
+			-- not `$((()))$(())`)
 			-- (a bad expression — or `$((1))$((2))` — takes the word path: its error is a
 			-- runtime one, reported when the assignment runs)
 			local aok, ae = pcall(arith, raw:sub(4, -3))
@@ -4762,6 +4824,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			i = i + 8
 			ws()
 			local s, e = src:find("^[%w_:%.+@/%%%^~,!][%w_%.%-:+@/!#=%%%^~,]*", i)
+			if s and src:sub(e + 1, e + 1):match("[$'\"\\`]") or not s and src:sub(i, i):match("[$'\"\\`]") then
+				s, e = i, raw_word_end(i) - 1 -- (a quoted/expanded NAME: reported when it runs)
+			end
 			if not s then
 				if i > n then -- (the input's final newline is the token: bash)
 					error("syntax error near `newline'")
@@ -4833,31 +4898,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 			end
 		end
-		-- A funcdef whose "name" is an EXPANSION (`$foo-bar()`, `foo-$(x)()`): bash
-		-- parses it and reports "not a valid identifier" at RUNTIME (status 1), not a
-		-- parse error. Scan the word (balancing $()); if it's `$`-bearing and followed
-		-- by `()`, treat it as a funcdef with that (invalid) name.
-		local d1 = src:find("[$ \t\n(;&|<>]", i) -- (no `$` before the word ends: can't be one)
-		if d1 and src:sub(d1, d1) == "$" then
-			local j, depth = i, 0
-			while j <= n do
-				local c = src:sub(j, j)
-				if c == "$" and src:sub(j + 1, j + 1) == "(" then
-					depth = depth + 1
-					j = j + 2
-				elseif c == "(" and depth > 0 then
-					depth = depth + 1
-					j = j + 1
-				elseif c == ")" and depth > 0 then
-					depth = depth - 1
-					j = j + 1
-				elseif depth == 0 and (c == "" or c:match("[ \t\n(;&|<>]")) then
-					break
-				else
-					j = j + 1
-				end
-			end
-			if j > i and src:sub(i, j - 1):find("$", 1, true) then
+		-- A funcdef whose "name" is an EXPANSION or QUOTED (`$foo-bar()`, `foo-$(x)()`,
+		-- `'f'()`, `\h()`): to bash's grammar any WORD before `()` is a function name — it
+		-- reports "`'f'': not a valid identifier" at RUNTIME (status 1), not a parse error.
+		-- Scan the word (quotes and expansions whole); if it has a `$`, a quote or a `\`
+		-- and `()` follows, it's a funcdef with that (invalid) name.
+		local d1 = src:find("[$'\"\\` \t\n(;&|<>]", i) -- (none before the word ends: can't be one)
+		if d1 and src:sub(d1, d1):match("[$'\"\\`]") then
+			local j = raw_word_end(i)
+			if j > i and src:sub(i, j - 1):find("[$'\"\\`]") then
 				local k = j
 				while is_blank(src:sub(k, k)) do
 					k = k + 1
@@ -4967,6 +5016,15 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			try_alias(false)
 			do -- (after the name: `in`, `do`, or a separator — `for x y` is an error)
 				local pw, c = peekword() or src:match("^[^ \t\n;&|()<>]+", i), src:sub(i, i)
+				-- (a redirection / `;;` there: bash's token is the whole operator — `>&`, `;;`)
+				local op = (c == "<" or c == ">" or src:sub(i, i + 1) == "&>" or src:sub(i, i + 1) == ";;")
+					and (src:match("^<<<", i) or src:match("^<<%-", i) or src:match("^&>>", i) or src:match("^;;&", i)
+						or src:match("^[<>]%(", i) and src:sub(i, scan_cmdsub(src, i + 2) - 1) -- (an open one: its EOF)
+						or src:match("^<[<&>]", i) or src:match("^>[>&|]", i)
+						or src:match("^&>", i) or src:match("^;;", i) or c)
+				if op then
+					error("syntax error near `" .. op .. "'")
+				end
 				if pw and pw ~= "" and pw ~= "in" and pw ~= "do" and not c:match("[;\n&|()]") and i <= n then
 					error("syntax error near `" .. pw .. "'")
 				end
@@ -4980,9 +5038,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					if c == ";" or c == "\n" or c == "" or c == "#" then
 						break
 					end
-					if peekword() == "do" then
-						break
-					end
+					-- (a `do` here is a word of the list: only a `;` or newline ends it —
+					-- `for i in a do :; done` is bash's syntax error at `done')
 					-- an unquoted bare `(` in word position is a syntax error (`for x in a=()`,
 					-- `for x in (`); extglob/$()/<() are consumed inside word(true).
 					if c == "(" or c == ")" then
@@ -6194,6 +6251,34 @@ end
 -- when interpreting) makes alias expansion use the live runtime alias table.
 -- `line1`: the line the text's first line is (eval: the eval command's own line — bash
 -- numbers eval'd code, and functions it defines, from there)
+-- THE ONE ENTRY for text re-read at EXPANSION time (a ${…} operand, a subscript, a redirect
+-- target, a case pattern, an arithmetic text's $…, a nameref's element, a prompt — raw text the
+-- parser stored instead of a word tree). Every scanner here raises a syntax error as a Lua
+-- string; at parse time the reader turns it into bash's syntax error, but a re-read happens
+-- while a command RUNS, where a raw string error would escape as a Lua error (fuzz F2, F5, F48,
+-- F53-F55: each was one more re-read site guarded on its own, the next one left open). So a
+-- run-time re-read never calls parse_word/parse_default_quoted/parse_heredoc itself: it calls
+-- this, which never raises a string — a construct the re-read finds left open becomes an error
+-- PART, raised when the word expands after what precedes it (bash expands left to right):
+-- extract_dollar_brace_string's "bad substitution: no closing `}' in WORD" (`]' for a $[),
+-- else the scanner's own message. how: nil (a plain word), "dq" (a ${…} operand inside "…":
+-- parse_default_quoted), "hd" (here-document-style text: parse_heredoc). …: the parse
+-- function's further arguments.
+function M.reword(txt, how, ...)
+	local ok, w = pcall(how == "dq" and M.parse_default_quoted or how == "hd" and M.parse_heredoc or M.parse_word,
+		txt, ...)
+	if ok then
+		return w
+	end
+	if type(w) ~= "string" then
+		error(w, 0)
+	end
+	local m = unpos(w)
+	local close = m:match("^unexpected EOF while looking for matching `([}%]])'$")
+	return { k = "word", src = txt, parts = { close and { nulcut = txt, nocl = close == "]" and "]" or nil, q = true }
+		or { xperr = m, q = true } } }
+end
+
 function M.open(src, sh, line1)
 	return make_parser(src, sh, nil, nil, nil, nil, line1)
 end

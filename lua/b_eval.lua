@@ -112,7 +112,7 @@ return function(sh, cmd, args, hook, tcb)
 										error({ __curse_exit = 1 }, 0)
 									end
 									sh.noerr = ne0
-									rt.line_aborted(sh, 1, pf0)
+									rt.line_aborted(sh, 1, pf0, serr)
 									break -- div0/failglob: abort the rest of this line
 								else
 									error(serr)
