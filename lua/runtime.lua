@@ -3342,6 +3342,42 @@ end
 -- has none of its own), file actions `fa` plus closing every fd another in-process shell
 -- owns, the signal mask a bash child starts with, SIGINT/SIGQUIT ignored for an async one
 -- (`hold`), and the child environ with SHLVL moved by `lvl`. Returns rc, pid.
+-- `NAME: fork: retry: Resource temporarily unavailable` (sys_error: no line)
+function M.nofork_msg(sh, retry)
+	io.stderr:write((M.err_prefix(sh):gsub("line %d+: $", "")) .. (retry and "fork: retry: " or "fork: ")
+		.. ffi.string(C.strerror(11)) .. "\n")
+end
+-- bash's sleep(forksleep) between fork retries — the pipeline's other stages (tasks) and
+-- the background jobs run meanwhile. false: a signal cut it short (bash stops retrying).
+function M.fork_sleep(secs)
+	local wall = M.wall_secs
+	local dl = wall() + secs
+	local t = co_task()
+	while true do
+		local left = dl - wall()
+		if left <= 0 then
+			return true
+		end
+		if next(M.internal_pids) then
+			M.reap_orphans()
+		end
+		if t then
+			pre_yield(t)
+			if coroutine.yield(-1, 0) == SIGMARK then
+				task_signals(t)
+			end
+		elseif sched_live() then
+			M.sched_pump({ deadline = dl })
+		else
+			local sec = math.floor(left)
+			local ts = ffi.new("struct curse_rt_timespec", sec, math.floor((left - sec) * 1e9))
+			if C.curse_rt_ppoll(nil, 0, ts, nil) < 0 then
+				return false -- (EINTR: a signal — its trap has run)
+			end
+		end
+	end
+end
+local FORK_Q = {} -- (spawns waiting for another's fork retry to end: M.fork_sleep)
 local function spawn_argv(self, path, args, n, fa, hold, lvl)
 	if next(M.internal_pids) then -- (a `ps` it runs must not see orphans that have ended)
 		M.reap_orphans()
@@ -3384,7 +3420,50 @@ local function spawn_argv(self, path, args, n, fa, hold, lvl)
 	M.shlvl_delta = d
 	local pidp = ffi.new("curse_pid_t[1]")
 	local cpuv = self.iso_ctx and M.iso_spawn_pre(self)
+	if M.fork_retrying or FORK_Q[1] then
+		-- another stage is in bash's fork retry: bash forks one at a time, in pipeline
+		-- order — the ones that came meanwhile queue, and go in their order once it is done
+		-- (else a later stage takes the freed process and the earlier ones never get one)
+		local me = {}
+		FORK_Q[#FORK_Q + 1] = me
+		local ok, err = pcall(function()
+			while M.fork_retrying or FORK_Q[1] ~= me do
+				M.fork_sleep(0.01)
+			end
+		end)
+		for k = 1, #FORK_Q do
+			if FORK_Q[k] == me then
+				table.remove(FORK_Q, k)
+				break
+			end
+		end
+		if not ok then
+			error(err, 0)
+		end
+	end
 	local rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
+	-- No process to be had (EAGAIN: RLIMIT_NPROC, a cgroup's pids.max): bash's make_child
+	-- says `fork: retry: …`, reaps, sleeps 1, 2, 4, 8 s and tries again — meanwhile the
+	-- pipeline's earlier stages end and free theirs (an 800-stage pipeline under a 400-task
+	-- limit gets through: stress-attack S15); then `fork: …` (spawn_errmsg), status 126.
+	local forksleep = 1
+	if rc == 11 then
+		M.fork_retrying = true
+		while rc == 11 and forksleep < 16 do
+			M.nofork_msg(self, true)
+			local ok, slept = pcall(M.fork_sleep, forksleep)
+			if not ok then
+				M.fork_retrying = nil
+				error(slept, 0)
+			end
+			if not slept then
+				break
+			end
+			forksleep = forksleep * 2
+			rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
+		end
+		M.fork_retrying = nil
+	end
 	if cpuv then
 		M.iso_spawn_post(self, rc == 0 and pidp[0] or 0)
 	end
@@ -9339,6 +9418,10 @@ end
 -- whose file then fails ENOENT is named by its PATH (bash: the hashed file is gone, or
 -- — the file exists — its interpreter is: "cannot execute: required file not found").
 function M.spawn_errmsg(self, name, execpath, rc)
+	if rc == 11 then -- (no process to be had, after bash's retries: make_child's sys_error)
+		M.nofork_msg(self, false)
+		return ""
+	end
 	local pre = "curse: " .. (self.exec_builtin and "exec: " or "")
 	if rc == 2 and not self.exec_builtin and execpath then
 		-- (shell_execve's file_error / internal_error name the file as it is — only a
