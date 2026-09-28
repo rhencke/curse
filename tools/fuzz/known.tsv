@@ -141,5 +141,7 @@ F115	both	^target:regex:	^l
 F116	sig	^target:(de)?parse:.*\|> parse=N
 F117	sig	^target:(de)?parse:.*unexpected token
 F118	both	^target:pexp:output\|< S: line N: X: bad array subscript	\[-[0-9]
+F119	sig	^compiled\|S: line L: [A-Za-z_][A-Za-z_0-9]*: readonly variable
+F120	sig	^all\|S: line L:  \$\{\} : bad substitution
 NOISE	src	`set`|\$\(set\)|\$\{?BASH\}?([^_A-Za-z0-9]|$)|^[ \t]*(set|declare|typeset|readonly|export)( -p)?[ \t]*$
 NOISE	src	RANDOM|SRANDOM|EPOCH|BASHPID|SECONDS|\btimes\b|\bjobs\b|\$!|%[0-9%+-]|\bwait -n

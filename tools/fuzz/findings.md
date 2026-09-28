@@ -1254,3 +1254,40 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   variable is refused before its value expands (BASH_SOURCE=$(…) p ran nothing in bash).
   test/cases/2774-prefix-noassign-no-expansion.sh
 - F86 FIXED — test/cases/2775-nameref-noassign-array.sh
+
+# Overnight fuzz-night campaign (gram:tiered + gram:compiled, containerized), branch fuzz-night
+
+Both found by campaign 1 (25 min, `gram:tiered`+`gram:compiled` in `fuzz-docker`), reduced by
+hand, checked with `cmp.sh` in the container (bash 5.2.21 vs curse interp / compiled / tiered /
+static) against the current main (bf1c58e, after the fix-f53 merge landed mid-campaign — a
+third candidate from this same batch, an ambiguous-redirect error on a backgrounded compound
+losing its `line N:` prefix, turned out to already be fixed by that merge's
+2766-compound-redirect-error-line.sh and was dropped).
+
+## F119. Compiled tier: a `for`/`select` loop assigning into a readonly special variable bypasses the readonly check and overwrites it
+
+    old=$UID
+    for UID in a b
+    do
+        :
+    done
+    echo "UID=$UID same=$([ "$UID" = "$old" ] && echo yes || echo no)"
+
+- bash, curse interp/tiered/static: `S: line 2: UID: readonly variable` on the first
+  iteration (the loop still runs), `UID=$old same=yes` (UID unchanged), status 0.
+- curse compiled tier only: no error at all, and `UID` is silently overwritten by the loop
+  (`UID=b same=no`) — the compiled tier's `for` loop doesn't check the readonly attribute
+  before storing the iteration variable, so assigning into any readonly variable through a
+  `for`/`select` list (not just a special one) escapes detection entirely and corrupts it.
+  (gram:compiled queue; not touched by the for-loop line-attribution fixes in F62/F69/F79.)
+
+## F120. `(( ${} ))`: bash's bad-substitution message keeps the subexpression's surrounding whitespace, curse trims it
+
+    (( ${} ))
+
+- bash: `S: line 1:  ${} : bad substitution` (the arithmetic subexpression text ` ${} `,
+  spaces included, is echoed verbatim between "line 1:" and the message).
+- curse (all tiers): `S: line 1: ${}: bad substitution` (trimmed to `${}`, no surrounding
+  spaces) — a narrower case than F33 (`${}` alone): F33's fix only normalizes `${}` with no
+  space before the following text, so `${} ` (a trailing space before the closer) still
+  disagrees. (gram:tiered queue)
