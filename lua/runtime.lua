@@ -15258,6 +15258,9 @@ function M.array_key(sh, name, raw, expanded, inarith)
 	if raw:match("^%s*$") then
 		return 0
 	end
+	if not inarith and raw:find('\\[$`"\\]') then -- (a backslash quoting as in double quotes:
+		return require("interp")._int.array_key(sh, name, raw) -- interp's ${a[…]} path — B6)
+	end
 	-- the parsed subscript is cached per raw text; interp's arith_key evaluates it (natively
 	-- when it can; a non-numeric $name takes bash's textual path, quoted as a subscript) and
 	-- makes any error abandon the line
@@ -17767,8 +17770,9 @@ function M.int_value(sh, s, ev)
 		return M.arith_num(s)
 	end
 	-- (the value is expansion output: a `$`/`` ` `` in it is a bad token, never expanded
-	-- again — `declare -i n; n='1+${x}'` is bash's `operand expected`)
-	local ok, v = pcall((s:find("[$`]") and require("interp").arith_expanded_eval) or ev or M.arith_str, sh, s)
+	-- again — `declare -i n; n='1+${x}'` is bash's `operand expected` — and a `"` is just a
+	-- character, no quote pair to strip: `n='"2"'` is an error too)
+	local ok, v = pcall((s:find('[$`"]') and require("interp").arith_expanded_eval) or ev or M.arith_str, sh, s)
 	if ok then
 		return v
 	end
