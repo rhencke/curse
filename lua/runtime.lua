@@ -16190,9 +16190,12 @@ function M.var_is_nameref(sh, nm)
 end
 function M.var_is_set(sh, nm, expanded)
 	local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
-	if base and require("parser").subscript_x(nm, #base + 1) ~= #nm then
-		return false -- (not a valid_array_reference — its `[` doesn't close at the end, as
-	end -- skipsubscript reads it: `A["]` — so no variable by that name)
+	if base and not sh:is_assoc(sh:deref(base)) and require("parser").subscript_x(nm, #base + 1) ~= #nm then
+		-- (not a valid_array_reference — its `[` doesn't close at the end as skipsubscript
+		-- reads it: `A["]` — so no variable by that name. An associative array's key, which
+		-- [[ -v ]]'s expansion quoted for it, is taken to the last `]`)
+		return false
+	end
 	if base then
 		local b = sh.vars[sh:deref(base)]
 		if (sub == "@" or sub == "*") and not sh:is_assoc(base) then -- `-v a[@]`: any element

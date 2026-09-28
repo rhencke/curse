@@ -15,3 +15,5 @@ printf '[[ -v '"'"'E["]'"'"' ]]; echo "src $?"\n' > s2909.sh; . ./s2909.sh
 trap '[[ -v "F[\"]" ]]; echo "trap $?"' USR1; kill -USR1 $$; trap - USR1
 n=0; for ((i = 0; i < 150; i++)); do [[ -v 'A["]' ]] || n=$((n + 1)); test -v "a[i%2]" && n=$((n + 1)); done; echo "$n"
 rm -f s2909.sh
+# (an associative array's key from an expansion, `"` included, is its key)
+declare -A as; k='"'; as[$k]=1; [[ -v as["$k"] ]]; echo "as $?"; [[ -v as[$k] ]]; echo "as $?"

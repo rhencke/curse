@@ -739,7 +739,7 @@ local function not_compilable(e)
 	-- renders it (prints bash's "syntax error in expression" + aborts the line), so the
 	-- enclosing loop/statement must delegate — else emit_value throws an uncaught error.
 	-- rpow: a short-circuited operand holding `**` still checks its exponent (interp's noeval_pow)
-	if e.k == "xpandleaf" or e.k == "arith_perr" or e.rpow or (e.idxraw and not arith_elem_ok(e))
+	if e.k == "xpandleaf" or e.k == "arith_perr" or e.rpow or e.badsub or (e.idxraw and not arith_elem_ok(e))
 		or arith_depth(e) > ARITH_MAXDEPTH
 	then
 		return true

@@ -278,9 +278,30 @@ local function arith(src, nodefer)
 			-- (to its `]` as expr.c's skipsubscript reads it: an escaped char, '…' "…" `…`
 			-- $( … ) ${ … } nest — `a["]` never closes)
 			local rs = i + 1
-			local j = M.subscript_x(src, i)
+			local j, bad = M.subscript_x(src, i), nil
 			if j > n then
-				error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
+				-- (…unless an associative array's already-expanded key under assoc_expand_once:
+				-- expr_skipsubscript's VA_NOEXPAND reads to the `]` without quoting — `a[80's]`.
+				-- Known only at run time: the balanced `]` then, the error deferred — badsub)
+				local depth, k = 1, i + 1
+				while k <= n do
+					local ch = src:sub(k, k)
+					if ch == "\\" then
+						k = k + 1
+					elseif ch == "[" then
+						depth = depth + 1
+					elseif ch == "]" then
+						depth = depth - 1
+						if depth == 0 then
+							break
+						end
+					end
+					k = k + 1
+				end
+				if k > n then
+					error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
+				end
+				j, bad = k, { tok = src:sub(ns), expr = src }
 			end
 			local raw = src:sub(rs, j - 1)
 			i = j + 1 -- past the ]
@@ -288,7 +309,7 @@ local function arith(src, nodefer)
 			if not ok then
 				trap_flow(idx)
 			end
-			return nm, (ok and idx) or nil, raw
+			return nm, (ok and idx) or nil, raw, bad
 		end
 		return nm, nil, nil
 	end
@@ -319,9 +340,9 @@ local function arith(src, nodefer)
 		if starts("++") or starts("--") then
 			local d = src:sub(i, i) == "+" and 1 or -1
 			i = i + 2
-			local nm, idx, ir = nameSub()
+			local nm, idx, ir, bad = nameSub()
 			-- (readtok: a `++`/`--` right after `++x` is `--x++` — "++: assignment requires lvalue")
-			local node = { k = "pre", name = nm, idx = idx, idxraw = ir, d = d }
+			local node = { k = "pre", name = nm, idx = idx, idxraw = ir, d = d, badsub = bad }
 			if starts("++") or starts("--") then
 				aerr(src:sub(i, i + 1) .. ": assignment requires lvalue", node)
 			end
@@ -430,21 +451,21 @@ local function arith(src, nodefer)
 			return { k = "num", v = v }
 		end
 		-- a name (optionally subscripted): a var, an assignment, or ++/--
-		local name, idx, ir = nameSub()
+		local name, idx, ir, bad = nameSub()
 		-- post ++/--
 		if starts("++") then
 			i = i + 2
-			return { k = "post", name = name, idx = idx, idxraw = ir, d = 1 }
+			return { k = "post", name = name, idx = idx, idxraw = ir, d = 1, badsub = bad }
 		end
 		if starts("--") then
 			i = i + 2
-			return { k = "post", name = name, idx = idx, idxraw = ir, d = -1 }
+			return { k = "post", name = name, idx = idx, idxraw = ir, d = -1, badsub = bad }
 		end
 		-- assignment operators (3-char shifts before their 2-char prefixes)
 		for _, op in ipairs(asgn and { "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|=" } or {}) do
 			if starts(op) then
 				i = i + #op
-				local node = { k = "asgn", name = name, idx = idx, idxraw = ir, op = op, e = parseExpr(0) }
+				local node = { k = "asgn", name = name, idx = idx, idxraw = ir, op = op, e = parseExpr(0), badsub = bad }
 				if op == "/=" or op == "%=" then
 					skip()
 					node.etxt, node.etok = etxt, lasttp and src:sub(lasttp) or ""
@@ -454,9 +475,9 @@ local function arith(src, nodefer)
 		end
 		if asgn and starts("=") and src:sub(i + 1, i + 1) ~= "=" then
 			i = i + 1
-			return { k = "asgn", name = name, idx = idx, idxraw = ir, op = "=", e = parseExpr(0) }
+			return { k = "asgn", name = name, idx = idx, idxraw = ir, op = "=", e = parseExpr(0), badsub = bad }
 		end
-		return { k = "var", name = name, idx = idx, idxraw = ir }
+		return { k = "var", name = name, idx = idx, idxraw = ir, badsub = bad }
 	end
 
 	-- binary operators by precedence (higher binds tighter), matching bash

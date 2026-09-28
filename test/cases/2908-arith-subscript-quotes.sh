@@ -14,3 +14,7 @@ trap 'x="a[\$(]"; echo $((x)); echo no' USR1; kill -USR1 $$; trap - USR1
 i=0; while [ $i -lt 150 ]; do x='a[$(]'; y=$((x)); i=$((i + 1)); done 2>&1 | sort | uniq -c
 y=0; for i in {1..150}; do x='a[i%3]'; y=$((y + x)); done; echo "$y"
 rm -f s2908.sh
+# (an associative array's expanded key under assoc_expand_once reads to its `]` unquoted)
+shopt -s assoc_expand_once; declare -A h; b="80's"
+let "++h[$b]"; (( h[$b] += 2 )); echo "${h[$b]}"; declare -p h
+shopt -u assoc_expand_once; let "++h[$b]"; echo "st $?"

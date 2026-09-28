@@ -1021,6 +1021,16 @@ end
 -- bash evaluates arithmetic WHILE parsing it, so what came before a syntax error has run:
 -- `let 'b=a++ +'` increments a. The parser hands the completed part as err.pre; evaluate
 -- it before the error is reported (its own error — `1/0 + )` — wins, as in bash).
+-- A NAME[…] whose `]` skipsubscript never finds (parser nameSub: badsub): "bad array
+-- subscript" — unless NAME is associative and assoc_expand_once holds (VA_NOEXPAND: read to
+-- the `]` without quoting, `a[80's]`)
+local function badsub_chk(sh, e)
+	if e.badsub and not (sh.shopt.assoc_expand_once and sh:is_assoc(e.name)) then
+		io.stderr:write("curse: " .. P.arith_errmsg(e.badsub.expr,
+			{ __curse_arith = true, msg = "bad array subscript", tok = e.badsub.tok }) .. "\n")
+		error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
+	end
+end
 arith_pre = function(sh, err)
 	if type(err) == "table" and err.pre then
 		eval(sh, err.pre)
@@ -1038,6 +1048,7 @@ eval = function(sh, e)
 	end
 	if k == "var" then
 		if e.idxraw then
+			badsub_chk(sh, e)
 			arith_nounset(sh, e.name)
 			if rt.arith_badraw(sh, e.name, e.idxraw, "r") then -- (non-fatal: 0)
 				return i64(0)
@@ -1277,6 +1288,7 @@ eval = function(sh, e)
 		local v = eval(sh, e.e) -- (bash evaluates the value BEFORE the lvalue's subscript)
 		local iv, bad
 		if e.idxraw then -- (a bad element reads 0 and stores nothing: rt.arith_badraw)
+			badsub_chk(sh, e)
 			local how = e.op == "=" and "w" or "rw"
 			if e.op ~= "=" then
 				arith_nounset(sh, e.name)
@@ -1335,6 +1347,7 @@ eval = function(sh, e)
 	if k == "post" then
 		arith_nounset(sh, e.name) -- x++ / x-- read x first
 		if e.idxraw then
+			badsub_chk(sh, e)
 			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw, true)
 			if iv == rt.EMPTYSUB then
 				iv = not rt.arith_badraw(sh, e.name, "", "rw")
@@ -1353,6 +1366,7 @@ eval = function(sh, e)
 	if k == "pre" then
 		arith_nounset(sh, e.name) -- ++x / --x read x first
 		if e.idxraw then
+			badsub_chk(sh, e)
 			local iv = not rt.arith_badraw(sh, e.name, e.idxraw, "rw") and arith_key(sh, e.name, e.idx, e.idxraw, true)
 			if iv == rt.EMPTYSUB then
 				iv = not rt.arith_badraw(sh, e.name, "", "rw")
