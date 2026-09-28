@@ -619,6 +619,16 @@ curse result shown ("all tiers").
 
 (parse; `time --` under `set -n` printing timings is F96.)
 
+## F118. `${v[-1]}` on a scalar: bash's "bad array subscript" is missing
+
+    n=5; echo "[${n[-1]}]"; echo "[${n[-1]:-d}]"; echo "[${#n[-1]}]"; echo end
+
+- bash: `S: line 1: n: bad array subscript` then `[]`, again then `[d]`, then
+  `S: line 1: -1]: bad array subscript` and the rest of the script is skipped (the `${#…}`
+  one is fatal), status 1.
+- curse (all tiers): `[]`, `[d]`, `[0]`, `end` — no error at all. The largest pexp group
+  (~130 of 377 unbucketed signatures). (pexp)
+
 ## Variants of known entries (not new)
 
 - `x=a; echo ${x/${/}}` and `if 0&break;then select H in ${0[0]/${/}} do 0;done;fi`
