@@ -1421,6 +1421,16 @@ function M.pipe_hi(fds)
 		return -1
 	end
 	fds[0], fds[1] = fd_hi(_hi_pipe[0]), fd_hi(_hi_pipe[1])
+	if fds[0] < 0 or fds[1] < 0 then -- (no fd to move one to: EMFILE, as pipe() would say)
+		if fds[0] >= 0 then
+			C.close(fds[0])
+		end
+		if fds[1] >= 0 then
+			C.close(fds[1])
+		end
+		ffi.errno(24)
+		return -1
+	end
 	return 0
 end
 local task_flush -- forward: flush a task's buffered stdout (defined with the scheduler)
@@ -1626,7 +1636,7 @@ function M.wait_child(pid, stbuf, flags, intr, inplace)
 			end
 			t.child_pid, t.child_inplace = nil, nil
 			C.close(pfd)
-		elseif t then -- no pidfd (old kernel): poll WNOHANG on a scheduler tick
+		elseif t then -- no pidfd (old kernel, or no fd to spare): poll WNOHANG on a scheduler tick
 			while C.waitpid(pid, stbuf, 1) == 0 do
 				pre_yield(t)
 				if coroutine.yield(-1, 0) == SIGMARK then
@@ -1634,6 +1644,21 @@ function M.wait_child(pid, stbuf, flags, intr, inplace)
 				end
 			end
 			return pid
+		else -- (the shell itself, the same way: the tasks run meanwhile — they may hold the
+			-- pipe its child reads, a small `ulimit -n` leaving no fd for a pidfd)
+			local r = C.waitpid(pid, stbuf, 1)
+			while r == 0 do
+				M.sched_pump({ deadline = M.wall_secs() + 0.01, untilf = intr and function()
+					return intr.wait_sig ~= nil
+				end })
+				if intr and intr.wait_sig then
+					return -1
+				end
+				r = C.waitpid(pid, stbuf, 1)
+			end
+			if r ~= -1 or ffi.errno() ~= 4 then
+				return r
+			end
 		end
 	end
 	if intr then
@@ -2474,6 +2499,7 @@ end
 -- read-only (bash moves its input to a new fd, and the saved copy comes back): the file is
 -- created, but writes through 255 fail (stress-attack S19). Any exec of 255 ends the
 -- virtual state.
+do
 local function input_open(sh, fd)
 	local f = M.ropen(sh.input_path, 0, 0)
 	if f < 0 then
@@ -2506,6 +2532,7 @@ function M.input_exec(sh, fd)
 	if C.fcntl(fd, 1) ~= -1 then
 		input_open(sh, fd)
 	end
+end
 end
 -- a path made absolute against the current directory
 function M.abspath(p)
@@ -2561,6 +2588,9 @@ local function redir_open(sh, op, fd, target, saves, vname)
 			M.open_fail(sh, target, vname)
 			return false
 		end
+		if not M.nofile_check(sh, h, both and 2 or fd, target) then
+			return false
+		end
 		if both then
 			C.dup2(h, 1)
 			C.dup2(h, 2)
@@ -2577,6 +2607,9 @@ local function redir_open(sh, op, fd, target, saves, vname)
 			local tf = M.fd_number(target) -- (emit hands only all-digit targets here)
 			if tf == fd then -- `N>&N`: nothing to do, even on a closed N (redir.c)
 				return true
+			end
+			if not M.nofile_check(sh, nil, fd, target) then
+				return false
 			end
 			if C.fcntl(tf, 1) == -1 and not M.input_dup_src(sh, tf, function(f)
 					redir_backup(saves, f, sh)
@@ -3377,7 +3410,37 @@ function M.fork_sleep(secs)
 		end
 	end
 end
-local FORK_Q = {} -- (spawns waiting for another's fork retry to end: M.fork_sleep)
+M.FORK_Q = {} -- (spawns waiting for another's fork retry to end: M.fork_sleep)
+-- A spawned program gets the script's (virtual) open-files limit: the real soft one is put
+-- down to it around the spawn (the child inherits it at clone), the hard one given to the
+-- child right after (prlimit), as for a subshell's CPU limit (M.iso_spawn_pre)
+do
+local nofile_rl, nofile_real = nil, nil
+function M.nofile_spawn_pre(sh)
+	local L = M.nofile_limit(sh)
+	if not L then
+		return nil
+	end
+	nofile_rl = nofile_rl or ffi.new("struct curse_iso_rlimit")
+	if C.curse_iso_getrlimit(7, nofile_rl) ~= 0 then
+		return nil
+	end
+	nofile_real = nofile_rl.cur
+	nofile_rl.cur = L < nofile_rl.max and L or nofile_rl.max
+	C.curse_iso_setrlimit(7, nofile_rl)
+	return true
+end
+function M.nofile_spawn_post(sh, pid)
+	nofile_rl.cur = nofile_real
+	C.curse_iso_setrlimit(7, nofile_rl)
+	local H = M.iso_vhard(sh, 7)
+	if pid > 0 and H and H < nofile_rl.max then
+		local rl = ffi.new("struct curse_iso_rlimit")
+		rl.cur, rl.max = math.min(M.nofile_limit(sh), tonumber(H)), H
+		C.curse_iso_prlimit(pid, 7, rl, nil)
+	end
+end
+end
 local function spawn_argv(self, path, args, n, fa, hold, lvl)
 	if next(M.internal_pids) then -- (a `ps` it runs must not see orphans that have ended)
 		M.reap_orphans()
@@ -3420,6 +3483,7 @@ local function spawn_argv(self, path, args, n, fa, hold, lvl)
 	M.shlvl_delta = d
 	local pidp = ffi.new("curse_pid_t[1]")
 	local cpuv = self.iso_ctx and M.iso_spawn_pre(self)
+	local FORK_Q = M.FORK_Q
 	if M.fork_retrying or FORK_Q[1] then
 		-- another stage is in bash's fork retry: bash forks one at a time, in pipeline
 		-- order — the ones that came meanwhile queue, and go in their order once it is done
@@ -3441,6 +3505,7 @@ local function spawn_argv(self, path, args, n, fa, hold, lvl)
 			error(err, 0)
 		end
 	end
+	local nofile = M.nofile_spawn_pre(self)
 	local rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
 	-- No process to be had (EAGAIN: RLIMIT_NPROC, a cgroup's pids.max): bash's make_child
 	-- says `fork: retry: …`, reaps, sleeps 1, 2, 4, 8 s and tries again — meanwhile the
@@ -3463,6 +3528,9 @@ local function spawn_argv(self, path, args, n, fa, hold, lvl)
 			rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
 		end
 		M.fork_retrying = nil
+	end
+	if nofile then
+		M.nofile_spawn_post(self, rc == 0 and pidp[0] or 0)
 	end
 	if cpuv then
 		M.iso_spawn_post(self, rc == 0 and pidp[0] or 0)
@@ -4645,7 +4713,11 @@ function M.iso_vhard(sh, res)
 			return v
 		end
 	end
-	return sh.iso_vhard_base and sh.iso_vhard_base[res] -- (a stage: its subshell's, stage_clone)
+	local b = sh.iso_vhard_base and sh.iso_vhard_base[res] -- (a stage: its subshell's, stage_clone)
+	if b then
+		return b
+	end
+	return res == 7 and sh.vnofile and sh.vnofile.h or nil -- (the script's own: M.nofile_limit)
 end
 
 -- The CPU-time soft limit a subshell set (b_ulimit: the real one counts from the context's
@@ -4658,6 +4730,41 @@ function M.iso_vsoft(sh, res)
 			return v or nil, st[i] -- (false: this one set the real limit itself)
 		end
 	end
+	if res == 7 and sh.vnofile then
+		return sh.vnofile.s
+	end
+end
+-- RLIMIT_NOFILE is VIRTUAL: `ulimit -n N` never lowers the shell's own limit — curse's
+-- plumbing (in-process stages, $(…) captures, pidfds, parked std fds) needs more fds than
+-- bash's forks do, and a script's `ulimit -n 20` starved it: pipelines hung, output was
+-- lost, a procsub's /dev/fd/N was gone (stress-attack S20). The limit is the script's:
+-- `ulimit -n` shows it, a redirection past it fails as bash's (M.nofile_check), `{v}`
+-- allocates below it, and every program spawned gets it (M.nofile_spawn). nil: no
+-- virtual limit (the process's own applies).
+function M.nofile_limit(sh)
+	local v = M.iso_vsoft(sh, 7)
+	return v and tonumber(v) or nil
+end
+-- A redirection's new fd `h` (open's lowest free one) onto `fd`: past the script's limit,
+-- open's EMFILE (every fd below it taken) or dup2's EBADF, as bash reports them. true: ok.
+function M.nofile_check(sh, h, fd, target)
+	local L = M.nofile_limit(sh)
+	if not L then
+		return true
+	end
+	if h and h >= L and h ~= fd then
+		C.close(h)
+		io.stderr:write("curse: " .. tostring(target) .. ": " .. ffi.string(C.strerror(24)) .. "\n")
+		return false
+	end
+	if fd >= L then
+		if h and h ~= fd then
+			C.close(h)
+		end
+		io.stderr:write("curse: " .. fd .. ": " .. ffi.string(C.strerror(9)) .. "\n")
+		return false
+	end
+	return true
 end
 -- This process's CPU time so far, in seconds
 do
@@ -5584,6 +5691,7 @@ end
 -- NEST_MAX: one level per 600 bytes of RLIMIT_STACK (8 MiB: 13981 — past where bash's C
 -- stack has overflowed, SIGSEGV, for every kind of recursion: docs/bash-ub.md); none
 -- when the stack is unlimited (memory then bounds it: M.oom).
+do
 local NEST_HOP = 32
 local HOP_UP = setmetatable({}, { __mode = "k" }) -- hop coroutine -> the coroutine it runs for
 M.HOP_UP = HOP_UP
@@ -5659,6 +5767,7 @@ end
 -- (a `ulimit -s` changes the bound: bash's stack is the new one)
 function M.nest_reset()
 	NEST_MAX = nil
+end
 end
 function M.lua_overflow(sh, err)
 	if type(err) == "string" and err:find("not enough memory$") then
@@ -6078,6 +6187,22 @@ end
 -- The shell keeps one end of each of the two pipes: NAME=(read-fd write-fd), NAME_PID.
 -- Like bash, each pipe end first moves to the highest FREE fd below 64 (move_to_high_fd),
 -- so a lone coproc is `63 60` (the read pipe takes 63/62, the write pipe 61/60).
+-- A process substitution's fd: bash moves it to 63 and down (move_to_high_fd) — unless the
+-- open-files limit is below 64, when it stays the lowest free one (from 3)
+function M.procsub_fd(sh, fd)
+	local L = M.nofile_limit(sh)
+	if L and L < 64 then
+		local d = C.curse_co_fcntl3(fd, 0, 3) -- F_DUPFD
+		if d >= 0 and d < L then
+			C.close(fd)
+			return d
+		end
+		if d >= 0 then
+			C.close(d)
+		end
+	end
+	return M.fd_below(fd, 64)
+end
 function M.fd_below(fd, lim)
 	for t = lim - 1, 10, -1 do
 		if C.curse_co_fcntl3(t, 1, 0) < 0 and C.dup2(fd, t) == t then -- F_GETFD fails: free

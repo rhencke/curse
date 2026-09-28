@@ -1689,7 +1689,7 @@ local function expand_procsub(sh, p)
 	end, "procsub", false, false, nil, nil,
 		{ fds = { [p.dir == "<" and 1 or 0] = theirs }, keepstdin = true, nojob = true })
 	C.close(theirs)
-	local fd = rt.fd_below(mine, 64)
+	local fd = rt.procsub_fd(sh, mine)
 	rt.fd_register(fd, sh) -- (only this shell's own spawns inherit it — and its later clones')
 	sh.procsub_files = sh.procsub_files or {}
 	sh.procsub_files[#sh.procsub_files + 1] = { fd = fd, pid = job and job.pid or 0, g = job and job.g }
@@ -2945,16 +2945,21 @@ local exec_list -- forward
 -- Lowest free fd >= 10 (bash allocates named-fd redirs here); F_GETFD=1 on a
 -- closed fd returns -1 (EBADF).
 local nofile_rl = ffi.new("struct curse_rlimit[1]")
-local function alloc_fd()
-	for fd = 10, 250 do
+local function alloc_fd(sh)
+	local L = sh and rt.nofile_limit(sh)
+	if not L and C.getrlimit(7, nofile_rl) == 0 then
+		L = tonumber(nofile_rl[0].rlim_cur)
+	end
+	if L and L <= 10 then -- (bash's fcntl(F_DUPFD, 10) fails EINVAL past RLIMIT_NOFILE: `ulimit -n 6`)
+		ffi.errno(22)
+		return -1
+	end
+	for fd = 10, math.min(250, (L or 251) - 1) do
 		if C.fcntl(fd, 1) == -1 then
-			-- (bash's fcntl(F_DUPFD, 10) fails EINVAL past RLIMIT_NOFILE: `ulimit -n 6`)
-			if C.getrlimit(7, nofile_rl) == 0 and nofile_rl[0].rlim_cur <= fd then
-				return -1
-			end
 			return fd
 		end
 	end
+	ffi.errno(24) -- (none free below the limit: EMFILE)
 	return -1
 end
 local FDVAR_NOASSIGN = { GROUPS = 1, FUNCNAME = 1, BASH_ARGC = 1, BASH_ARGV = 1, BASH_SOURCE = 1, BASH_LINENO = 1 }
@@ -3075,10 +3080,11 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 				-- (redir.c: the target is opened/duplicated first — an open failure is the only
 				-- error — then moved to a free fd >= 10, and only then assigned: a readonly v
 				-- or a noassign array is reported after a successful open, the fd closed)
-				local nf = alloc_fd()
+				local nf = alloc_fd(sh)
 				if nf < 0 then
-					io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: Invalid argument\n")
-					io.stderr:write("curse: " .. (r.target or "") .. ": Invalid argument\n")
+					local why = ffi.string(C.strerror(ffi.errno() == 24 and 24 or 22)) -- (EMFILE / EINVAL)
+					io.stderr:write((rt.err_prefix(sh):gsub("line %d+: $", "")) .. "redirection error: cannot duplicate fd: " .. why .. "\n")
+					io.stderr:write("curse: " .. (r.target or "") .. ": " .. why .. "\n")
 					ok = false
 					break
 				end
@@ -3178,7 +3184,9 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 					-- Validate the source fd is open BEFORE backing up the destination: a
 					-- dup-based backup would otherwise reuse a just-closed source fd number,
 					-- making a stale `>&N` spuriously succeed (fd N reopened as the backup).
-					if C.fcntl(m, 1) == -1 and not rt.input_dup_src(sh, m, backup) then -- (closed: EBADF)
+					if not fdnew and not rt.nofile_check(sh, nil, r.fd, tv) then
+						ok = false
+					elseif C.fcntl(m, 1) == -1 and not rt.input_dup_src(sh, m, backup) then -- (closed: EBADF)
 						-- (bash names the target as written: `$v: Bad file descriptor`)
 						local nm = r.target or tv
 						if fdnew
