@@ -4137,17 +4137,29 @@ end
 -- every var touched by a NON-INLINABLE function body (those keep an out-of-line
 -- closure, so a var they touch must be a shared upvalue, not a run-local).
 -- Inlinable functions are spliced into run(), so their var access is run() access.
-local function collect_funcvars(stmts, set, inlinable)
+local function collect_funcvars(stmts, set, inlinable, bodies)
 	for _, st in ipairs(stmts) do
 		if st.t == "funcdef" then
 			if not (inlinable and inlinable[st.name]) then
 				collect_names(st.body, set)
+				-- (an inlinable function it calls is spliced into ITS body: that out-of-line
+				-- function touches those vars too — `f1(){ f2; f2; }` with f2 `x=$((x+1))`)
+				if bodies then
+					any_node(st.body, function(n)
+						local c = n.t == "simple" and n.words and n.words[1] and full_lit(n.words[1])
+						local b = c and inlinable[c] and bodies[c]
+						if b then
+							collect_names(b, set)
+						end
+						return false
+					end)
+				end
 			end
 		elseif st.t == "forc" or st.t == "whilec" or st.t == "forin" then
-			collect_funcvars(st.body, set, inlinable)
+			collect_funcvars(st.body, set, inlinable, bodies)
 		elseif st.t == "if" then
 			for _, cl in ipairs(st.clauses) do
-				collect_funcvars(cl.body, set, inlinable)
+				collect_funcvars(cl.body, set, inlinable, bodies)
 			end
 		end
 	end
@@ -9421,7 +9433,7 @@ function M.emit(ast, opts)
 		lifted, lift_disq, lift_localed = analyze_lift(ast)
 	end
 	local funcTouched = {}
-	collect_funcvars(ast.stmts, funcTouched, inlinable)
+	collect_funcvars(ast.stmts, funcTouched, inlinable, inlinefns)
 	-- Fragment-local lifting (emit_fragment): a var assigned only inside fragments
 	-- (subshell / $(…) / pipeline-stage bodies) never lifts in run(), but can be a
 	-- register local of the fragment if nothing anywhere makes its value non-numeric
