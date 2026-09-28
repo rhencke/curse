@@ -6199,7 +6199,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						t = "parse_error",
 						-- (a recoverable one, or a `near TOKEN` one: the token's line)
 						line = (type(st) == "table" and st.__curse_perr and st.line)
-							or (recover or (type(st) == "string" and st:find("near `", 1, true))) and line
+							or (recover or (type(st) == "string" and (st:find("near `", 1, true)
+								or st:find("near unexpected token `", 1, true)))) and line
 							or (eof_s == src and eof_at >= start and type(st) == "string"
 								and st:find("EOF while looking for matching", 1, true)) -- (where it opened)
 								and startline + select(2, src:sub(start, eof_at - 1):gsub("\n", ""))

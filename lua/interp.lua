@@ -3971,6 +3971,30 @@ function pf.seq(parts)
 		end
 	end
 	if not (big and ps and ps.fsh) then
+		if big then -- (printf -v: the text is built whole — bash's vbadd sizes it in an int,
+			-- so past INT_MAX it overflows and xrealloc fails, fatal: docs/bash-ub.md — curse
+			-- reports the true size and exits 2 the same way)
+			local n = 0
+			for k = 1, #parts do
+				local q = parts[k]
+				n = n + (type(q) == "table" and math.max(q[2], 0) or #q)
+			end
+			for _, o in ipairs(ps and ps.out or {}) do
+				n = n + #o
+			end
+			if n > 2147483647 - 64 then
+				local sh = rt.cur_shell
+				local fl = sh and sh.force_line
+				if sh then
+					sh.force_line = 0 -- (fatal_error: no line)
+				end
+				io.stderr:write(("curse: xrealloc: cannot allocate %.0f bytes\n"):format(n))
+				if sh then
+					sh.force_line = fl
+				end
+				error({ __curse_exit = 2 }, 0)
+			end
+		end
 		for k = 1, #parts do
 			local q = parts[k]
 			if type(q) == "table" then
@@ -4188,6 +4212,33 @@ end
 -- (`full`: the spec string.format takes, nil when the width/precision is too wide)
 function pf.float(ps, tk, full, spec, width, prec, conv, arg)
 	local w = tonumber(width) or 0
+	local P = tonumber(prec)
+	if P and P >= pf.BIG then -- (a precision snprintf can't produce, near INT_MAX: a number's
+		-- exact expansion ends long before — a long double's within 20000 digits — so format to
+		-- that and the rest are zeros, streamed: bash writes them all)
+		local M = 20000
+		local r = pf.float(ps, tk, nil, (spec:gsub("[-0]", "")), "", tostring(M), conv, arg)
+		local lc, z = conv:lower(), P - M
+		if not r:find("%d") or (lc == "g" and not spec:find("#", 1, true)) then
+			z = 0 -- (inf/nan take no precision; %g drops the trailing zeros)
+		end
+		local cut = (lc == "e" or lc == "g") and r:find("[eE][+%-]%d+$") or lc == "a" and r:find("[pP][+%-]%d+$")
+		local parts = cut and { r:sub(1, cut - 1), { "0", z }, r:sub(cut) } or { r, { "0", z } }
+		local n = #r + z
+		if w > n then
+			if spec:find("-", 1, true) then
+				parts[#parts + 1] = { " ", w - n }
+			elseif spec:find("0", 1, true) and r:find("%d") then
+				local pre = r:match("^[+%- ]?0?[xX]?") or ""
+				parts[1] = r:sub(#pre + 1, cut and cut - 1 or nil)
+				table.insert(parts, 1, { "0", w - n })
+				table.insert(parts, 1, pre)
+			else
+				table.insert(parts, 1, { " ", w - n })
+			end
+		end
+		return pf.seq(parts)
+	end
 	if w >= pf.BIG then -- (a width snprintf can't produce, near INT_MAX: pad the bare text)
 		local r = pf.float(ps, tk, nil, (spec:gsub("[-0]", "")), "", prec, conv, arg)
 		if w <= #r then
