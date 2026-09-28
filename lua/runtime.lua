@@ -2863,7 +2863,11 @@ local function spawn_argv(self, path, args, n, fa, hold, lvl)
 	local cenv = M.child_env() -- (bash's order; kept alive across the call)
 	M.shlvl_delta = d
 	local pidp = ffi.new("curse_pid_t[1]")
+	local cpuv = self.iso_ctx and M.iso_spawn_pre(self)
 	local rc = C.posix_spawn(pidp, path, fa, attr, ffi.cast("char *const *", argv), cenv)
+	if cpuv then
+		M.iso_spawn_post(self, rc == 0 and pidp[0] or 0)
+	end
 	if hold then
 		async_spawn_release()
 	end
@@ -3437,8 +3441,11 @@ local function subprog_leave(self, al, ln, cc, tl, cl, ld, sd, lb)
 	self.cur_cline, self.loopdepth, self.subdepth = cl, ld, sd
 	self.in_subprogram = self.in_subprogram - 1
 end
-local deferred_sigs, cap_depth, cap_pid, flush_deferred, cap_enter -- (the signal hold: see M.defer_signal)
+local cap_depth, cap_pid, flush_deferred, cap_enter, cap_leave -- (the signal hold: see M.defer_signal)
 function Shell:capture_inproc(backtick, runner, capfd, ctx)
+	-- (signals are held from here to the end, the capture's state all undone — a trap run
+	-- in between would write into the capture, or into state about to be dropped)
+	cap_enter()
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	-- ($(…) inside a loop knows it — a break/continue there ends the substitution, as it
 	-- ends a `( … )` (bash) — so its loopdepth stays)
@@ -3483,7 +3490,6 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
 	local sv_cj, sv_xs = self.cap_jobs, self.xsigint
 	self.cap_jobs, self.xsigint = {}, nil
-	cap_enter()
 	local ok, err = pcall(runner, self)
 	if not ok then
 		err = M.lua_overflow(self, err)
@@ -3497,12 +3503,10 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		M.wait_groups(self.cap_jobs)
 	end
 	self.cap_jobs, self.cap_sink = sv_cj, sv_sink
-	if cap_pid == C.getpid() then
-		cap_depth = cap_depth - 1 -- (a held signal is raised once the capture is done, below)
-	end
 	self.xdepth = sv_xd
 	if ctx and ctx.pid == C.getpid() then
 		if not ok and type(err) == "table" and err.__curse_vsig == ctx then
+			M.stdout_discard()
 			err = { __curse_exit = 128 + err.sig } -- (`kill $BASHPID`: the substitution dies)
 		end
 		local cst = ok and self.status or (type(err) == "table" and (err.__curse_exit or err.__curse_return))
@@ -3524,6 +3528,11 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		C.dup2(save1, 1)
 		C.close(save1) -- put the real fd 1 back before reading the temp file
 	end
+	-- (a write error of the body's — its reader gone — is its own: the parent's next
+	-- builtin must not report it)
+	if C.curse_rt_ferror(C.curse_rt_stdout) ~= 0 then
+		M.clear_stdout_err()
+	end
 	local function readcap() -- the captured bytes, from the buffer or the temp file
 		if not capfd then
 			return table.concat(buf)
@@ -3542,15 +3551,20 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 		C.close(tmp)
 		return table.concat(parts)
 	end
+	-- (the signal hold ends only here, with the parent's state all back: a trap run
+	-- earlier would have run with the capture's fd 1 / output sink)
 	if not ok then
 		if type(err) == "table" and err.__curse_parseerr then
 			if backtick then -- contained (non-fatal): "", status 2 — an assignment's $?
 				self.status, self.last_cmdsub_status = 2, 2
 				self.ncs = (self.ncs or 0) + 1
 				readcap()
+				cap_leave()
+				flush_deferred(self)
 				return ""
 			end
 			readcap() -- drop the temp file, then propagate
+			cap_leave()
 			error(err) -- a SYNTAX error inside $(…) is fatal to the whole containing command (bash)
 		elseif type(err) == "table" and (err.__curse_exit or err.__curse_return) then
 			self.status = err.__curse_exit or err.__curse_return
@@ -3558,6 +3572,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 			self.status = err.__curse_status or 0 -- (it just ends the substitution)
 		else
 			readcap()
+			cap_leave()
 			error(err)
 		end
 	end
@@ -3565,6 +3580,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.ncs = (self.ncs or 0) + 1 -- (substitutions performed: an assignment's status is the last one's)
 	-- bash strips NUL bytes from command-substitution output ("ignored null byte")
 	local r = M.cmdsub_nul(readcap()):gsub("\n+$", "")
+	cap_leave()
 	if sigint then
 		C.kill(C.getpid(), 2)
 	end
@@ -3802,7 +3818,11 @@ end -- (the checkpoint block)
 iso_push = function(sh)
 	-- the pid that runs this context in-process: a process forked later (a fallback
 	-- pipeline stage, see M.fork) inherits the stack but is ALREADY its own process
-	local ctx = { pid = C.getpid(), mgen = sh.m_gen } -- (mgen: b_fg's job-control check)
+	local ctx = { pid = C.getpid(), mgen = sh.m_gen, cap0 = cap_depth } -- (mgen: b_fg's job-control check)
+	-- (a SIGPIPE / SIGXFSZ its writes raise, RLIMIT_CPU's SIGXCPU: its own — M.sync_signal)
+	C.curse_sig_emulate(13)
+	C.curse_sig_emulate(24)
+	C.curse_sig_emulate(25)
 	local st = sh.iso_ctx
 	if not st then
 		st = {}
@@ -3971,7 +3991,8 @@ function M.iso_save_rlimits(sh)
 			sv[r] = rl
 		end
 	end
-	ctx.rlim, ctx.vhard = sv, {}
+	ctx.rlim, ctx.vhard, ctx.vsoft = sv, {}, {}
+	ctx.cpu0 = M.process_cpu() -- (its CPU-time limit counts from here: b_ulimit)
 	return ctx
 end
 -- The hard limit a subshell set (kept virtual: lowering a real hard limit can't be undone)
@@ -3984,6 +4005,59 @@ function M.iso_vhard(sh, res)
 		end
 	end
 	return sh.iso_vhard_base and sh.iso_vhard_base[res] -- (a stage: its subshell's, stage_clone)
+end
+
+-- The CPU-time soft limit a subshell set (b_ulimit: the real one counts from the context's
+-- start, a forked child's CPU clock starting at 0)
+function M.iso_vsoft(sh, res)
+	local st = sh.iso_ctx
+	for i = st and #st or 0, 1, -1 do
+		local v = st[i].vsoft and st[i].vsoft[res]
+		if v ~= nil then
+			return v or nil, st[i] -- (false: this one set the real limit itself)
+		end
+	end
+end
+-- This process's CPU time so far, in seconds
+do
+local iso_ts = ffi.new("struct curse_co_ts")
+function M.process_cpu()
+	C.curse_rt_cgt(2, iso_ts) -- CLOCK_PROCESS_CPUTIME_ID
+	return tonumber(iso_ts.tv_sec) + tonumber(iso_ts.tv_nsec) / 1e9
+end
+-- A program spawned in an in-process subshell that set a CPU-time limit: the limit is the
+-- subshell's own (the real soft one is shifted by the CPU the shell had used: b_ulimit),
+-- and the program — whose clock starts at 0 — gets it as the subshell set it (bash's
+-- child inherits it at fork). posix_spawn can't set a limit: the soft one is put back
+-- unshifted around the spawn (the child inherits it at clone; a SIGXCPU the kernel sends
+-- the shell meanwhile is dropped: M.sync_signal), the (virtual) hard one is given to the
+-- child right after (prlimit: a program that reads it at once may still see the old one).
+pcall(ffi.cdef, "int curse_iso_prlimit(int pid, int res, const struct curse_iso_rlimit *nw, struct curse_iso_rlimit *old) asm(\"prlimit\");")
+local spawn_rl, spawn_real = ffi.new("struct curse_iso_rlimit"), nil
+function M.iso_spawn_pre(sh)
+	local vs = M.iso_vsoft(sh, 0)
+	if vs and C.curse_iso_getrlimit(0, spawn_rl) == 0 then
+		spawn_real = spawn_rl.cur
+		spawn_rl.cur = vs < spawn_rl.max and vs or spawn_rl.max
+		M.spawn_cpu_window = true
+		C.curse_iso_setrlimit(0, spawn_rl)
+		return true
+	end
+end
+function M.iso_spawn_post(sh, pid)
+	spawn_rl.cur = spawn_real
+	C.curse_iso_setrlimit(0, spawn_rl)
+	M.spawn_cpu_window = nil
+	local vh = M.iso_vhard(sh, 0)
+	if pid > 0 and vh and vh < spawn_rl.max then
+		local rl = ffi.new("struct curse_iso_rlimit")
+		rl.cur, rl.max = M.iso_vsoft(sh, 0), vh
+		if rl.cur > rl.max then
+			rl.cur = rl.max
+		end
+		C.curse_iso_prlimit(pid, 0, rl, nil)
+	end
+end
 end
 
 -- Virtual pids: $BASHPID of an in-process subshell. Above the kernel's pid_max, so no
@@ -4032,36 +4106,52 @@ cap_depth = 0 -- in-process $(…) bodies running (any path), in process cap_pid
 -- its exit/return/break act on the shell's control flow (bash: the trap is the parent's;
 -- the child that ran `kill $$` goes on). Held here, it is raised again once the shell is
 -- back in its own coroutine (M.raise_task_held, when the scheduler returns).
+--
+-- The held sets live in C (lib_cursesig.c curse_held_*: 0 the deferred signals, 1 the
+-- scheduler's task_held): traps add to them from inside the VM hook, and ordinary code
+-- takes from them — code that hook preempts at any VM instruction, so a Lua
+-- check-then-take of a shared table was split by a trap that took the set itself
+-- (stress-attack S1). Each C call is one step no trap can split.
+do -- (a block of its own: the main chunk is near LuaJIT's 200-local limit)
+pcall(ffi.cdef, "void curse_held_add(int set, int s); int curse_held_take(int set); int curse_held_any(int set); int curse_held_takeall(int set, unsigned char *out);")
+local HELD, TASK_HELD = 0, 1
+local function hold(set, sig)
+	C.curse_held_add(set, sig)
+	M.sig_held_n = M.sig_held_n + 1
+	return true
+end
+function M.task_held()
+	return C.curse_held_any(TASK_HELD) ~= 0
+end
 function M.defer_signal(sh, sig)
 	if CO then
-		local h = M.task_held or {}
-		M.task_held, h[sig] = h, true
-		M.sig_held_n = M.sig_held_n + 1
-		return true
+		return hold(TASK_HELD, sig)
 	end
 	if not (iso_cur(sh) or (cap_depth > 0 and cap_pid == C.getpid())) then
 		return false
 	end
-	deferred_sigs = deferred_sigs or {}
-	deferred_sigs[sig] = true
-	M.sig_held_n = M.sig_held_n + 1
-	return true
+	return hold(HELD, sig)
 end
 -- (the held signals, raised again together: blocked while sent, so the hook sees them
 -- all pending at once and runs their traps in ascending order — lib_cursesig.c)
 pcall(ffi.cdef, "void curse_sig_hold(int hold);")
+local function raise_held(set)
+	local me = C.getpid()
+	C.curse_sig_hold(1)
+	local sig = C.curse_held_take(set)
+	while sig ~= 0 do
+		C.kill(me, sig)
+		sig = C.curse_held_take(set)
+	end
+	C.curse_sig_hold(0)
+end
 function M.raise_task_held()
-	local h = M.task_held
-	if h and not CO then
-		M.task_held = nil
-		local me = C.getpid()
-		C.curse_sig_hold(1)
-		for sig = 1, 64 do
-			if h[sig] then
-				C.kill(me, sig)
-			end
-		end
-		C.curse_sig_hold(0)
+	if not CO and C.curse_held_any(TASK_HELD) ~= 0 then
+		raise_held(TASK_HELD)
+	end
+end
+function M.drop_task_held()
+	while C.curse_held_take(TASK_HELD) ~= 0 do
 	end
 end
 -- A trapped signal arriving while the shell waits for a foreground command — an external,
@@ -4092,30 +4182,46 @@ end
 -- many arrived: bash's pending_traps count is run once)
 function M.fg_held(sig)
 	if M.fg_hold > 0 and M.fg_pid == C.getpid() then
-		deferred_sigs = deferred_sigs or {}
-		deferred_sigs[sig] = true
-		M.sig_held_n = M.sig_held_n + 1
-		return true
+		return hold(HELD, sig)
 	end
 	return false
 end
 flush_deferred = function(sh)
-	if deferred_sigs and not iso_cur(sh) and not (cap_depth > 0 and cap_pid == C.getpid())
-		and not (M.fg_hold > 0 and M.fg_pid == C.getpid()) then
-		local d = deferred_sigs
-		deferred_sigs = nil
-		-- (a trapped one runs here and now, in signal-number order as run_pending_traps
-		-- does — even inside a running trap handler, whose VM hook can't fire again; any
-		-- other is raised again for its disposition)
-		local I = require("interp")
-		for sig = 1, 64 do
-			if d[sig] then
-				local h = sh.traps and sh.traps["SIG" .. (I._int.NUMSIG[sig] or "")]
-				if h and h ~= "" then
-					I.run_signal(sh, sig, false, true)
-				else
-					C.kill(C.getpid(), sig)
+	if C.curse_held_any(HELD) == 0 or iso_cur(sh) or (cap_depth > 0 and cap_pid == C.getpid())
+		or (M.fg_hold > 0 and M.fg_pid == C.getpid()) then
+		return
+	end
+	-- (a trapped one runs here and now, in signal-number order as run_pending_traps
+	-- does — even inside a running trap handler, whose VM hook can't fire again; any
+	-- other is raised again for its disposition. All taken at once: a trap run here may
+	-- flush in turn — its own $(…), its compile's hold ending — and must not run the
+	-- others ahead of their turn)
+	local I = require("interp")
+	local d = ffi.new("unsigned char[65]")
+	C.curse_held_takeall(HELD, d)
+	for sig = 1, 64 do
+		if d[sig] ~= 0 then
+			d[sig] = 0
+			local h = sh.traps and sh.traps["SIG" .. (I._int.NUMSIG[sig] or "")]
+			if h and h ~= "" then
+				local ok, e = pcall(I.run_signal, sh, sig, false, true)
+				if not ok then
+					-- the trap ended in `exit` (the rest are dropped: the shell ends — bash's
+					-- exit_shell never returns to run_pending_traps) or `return`/`break` out
+					-- of it: the rest outlive the unwind, as bash's pending_traps do — raised
+					-- again, to run at the next VM safepoint
+					if not (type(e) == "table" and e.__curse_exit) then
+						for s = sig + 1, 64 do
+							if d[s] ~= 0 then
+								C.curse_held_add(HELD, s)
+							end
+						end
+						raise_held(HELD)
+					end
+					error(e, 0)
 				end
+			else
+				C.kill(C.getpid(), sig)
 			end
 		end
 	end
@@ -4129,7 +4235,7 @@ do
 	M.req_depth = 0
 	local function req_done(ok, ...)
 		M.req_depth = M.req_depth - 1
-		if M.req_depth == 0 and deferred_sigs and M.defer_sh then
+		if M.req_depth == 0 and M.defer_sh and C.curse_held_any(HELD) ~= 0 then
 			flush_deferred(M.defer_sh)
 		end
 		if not ok then
@@ -4159,11 +4265,10 @@ end
 function M.defer_loading(sh, sig)
 	if M.req_depth > 0 then
 		M.defer_sh = sh
-		deferred_sigs = deferred_sigs or {}
-		deferred_sigs[sig] = true
-		return true
+		return hold(HELD, sig)
 	end
 	return false
+end
 end
 cap_enter = function()
 	local pid = C.getpid()
@@ -4171,6 +4276,11 @@ cap_enter = function()
 		cap_pid, cap_depth = pid, 0
 	end
 	cap_depth = cap_depth + 1
+end
+cap_leave = function()
+	if cap_pid == C.getpid() and cap_depth > 0 then
+		cap_depth = cap_depth - 1
+	end
 end
 
 
@@ -4205,6 +4315,38 @@ function M.iso_keep_fd(sh, fd, saved)
 end
 -- (a $(…) puts its fds back BEFORE its capture restores fd 1 — see capture_inproc)
 function M.iso_restore_fds(ctx)
+	-- a command's redirection the context made and never undid — the command's code was
+	-- unwound past its restore (the subshell died of a signal: `f >/dev/null` whose f got
+	-- SIGPIPE; compiled code restores only on the way out): each fd back to its value from
+	-- before the oldest of them (its later saves are closed), as the forked child's
+	-- redirections died with it
+	local pre = ctx.pre
+	if pre then
+		ctx.pre = nil
+		io.flush()
+		for fd, l in pairs(pre) do
+			local first
+			for i = 1, #l do
+				local e = l[i]
+				if not e.done then
+					e.done = true
+					if not first then
+						first = e
+					elseif e.saved >= 0 then
+						C.close(e.saved)
+					end
+				end
+			end
+			if first then
+				if first.saved >= 0 then
+					C.dup2(first.saved, fd)
+					C.close(first.saved)
+				else
+					C.close(fd)
+				end
+			end
+		end
+	end
 	local h = ctx.hifds
 	if h then
 		ctx.hifds = nil
@@ -4249,6 +4391,7 @@ local function iso_undo(sh, ctx)
 		for canon in pairs(sv.sigtraps or {}) do
 			seen[canon] = true
 		end
+		local untrapped
 		for canon in pairs(seen) do
 			local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
 			if num then
@@ -4259,14 +4402,23 @@ local function iso_undo(sh, ctx)
 						C.curse_sig_catch(num)
 					end
 				else
-					C.curse_sig_default(num)
+					untrapped = untrapped or {}
+					untrapped[#untrapped + 1] = num
 				end
 			end
 		end
 		o.traps, o.sigtraps = sv.traps, sv.sigtraps
+		for _, num in ipairs(untrapped or {}) do -- (the parent's untrapped disposition: the
+			M.sig_untrapped(o, num) -- default — or caught, by a daemon worker or for its EXIT trap)
+		end
 		M.exit_trap_inherited, o.err_trap_sp, o.in_exit_trap = sv.inh, sv.esp, sv.inexit
 		o.dbg_trap_sp, o.ret_trap_sp, o.err_trap_ps = sv.dsp, sv.rsp, sv.eps
 		_G.__curse_sigrun = sv.run
+		if iso_cur(sh) then -- (an enclosing context: its own SIGPIPE/XCPU/XFSZ stay its own)
+			C.curse_sig_emulate(13)
+			C.curse_sig_emulate(24)
+			C.curse_sig_emulate(25)
+		end
 	end
 	M.iso_restore_fds(ctx)
 	if ctx.env then
@@ -4298,19 +4450,30 @@ local function iso_undo(sh, ctx)
 	end
 end
 
--- `hold`: the caller raises the held signals itself (flush_deferred) once it has put the
--- parent's variables back too — a trap run before that would run in the subshell's.
+-- `hold`: the caller raises the held signals itself (M.iso_release) once it has put the
+-- parent's variables back too — a trap run before that would run in the subshell's: the
+-- signals stay held till then (a trap that ran in that window lost its effects).
 iso_pop = function(sh, ctx, hold)
 	local st = sh.iso_ctx
-	if st and st[#st] == ctx then
-		st[#st] = nil
-	end
 	if ctx.pid == C.getpid() then
+		cap_enter() -- (still held while the context is undone, and after it, if `hold`)
+		if st and st[#st] == ctx then
+			st[#st] = nil
+		end
 		iso_undo(sh, ctx)
 		if not hold then
+			cap_leave()
 			flush_deferred(sh)
 		end
+	elseif st and st[#st] == ctx then
+		st[#st] = nil
 	end
+end
+function M.iso_release(sh, ctx)
+	if ctx.pid == C.getpid() then
+		cap_leave()
+	end
+	flush_deferred(sh)
 end
 
 -- The EXIT trap a subshell set itself runs when it ends (never an inherited one, nor
@@ -4373,6 +4536,125 @@ function M.vkill(sh, pid, sig)
 	M.iso_signal(sh, ctx, sig)
 	return true
 end
+-- A signal the process raised against ITSELF — a write's SIGPIPE (its reader gone) or
+-- SIGXFSZ (past RLIMIT_FSIZE), RLIMIT_CPU's SIGXCPU — while an in-process subshell runs
+-- is that subshell's: a forked one would die of it alone and its parent go on (bash:
+-- `( … > >(head -c1) )` is 141, `( ulimit -f 1; printf … >f )` 153, `( ulimit -t 1; spin )`
+-- killed). The kernel's default action would end the whole shell, so the default is
+-- emulated (lib_cursesig.c curse_sig_emulate: iso_push, b_ulimit) and the hook brings
+-- it here (interp.run_signal), before any hold: the innermost in-process subshell (or
+-- $(…)) takes it with its own disposition — dies by it, runs its own trap, or ignores it
+-- (M.iso_signal). Returns true when it was taken; false: the shell's own (its trap, or
+-- — emulated default — its death: rt.termsig).
+do
+pcall(ffi.cdef, [[
+  int curse_sig_emulate(int s); int curse_sig_emulated(int s); int curse_sig_fromself(int s);
+  int curse_sig_pending(int s); void curse_sig_drop(int s);
+]])
+local SYNC_SIG = { [13] = true, [24] = true, [25] = true }
+M.SYNC_SIG = SYNC_SIG
+M.self_killed = {} -- (b_kill: `kill -SIG $$` is the shell's, however its siginfo reads)
+function M.note_self_kill(sh, sig)
+	-- (not when it's ignored: no delivery would ever take the mark back)
+	if SYNC_SIG[sig] and (sh.traps and sh.traps["SIG" .. (require("interp")._int.NUMSIG[sig] or "")]) ~= "" then
+		M.self_killed[sig] = true
+	end
+end
+local sync_running = {}
+local sync_take
+function M.sync_signal(sh, sig)
+	if not SYNC_SIG[sig] then
+		return false
+	end
+	if M.self_killed[sig] then
+		M.self_killed[sig] = nil
+		return false
+	end
+	if C.curse_sig_fromself(sig) == 0 then
+		return false -- (sent by another process to the shell's pid: the parent's)
+	end
+	return sync_take(sh, sig)
+end
+-- A builtin's write failed with EPIPE / EFBIG and the SIGPIPE / SIGXFSZ it raised is still
+-- waiting for the VM hook (a JIT trace ran the write): taken here, before the write error
+-- is reported (a daemon worker, which catches SIGPIPE, would end the whole request there).
+function M.sync_write_error(sh, why)
+	local sig = (why == "Broken pipe" and 13) or (why == "File too large" and 25) or nil
+	if sig and C.curse_sig_pending(sig) ~= 0 and C.curse_sig_fromself(sig) ~= 0 then
+		return sync_take(sh, sig)
+	end
+	return false
+end
+sync_take = function(sh, sig)
+	local t = CO and co_task()
+	local tsh = t and t.sh or sh
+	local ctx = iso_cur(tsh)
+	local incap = cap_depth > 0 and cap_pid == C.getpid() and cap_depth > (ctx and ctx.cap0 or 0)
+	if not ctx and not incap then
+		return false
+	end
+	if sig == 24 then
+		-- RLIMIT_CPU: a subshell's soft limit crossed (b_ulimit: counted from its start); at
+		-- or past its hard one the kernel sends SIGKILL instead (bash's `ulimit -t N` sets both)
+		local vs, vc = M.iso_vsoft(tsh, 0)
+		local vh = M.iso_vhard(tsh, 0)
+		if M.spawn_cpu_window or (vs and M.process_cpu() < math.floor(vc.cpu0) + tonumber(vs) - 0.01) then
+			return true -- (the unshifted limit of a spawn's window: M.iso_spawn_pre — not crossed)
+		end
+		if vs and vh and vs >= vh then
+			sig = 9
+		end
+	end
+	C.curse_sig_drop(sig) -- (taken: the hook, if it hasn't run yet, mustn't run it again)
+	if incap then -- a $(…) with no context of its own (nothing it changes needs one):
+		-- it has no trap of its own either — it dies of it (a trapped one reverts to the default)
+		error({ __curse_exit = 128 + sig }, 0)
+	end
+	-- (its own trap runs at once — bash runs it once the command is done, its redirections
+	-- undone: a trap writing into the very sink that failed raises the signal again,
+	-- which is dropped here rather than recursing without end)
+	if sync_running[sig] then
+		return true
+	end
+	sync_running[sig] = true
+	local ok, e = pcall(M.iso_signal, tsh, ctx, sig)
+	sync_running[sig] = nil
+	if not ok then
+		error(e, 0)
+	end
+	return true
+end
+-- An UNTRAPPED terminating signal (caught only to run the EXIT trap first, or by a daemon
+-- worker, whose request dies of it) arriving while an in-process subshell or $(…) runs:
+-- bash's parent, waiting for its child, dies of it at once — the child may run on, but
+-- the shell is gone. Held till the subshell ends instead, a subshell that never ends
+-- (a spinning loop, a request whose client sent SIGTERM: stress-attack S23) kept the
+-- shell alive for good. So the shell unwinds every in-process context (each rethrows the
+-- marker: an unknown error to them; parser.trap_flow passes it) and, back at the top
+-- (interp.finish), dies of it: M.termsig. A trapped one still waits for the subshell,
+-- as bash runs the trap once waitpid returns. Returns false when the signal isn't that.
+function M.termsig_unwind(sh, sig)
+	if CO or sig == 3 or not M.TERMSIG[sig] then
+		return false
+	end
+	local ctx = iso_cur(sh)
+	if not ctx and not (cap_depth > 0 and cap_pid == C.getpid()) then
+		return false
+	end
+	local traps = sh.traps -- (the shell's own traps: those saved by its outermost context)
+	for _, c in ipairs(sh.iso_ctx or {}) do
+		if c.pid == C.getpid() and c.traps then
+			traps = c.traps.traps
+			break
+		end
+	end
+	local canon = "SIG" .. (require("interp")._int.NUMSIG[sig] or "")
+	if traps and traps[canon] then
+		return false -- (trapped, or ignored: the shell's trap runs once the subshell has ended)
+	end
+	error({ __curse_termsig_unwind = sig }, 0)
+end
+end
 local SIG_DEFAULT_IGNORE = { [17] = true, [18] = true, [23] = true, [28] = true } -- CHLD CONT URG WINCH
 local SIG_STOP = { [19] = true, [20] = true, [21] = true, [22] = true }
 function M.iso_signal(sh, ctx, sig)
@@ -4419,6 +4701,9 @@ function M.sig_untrapped(sh, num)
 		end
 	else
 		C.curse_sig_default(num)
+		if M.SYNC_SIG[num] and iso_cur(sh) then -- (`trap - PIPE` in a subshell: its default
+			C.curse_sig_emulate(num) -- is still its own death, not the whole shell's)
+		end
 	end
 end
 -- A new shell's dispositions (run.lua, a daemon request): SIGQUIT ignored, a daemon
@@ -4635,6 +4920,9 @@ function M.lua_overflow(sh, err)
 	return { __curse_exit = 1 }
 end
 function Shell:subshell_run(runner, saves, paren, inplace)
+	-- (signals are held from here until the context is pushed, which holds them itself:
+	-- a trap run meanwhile would change the checkpointed state, dropped at the end)
+	cap_enter()
 	local s1, s2, s3, s4, s5, s6, s7, s8 = subprog_enter(self)
 	local cp = sub_checkpoint(self)
 	local sv_out, sv_ne = self.out, self.noerr
@@ -4658,6 +4946,8 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 
 	local up0 = M.iso_cur(self)
 	local ctx = iso_push(self)
+	cap_leave()
+	ctx.cap0 = cap_depth -- (a $(…) inside it holds above this)
 	if paren then -- (a ( … ) starts SUBSHELL_PAREN afresh: no SUBSHELL_PIPE)
 		ctx.pipe = nil
 	end
@@ -4678,6 +4968,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 		elseif type(err) == "table" and err.__curse_lineabort then
 			status = 1
 		elseif type(err) == "table" and err.__curse_vsig == ctx then
+			M.stdout_discard()
 			status = 128 + err.sig -- killed: reported as bash reports a dead foreground child
 			killed = err.st or err.sig -- (once its EXIT trap has run — termsig_handler — and it is gone)
 			if err.pid then
@@ -4704,9 +4995,12 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	self.bgp_cleared = sv_bgpc
 	if saves then M.redir_restore(saves) end
 	self.out, self.noerr, self.paren_sp = sv_out, sv_ne, sv_psp
+	if C.curse_rt_ferror(C.curse_rt_stdout) ~= 0 then -- (its write error: not the parent's)
+		M.clear_stdout_err()
+	end
 	subprog_leave(self, s1, s2, s3, s4, s5, s6, s7, s8)
 	sub_restore(self, cp)
-	flush_deferred(self) -- (the parent's signals: its traps run in its own state)
+	M.iso_release(self, ctx) -- (the parent's signals: its traps run in its own state)
 	if killed then -- the parent's report of its child that a signal killed (a `( … )`: its text)
 		if not ctx.vpid then
 			ctx.vpid = M.alloc_vpid()
@@ -4813,17 +5107,20 @@ end
 -- in_subprogram, cur_line, trailing-newline/NUL strip, exit/return→status); the heavy
 -- checkpoint wraps it. Returns the captured string.
 function Shell:capture_compiled_iso(cs_fn, backtick)
+	cap_enter() -- (held until the context is pushed: see subshell_run)
 	M.env_rebuilt(self) -- (command_substitute's maybe_make_export_env)
 	local sv_foreign = self.foreign_pids
 	self.foreign_pids = M.foreign_jobs(self)
 	local cp = sub_checkpoint(self)
 	local ctx = iso_push(self)
+	cap_leave()
+	ctx.cap0 = cap_depth -- (a $(…) inside it holds above this)
 	ctx.cs = true -- (a $(…): job control stays on — fg/bg in b_fg)
 	local ok, out = pcall(self.capture_inproc, self, backtick, cs_fn, true, ctx) -- fd-level capture
 	iso_pop(self, ctx, true)
 	sub_restore(self, cp)
 	self.foreign_pids = sv_foreign
-	flush_deferred(self)
+	M.iso_release(self, ctx)
 	if not ok then
 		error(out, 0)
 	end
@@ -6803,7 +7100,7 @@ function M.sched_pump(w)
 			if w.untilf and w.untilf() then
 				return
 			end
-			if M.task_held and not w.drop_sigs then
+			if not w.drop_sigs and M.task_held() then
 				return -- (a trapped signal came: the shell runs its trap now — `wait` ends)
 			end
 			-- a job preempted this round is runnable again at once; still poll (without
@@ -6838,7 +7135,7 @@ function M.sched_pump(w)
 					ready = true
 					return
 				end
-				if M.task_held and not w.drop_sigs then
+				if not w.drop_sigs and M.task_held() then
 					return -- (the poll's EINTR: a trapped signal, held — the shell's to run)
 				end
 				if w.deadline and M.wall_secs() >= w.deadline then
@@ -6857,7 +7154,7 @@ function M.sched_pump(w)
 	end
 	M.fg_arm() -- (the foreground runs on: its slice, while jobs still live)
 	if w.drop_sigs then -- (the shell has ended: a job's `kill $$` finds no one)
-		M.task_held = nil
+		M.drop_task_held()
 	else
 		M.raise_task_held() -- (a signal that came while a job ran: the shell's trap, now)
 	end
@@ -14847,6 +15144,16 @@ function M.tzset()
 		C.tzset()
 	end)
 end
+-- An in-process subshell died by a signal: what it left in stdout's buffer dies with it
+-- (a forked one's stdio buffer does) — else the next flush writes it to the parent's fd 1
+-- and a dead reader's EPIPE flag is reported by the parent's next builtin
+pcall(ffi.cdef, "void curse_rt_fpurge(void *fp) asm(\"__fpurge\");")
+function M.stdout_discard()
+	pcall(function()
+		C.curse_rt_fpurge(C.curse_rt_stdout)
+		C.curse_rt_clearerr(C.curse_rt_stdout)
+	end)
+end
 -- after a failed write, stdout's sticky error flag must go, or every later flush fails too
 function M.clear_stdout_err()
 	pcall(function()
@@ -15015,8 +15322,11 @@ end
 function M.chkwrite_report(sh, name, m)
 	sh.write_err, sh.write_errmsg = true, nil -- (reported: chkwrite_late's cue)
 	local why = (m or ""):match(":%s*([^:]+)$") or m or "Bad file descriptor"
+	if not CO_OUTS[sh.out] then
+		M.sync_write_error(sh, why) -- (an in-process subshell's own signal: it dies, or not)
+	end
 	if why == "Broken pipe" and not (sh.traps and sh.traps.SIGPIPE) and not CO_OUTS[sh.out]
-		and (M.daemon_worker or sh.termsig or (sh.traps and sh.traps.EXIT)) then
+		and (M.daemon_worker or sh.termsig or (sh.traps and sh.traps.EXIT) or C.curse_sig_emulated(13) ~= 0) then
 		M.termsig(sh, 13) -- (the SIGPIPE, caught: bash's handler ends the shell before this)
 	end
 	io.stderr:write("curse: " .. name .. ": write error: " .. why .. "\n")

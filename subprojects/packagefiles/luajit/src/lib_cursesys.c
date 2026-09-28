@@ -24,14 +24,24 @@ extern char confstr[];
 extern char curse_aopen_abandon[];
 extern char curse_aopen_result[];
 extern char curse_aopen_start[];
+extern char curse_held_add[];
+extern char curse_held_any[];
+extern char curse_held_take[];
+extern char curse_held_takeall[];
 extern char curse_ldfmt[];
 extern char curse_preempt_arm[];
 extern char curse_preempt_flagp[];
 extern char curse_sig_catch[];
 extern char curse_sig_clearpending[];
 extern char curse_sig_default[];
+extern char curse_sig_drop[];
+extern char curse_sig_emulate[];
+extern char curse_sig_emulated[];
+extern char curse_sig_fromself[];
 extern char curse_sig_hold[];
 extern char curse_sig_ignore[];
+extern char curse_sig_pending[];
+extern char curse_sig_shutdown[];
 extern char dup[];
 extern char dup2[];
 extern char endpwent[];
@@ -102,6 +112,7 @@ extern char posix_spawnattr_setsigmask[];
 extern char posix_spawnp[];
 extern char ppoll[];
 extern char prctl[];
+extern char prlimit[];
 extern char putenv[];
 extern char read[];
 extern char readdir[];
@@ -170,14 +181,24 @@ static const curse_sym_t curse_syms[] = {
   { "curse_aopen_abandon", (void*)curse_aopen_abandon },
   { "curse_aopen_result", (void*)curse_aopen_result },
   { "curse_aopen_start", (void*)curse_aopen_start },
+  { "curse_held_add", (void*)curse_held_add },
+  { "curse_held_any", (void*)curse_held_any },
+  { "curse_held_take", (void*)curse_held_take },
+  { "curse_held_takeall", (void*)curse_held_takeall },
   { "curse_ldfmt", (void*)curse_ldfmt },
   { "curse_preempt_arm", (void*)curse_preempt_arm },
   { "curse_preempt_flagp", (void*)curse_preempt_flagp },
   { "curse_sig_catch", (void*)curse_sig_catch },
   { "curse_sig_clearpending", (void*)curse_sig_clearpending },
   { "curse_sig_default", (void*)curse_sig_default },
+  { "curse_sig_drop", (void*)curse_sig_drop },
+  { "curse_sig_emulate", (void*)curse_sig_emulate },
+  { "curse_sig_emulated", (void*)curse_sig_emulated },
+  { "curse_sig_fromself", (void*)curse_sig_fromself },
   { "curse_sig_hold", (void*)curse_sig_hold },
   { "curse_sig_ignore", (void*)curse_sig_ignore },
+  { "curse_sig_pending", (void*)curse_sig_pending },
+  { "curse_sig_shutdown", (void*)curse_sig_shutdown },
   { "dup", (void*)dup },
   { "dup2", (void*)dup2 },
   { "endpwent", (void*)endpwent },
@@ -248,6 +269,7 @@ static const curse_sym_t curse_syms[] = {
   { "posix_spawnp", (void*)posix_spawnp },
   { "ppoll", (void*)ppoll },
   { "prctl", (void*)prctl },
+  { "prlimit", (void*)prlimit },
   { "putenv", (void*)putenv },
   { "read", (void*)read },
   { "readdir", (void*)readdir },

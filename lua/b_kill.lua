@@ -205,6 +205,9 @@ return function(sh, cmd, args, hook, tcb)
 				if pid == C.getpid() and sig ~= 0 then -- (to ourselves: taken once kill is done)
 					rt.self_sig_hold(sig)
 				end
+				if sig ~= 0 and (pid == C.getpid() or pid <= 0) then -- (the shell's, not a
+					rt.note_self_kill(sh, sig) -- subshell's own SIGPIPE: rt.sync_signal)
+				end
 				if C.kill(pid, sig) ~= 0 then
 					io.stderr:write("curse: kill: (" .. pid .. ") - " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
 				else

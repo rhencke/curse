@@ -575,7 +575,7 @@ index 24a1f7e4..5f2016ef 100644
    ExitState *ex = (ExitState *)exptr;
    ExitDataCP exd;
 diff --git a/src/luajit.c b/src/luajit.c
-index 65d55c3c..52be1dbf 100644
+index 65d55c3c..4026304e 100644
 --- a/src/luajit.c
 +++ b/src/luajit.c
 @@ -53,6 +53,9 @@ static void signal_set(int sig, void (*h)(int))
@@ -661,3 +661,14 @@ index 65d55c3c..52be1dbf 100644
    lua_gc(L, LUA_GCRESTART, -1);
  
    createargtable(L, argv, s->argc, argn);
+@@ -595,6 +650,10 @@ int main(int argc, char **argv)
+   smain.argv = argv;
+   status = lua_cpcall(L, pmain, NULL);
+   report(L, status);
++  /* curse: the VM is freed below while signals may still arrive (an error escaped the
++   * shell mid-storm): make curse's handlers inert first (lib_cursesig.c). */
++  { extern void curse_sig_shutdown(void); curse_sig_shutdown(); }
++  globalL = NULL;
+   lua_close(L);
+   return (status || smain.status > 0) ? EXIT_FAILURE : EXIT_SUCCESS;
+ }
