@@ -118,6 +118,12 @@ local function arith(src, nodefer)
 		local s2 = table.concat(out)
 		dtxt, src = s2 ~= src and s2 or nil, s2
 	end
+	-- A backslash in SOURCE arithmetic quotes as in double quotes (bash's expand_arith_string):
+	-- `\$ \` \" \\` lose it — the character left is literal, no expansion or quote — so
+	-- `$(( \" ))` evaluates ` " `. Expanded at run time, then parsed as that text.
+	if not nodefer and src:find('\\[$`"\\]') then
+		return { k = "xpand", raw = src }
+	end
 	-- `${…}` no longer forces a whole-expression defer — primary() consumes it as an
 	-- opaque operand leaf. A GLUED `${…}` (part of a compound name, `x${y}`) is still
 	-- caught by `[%w_]%$` below and deferred whole, as are $(…), `…`, and $*/$@/$?/…

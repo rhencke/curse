@@ -866,6 +866,29 @@ end
 -- substituted as literal text.
 local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a subscript
 	local out, k, n, depth = {}, 1, #raw, depth0 or 0
+	-- (text with nothing to expand — no `$`, `` ` `` or `~`, bash's ARITH_EXP_CHAR — gets only
+	-- expand_arith_string's string_quote_removal, as in double quotes: `\` before $ ` " \
+	-- goes, every `"` goes; no subscript is quoted — `$(( A[\\x] ))` reads `A[\x]`)
+	if not depth0 and not raw:find("[$`~]") then
+		while k <= n do
+			local c = raw:sub(k, k)
+			if c == "\\" then
+				local nx = raw:sub(k + 1, k + 1)
+				if not nx:match('^[$`"\\\n]$') then
+					out[#out + 1] = c
+				end
+				out[#out + 1] = nx
+				k = k + 2
+			elseif c == '"' then
+				k = k + 1
+			else
+				local e = (raw:find('[\\"]', k) or (n + 1)) - 1
+				out[#out + 1] = raw:sub(k, e)
+				k = e + 1
+			end
+		end
+		return table.concat(out)
+	end
 	while k <= n do
 		local c = raw:sub(k, k)
 		if c == "\\" then
