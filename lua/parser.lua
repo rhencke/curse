@@ -11,6 +11,9 @@ local M = {}
 -- expression", "doesn't compile"): the one shared test, applied at each such pcall.
 -- (Arith/parse/unbound errors carry their own tags: those stay the caller's to classify.)
 function M.trap_flow(e)
+	if type(e) == "string" and e:find("not enough memory$") then
+		error(e, 0) -- (out of memory is never a parse error: it ends the shell — rt.oom)
+	end
 	if type(e) == "table" and (e.__curse_exit or e.__curse_return or e.__curse_break
 		or e.__curse_continue or e.__curse_discard or e.__curse_termsig_unwind)
 		and not (e.__curse_matherr or e.__curse_experr or e.__curse_arith or e.__curse_perr
@@ -811,6 +814,9 @@ local function shown(s, subscript)
 	return subscript and (s:gsub("\\([$`\"'~])", "%1")) or s
 end
 function M.arith_errmsg(expr, err, subscript)
+	if type(err) == "string" and err:find("not enough memory$") then
+		error(err, 0) -- (out of memory mid-expression is no syntax error: rt.oom)
+	end
 	local t = shown(tostring(type(err) == "table" and err.expr or expr or ""):gsub("^[ \t]+", ""), subscript)
 	local pre = M.arith_cmd and (M.arith_cmd .. ": ") or ""
 	if type(err) == "table" and err.msg then

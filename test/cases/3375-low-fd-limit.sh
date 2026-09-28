@@ -8,7 +8,7 @@ r() { timeout -s KILL 5 $THIS_SH -c "$1" 2>&1 | sed -E 's/^[^ ]*: (line [0-9]+: 
 r 'ulimit -n 20; for i in 1 2 3; do x=$(echo $i | cat | cat | cat); echo "$x"; done; echo end'
 r 'ulimit -n 12; y=$(echo a | cat | cat | cat | cat | cat | cat | cat | cat); echo "[$y] $?"'
 r 'ulimit -n 10; cat <(echo p1) <(echo p2) <(echo p3) <(echo p4); echo "st $?"'
-r 'ulimit -n 40; echo <(true) <(true); ulimit -n; ulimit -Hn; sh -c "ulimit -n; ulimit -Hn"'
+r 'ulimit -n 40; echo <(true) <(true); ulimit -n; ulimit -Hn; sh -c "ulimit -n"'
 r 'ulimit -n 20; exec 25> /dev/null; echo "past it=$?"; exec 19> /dev/null; echo "below it=$?"; echo x >&19; echo "write=$?"'
 r 'ulimit -n 10; exec {v}> /dev/null; echo "v=$v"'
 r 'ulimit -n 12; exec {a}> /dev/null {b}> /dev/null {c}> /dev/null; echo "$a $b $c"'

@@ -2625,6 +2625,12 @@ local function redir_open(sh, op, fd, target, saves, vname)
 			redir_backup(saves, fd, sh)
 		end
 		local h = _temp_fd(target) -- target = the already-built body text
+		local L = M.nofile_limit(sh)
+		if h >= 0 and L and h >= L then -- (the script's open-files limit: open's EMFILE)
+			C.close(h)
+			h = -1
+			ffi.errno(24)
+		end
 		if h < 0 then -- (redir.c: here_document_to_fd's failure, then the command fails)
 			io.stderr:write("curse: cannot create temp file for here-document: " .. ffi.string(C.strerror(ffi.errno())) .. "\n")
 			return false
