@@ -270,23 +270,11 @@ local function arith(src, nodefer)
 			end
 		end
 		if starts("[") then
+			-- (to its `]` as expr.c's skipsubscript reads it: an escaped char, '…' "…" `…`
+			-- $( … ) ${ … } nest — `a["]` never closes)
 			local rs = i + 1
-			local depth, j = 1, i + 1
-			while j <= n and depth > 0 do
-				local ch = src:sub(j, j)
-				if ch == "\\" then
-					j = j + 1 -- (an escaped char, e.g. a quoted `\]` in an expanded key)
-				elseif ch == "[" then
-					depth = depth + 1
-				elseif ch == "]" then
-					depth = depth - 1
-					if depth == 0 then
-						break
-					end
-				end
-				j = j + 1
-			end
-			if depth ~= 0 then
+			local j = M.subscript_x(src, i)
+			if j > n then
 				error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
 			end
 			local raw = src:sub(rs, j - 1)
@@ -1463,6 +1451,7 @@ local function subscript_x(s, i) -- skip_matched_pair(s, i, '[', ']', 0): the `]
 	end
 	return n + 1
 end
+M.subscript_x = subscript_x -- (valid_array_reference's skipsubscript: rt / interp)
 local PARAM, QUOTE, QUOTE2, OP, WORD = 1, 2, 3, 4, 5
 dolbrace_x = function(s, i) -- extract_dollar_brace_string(Q_DOUBLE_QUOTES, 0): the `}`, or n + 1
 	local n, st, nest, dbs, start = #s, PARAM, 1, { [0] = PARAM }, i
@@ -1830,7 +1819,20 @@ local function parse_dollar(w, i, add, q)
 		-- find the MATCHING } — honoring \-escapes, '…'/"…" quoting, and nested ${…}
 		-- so `${var#\}}`, `${var-'}'}`, `${a:-${b}}` take the right inner text.
 		local endp = scan_braces(w, i + 1, q) -- index just past the closing }
-		local part = parse_paramexp(w:sub(i + 2, endp - 2))
+		-- (unquoted, the word's expansion re-extracts it — extract_dollar_brace_string, whose
+		-- subscript in the NAME skips to its `]` past a `}`: `${a[@}]}` is a[@}], and
+		-- `[${!a[@}]` runs to the word's end, the `]` in the subscript)
+		local sb = not q and w:match("^!?[%a_][%w_]*()%[", i + 2)
+		local ce = endp - 2 -- (the text's end)
+		if sb then
+			local ex = dolbrace_x(w, i + 2)
+			if ex <= #w and ex ~= endp - 1 then
+				endp, ce = ex + 1, ex - 1
+			elseif ex > #w and subscript_x(w, sb) <= #w then
+				endp, ce = #w + 1, #w
+			end
+		end
+		local part = parse_paramexp(w:sub(i + 2, ce))
 		part.q = q
 		add(part)
 		return endp

@@ -1672,7 +1672,7 @@ local function expand_pexp(sh, p, assign)
 	if et then
 		local eb, esub = et:match("^([%a_][%w_]*)%[(.+)%]$")
 		if eb then
-			pe = setmetatable({ name = eb, index = esub }, { __index = pe })
+			pe = setmetatable({ name = eb, index = esub, via_eref = true }, { __index = pe })
 		end
 	end
 	if pe.op == "indirect" then -- ${!ref} / ${!ref OP}: resolve the name, then expand it
@@ -2235,23 +2235,10 @@ indirect_part = function(sh, pe, quiet)
 	if not (numeric or special) then
 		local bad = not base
 		if not bad and #tname > #base then
-			if tname:sub(#base + 1, #base + 1) ~= "[" or tname:sub(-1) ~= "]" or #tname == #base + 2 then
-				bad = true
-			else -- the `[` must close exactly at the end
-				local depth = 0
-				for k = #base + 1, #tname do
-					local c = tname:byte(k)
-					if c == 91 then
-						depth = depth + 1
-					elseif c == 93 then
-						depth = depth - 1
-						if depth == 0 and k < #tname then
-							bad = true
-							break
-						end
-					end
-				end
-			end
+			-- (the `[` must close exactly at the end, as skipsubscript reads it: quotes nest —
+			-- `A["]` never closes)
+			bad = tname:sub(#base + 1, #base + 1) ~= "[" or #tname == #base + 2
+				or P.subscript_x(tname, #base + 1) ~= #tname
 		end
 		if bad then
 			io.stderr:write("curse: " .. tname .. ": invalid variable name\n")
@@ -2760,6 +2747,14 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				hasval = pn == 0 or pn <= sh.nparams
 			end
 			local pval = pn and sh:param(pn) or sh:get(pe.name) -- ($1 is not a variable)
+			local rb = not pn and sh.vars[pe.name]
+			local et = rb and rb.ref and sh:deref_elem(pe.name)
+			local eb, esub = (et or ""):match("^([%a_][%w_]*)%[(.+)%]$")
+			if eb then -- (through a nameref to an ELEMENT: that element — its subscript is
+				local k = array_key(sh, eb, esub) -- evaluated, `D[a b]` an arith error)
+				hasval = sh:is_elem_set(eb, k)
+				pval = hasval and (sh:array_get(eb, k) or "") or ""
+			end
 			local nonnull = pval ~= ""
 			local useword
 			if pe.op == ":-" then
@@ -5180,8 +5175,8 @@ end
 -- computed natively via emit_word — genuine compilation, not an AST re-walk.
 -- Evaluate an expression STRING (a value re-read as arithmetic): a parse error is a shell
 -- arith error (fails the command), never a raw Lua error out of compiled code.
-function M.arith_eval_str(sh, s)
-	local ok, ast = pcall(P.arith, s == "" and "0" or s, sh.arith_expanded and "expanded" or nil)
+function M.arith_eval_str(sh, s, mode)
+	local ok, ast = pcall(P.arith, s == "" and "0" or s, mode or (sh.arith_expanded and "expanded" or nil))
 	if not ok then
 		P.trap_flow(ast)
 	end

@@ -14214,6 +14214,15 @@ function Shell:expand_param(pe, arg, arg2, idxnum)
 				M.assign_default_fail(self, self:deref(name), "readonly variable")
 			end
 			self:array_set(name, idxnum or 0, v)
+			if pe.via_eref then -- (through a nameref to an element: bash binds the NAMEREF,
+				-- which lands on the element, then substitutes the variable's value — the
+				-- base's element 0; with none it reads NULL and crashes: docs/bash-ub.md —
+				-- curse substitutes the stored element)
+				local k0 = self:is_assoc(name) and "0" or 0
+				if self:is_elem_set(name, k0) then
+					return self:array_get(name, k0)
+				end
+			end
 			return self:array_get(name, idxnum or 0) or v -- (as stored: -i / -u / -l applied)
 		end
 		-- a bare name that IS an array writes element 0 (bash), not a scalar shadow; the
@@ -16136,6 +16145,9 @@ function M.var_is_nameref(sh, nm)
 end
 function M.var_is_set(sh, nm, expanded)
 	local base, sub = nm:match("^([%a_][%w_]*)%[(.+)%]$")
+	if base and require("parser").subscript_x(nm, #base + 1) ~= #nm then
+		return false -- (not a valid_array_reference — its `[` doesn't close at the end, as
+	end -- skipsubscript reads it: `A["]` — so no variable by that name)
 	if base then
 		local b = sh.vars[sh:deref(base)]
 		if (sub == "@" or sub == "*") and not sh:is_assoc(base) then -- `-v a[@]`: any element
@@ -16154,7 +16166,21 @@ function M.var_is_set(sh, nm, expanded)
 				key = require("interp")._int.array_key(sh, base, sub)
 			end
 		else
-			key = M.to_arr_key(M.arith_str(sh, sub))
+			-- ([[ -v ]]'s word was expanded already: its quotes are text — `A[\"0\"]` is an
+			-- error; test's subscript still expands)
+			if expanded and not M.looks_numeric(sub) then
+				local ok, v = pcall(require("interp").arith_eval_str, sh, sub, "let")
+				if not ok then -- (an arith error abandons the line, as bash's expression error)
+					require("parser").trap_flow(v)
+					if type(v) == "table" and v.__curse_matherr and not v.__curse_lineabort then
+						error({ __curse_exit = 1, __curse_lineabort = true }, 0)
+					end
+					error(v, 0)
+				end
+				key = M.to_arr_key(v)
+			else
+				key = M.to_arr_key(M.arith_str(sh, sub))
+			end
 		end
 		if M.neg_oob(sh, base, key) then -- (negative counts from the end; before the start: bash's
 			io.stderr:write("curse: " .. base .. ": bad array subscript\n") -- get_array_value error)

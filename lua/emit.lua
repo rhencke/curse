@@ -2640,11 +2640,9 @@ local function pexp_nameref_valop(pe)
 	if pe.index then
 		return pe.op == nil and pexp_compilable(pe)
 	end
-	-- scalar default/alternate/assign/error (${x-d}/:-/+/:+/=/:=/?/:?): getv=sh:get and
-	-- rt.var_has_value/assign_default ALL deref (sh:deref), so the compiled render matches interp
-	-- exactly for a plain/scalar/whole-array nameref (an element-target nameref matches interp's
-	-- own sh:deref behavior — both strip the subscript; a pre-existing interp quirk, left as parity).
-	return (pe.op == "len" or pe.op == "sub" or PEXP_STROP[pe.op] or PEXP_DEFAULT[pe.op]) and pexp_compilable(pe)
+	-- (a scalar default/alternate/assign/error — ${x-d}/:-/+/:+/=/:=/?/:? — may test an
+	-- element-target nameref's ELEMENT, subscript evaluated: the shared expander's)
+	return (pe.op == "len" or pe.op == "sub" or PEXP_STROP[pe.op]) and pexp_compilable(pe)
 end
 -- ${a[@]OP} / ${a[*]OP}: a per-element string-op over the whole array, compiled by
 -- mapping apply_str_op via rt.array_op_values — exactly interp's generic per-element

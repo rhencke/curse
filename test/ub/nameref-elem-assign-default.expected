@@ -1,0 +1,6 @@
+[q]
+declare -a a=([5]="q")
+[w]
+declare -a b=([2]="k" [7]="w")
+150
+[e]

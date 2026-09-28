@@ -925,18 +925,10 @@ return function(sh, cmd, args, hook, tcb)
 					local anm, sub, aop, aval = nil, nil, nil, nil
 					local nm, rest = a:match("^([%a_][%w_]*)%[(.*)$")
 					if nm then
-						local depth, close = 1, nil
-						for j = 1, #rest do
-							local ch = rest:sub(j, j)
-							if ch == "[" then
-								depth = depth + 1
-							elseif ch == "]" then
-								depth = depth - 1
-								if depth == 0 then
-									close = j
-									break
-								end
-							end
+						-- (to its `]` as skipsubscript reads it: quotes nest — `A["]=1` has none)
+						local close = P.subscript_x(a, #nm + 1) - #nm - 1
+						if close > #rest then
+							close = nil
 						end
 						if close then
 							local after = rest:sub(close + 1)
