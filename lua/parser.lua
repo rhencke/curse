@@ -201,21 +201,25 @@ local function arith(src, nodefer)
 	-- operations along the right edge — waiting on that token — hadn't happened yet
 	-- (`y = 3 @` assigns nothing, `x++, y=2 #c` increments x), but everything to their left,
 	-- a completed parenthesis, and the last operand (a `x++` included) had.
-	local function spine(e)
+	-- (nostr: the bad character is the token right after the last operand — a NAME, whose
+	-- value readtok reads only after that lookahead: `A[] ]` never reads A[])
+	local function spine(e, nostr)
 		local k = e.k
 		if e.paren then
 			return e
 		elseif k == "comma" then
-			return seq(e.l, spine(e.r))
+			return seq(e.l, spine(e.r, nostr))
 		elseif k == "bin" then
 			if e.op == "&&" or e.op == "||" then
-				return { k = "bin", op = e.op, l = e.l, r = spine(e.r) or ZERO }
+				return { k = "bin", op = e.op, l = e.l, r = spine(e.r, nostr) or ZERO }
 			end
-			return seq(e.l, spine(e.r))
+			return seq(e.l, spine(e.r, nostr))
 		elseif k == "asgn" or k == "un" then
-			return spine(e.e)
+			return spine(e.e, nostr)
 		elseif k == "tern" then
-			return { k = "tern", c = e.c, a = e.a, b = spine(e.b) or ZERO }
+			return { k = "tern", c = e.c, a = e.a, b = spine(e.b, nostr) or ZERO }
+		elseif nostr and k == "var" and not e.dollar then
+			return nil
 		end
 		return e
 	end
@@ -256,10 +260,11 @@ local function arith(src, nodefer)
 		local ns = i
 		local nm = ident()
 		if nodefer == "expanded" and starts("[") then
-			-- already-expanded text (bash's EXP_EXPANDED): the subscript runs to the LAST `]`
-			-- (`assoc[]]`, `assoc[x],b[$(…)]` take the key literally, nothing re-expands)
-			local close = src:match(".*()%]")
-			if close and close > i then
+			-- already-expanded text (bash's EXP_EXPANDED): the subscript runs to its `]` as
+			-- skipsubscript reads it (`A[]]` is A[] then a stray `]`; `a[1]+b[2]` two
+			-- elements) and nothing in it re-expands
+			local close = M.subscript_x(src, i)
+			if close <= n then
 				local raw = src:sub(i + 1, close - 1)
 				i = close + 1
 				local ok, idx = pcall(arith, raw, "expanded")
@@ -585,7 +590,7 @@ local function arith(src, nodefer)
 			-- an operand was expected)
 			local pc = src:sub(1, i - 1):match("(%S)%s*$")
 			aerr(pc == ")" and "syntax error: operand expected" or "syntax error: invalid arithmetic operator",
-				spine(e))
+				spine(e, pc ~= ")"))
 		elseif c:match("[%a_]") then
 			-- a name right after the expression: bash's readtok, reading a name, reads the
 			-- token after it too (the `=` peek) — past a run of names, a character that

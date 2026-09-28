@@ -857,8 +857,9 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	end
 	return ERRCHK
 end
-EF.LINE_BUILTINS = { compgen = 1, mapfile = 1, readarray = 1, fc = 1, -- (see the builtin dispatch; the
-	declare = 1, typeset = 1, ["local"] = 1, readonly = 1, export = 1, set = 1 } -- listers print LINENO)
+EF.LINE_BUILTINS = { compgen = 1, mapfile = 1, readarray = 1, fc = 1 } -- (see the builtin dispatch)
+-- (the declaration builtins list $LINENO: they run at their line — sh.cur_line only)
+EF.LINENO_BUILTINS = { declare = 1, typeset = 1, ["local"] = 1, readonly = 1, export = 1, set = 1 }
 EF.has_debug = false -- program installs a DEBUG trap → fire it before each command
 -- set -x: a program that can turn on xtrace (or runs eval/source, which may) carries a
 -- trace hook per command — `if sh.opt_x then rt.xtrace…` — placed where the interpreter
@@ -6249,6 +6250,8 @@ simple_compiled = function(cx, st, after)
 			if EF.LINE_BUILTINS[cmd] and not (EF.trapline and not EF.cur_infunc) then
 				local ln = st.cline or st.line or EF.cur_line or 0
 				bcall = ("sh.cur_line = %d; sh.cur_cline = %d; "):format(ln, ln) .. bcall
+			elseif EF.LINENO_BUILTINS[cmd] and not (EF.trapline and not EF.cur_infunc) then
+				bcall = ("sh.cur_line = %d; "):format(st.line or EF.cur_line or 0) .. bcall
 			end
 			if redir_apply then
 				-- a REDIRECTED builtin (`printf x > f`, `read v < f`, `type ls > f`): install the

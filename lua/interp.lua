@@ -3447,9 +3447,7 @@ M.report_recoverable = rt.report_recoverable
 local DYN_ARRAYS = { BASH_ARGC = 1, BASH_ARGV = 1, BASH_LINENO = 1, BASH_SOURCE = 1, DIRSTACK = 1, FUNCNAME = 1, GROUPS = 1 }
 M.DYN_ARRAYS = DYN_ARRAYS
 -- bash's dynamic scalars (computed on read, no var box here) and their attributes
-local DYN_SCALARS = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
-	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-", BASH_ARGV0 = "-",
-	OSTYPE = "-", MACHTYPE = "-", HOSTTYPE = "-" }
+local DYN_SCALARS = rt.DYN_SCALAR_ATTR
 -- Format one variable as a `declare -p` line, or nil if it is unset.
 local function fmt_decl(sh, name)
 	-- SHELLOPTS/BASHOPTS are readonly, exported, derived specials with no var box.
@@ -3471,7 +3469,7 @@ local function fmt_decl(sh, name)
 		end
 		return "declare -a " .. name .. "=(" .. table.concat(parts, " ") .. ")"
 	end
-	if (b == nil or (b.dyn and b.s == nil and b.n == nil)) and DYN_SCALARS[name]
+	if (b == nil or (b.dyn and b.s == nil and b.n == nil and not b.arr)) and DYN_SCALARS[name]
 		and not (sh.unset_specials and sh.unset_specials[name]) then
 		local v = sh:get(name) or "" -- (read first: get_seconds gives SECONDS its -i)
 		local fl = b and sh:attr_string(name) or DYN_SCALARS[name]

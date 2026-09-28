@@ -783,6 +783,16 @@ end
 -- local's own error; nothing is created (status 1). True when that happened.
 -- Does `local NAME` hit a readonly it may not shadow? Only a readonly GLOBAL blocks it;
 -- a readonly local of an enclosing function can be shadowed (bash).
+-- Does a function's local hold `name` (it or a caller's local shadows the global)?
+function Shell:is_local_anywhere(name)
+	for d = self.pd or 0, 0, -1 do
+		local sv = self.savedstack[d]
+		if sv and sv[name] ~= nil then
+			return true
+		end
+	end
+	return false
+end
 function Shell:is_global_ro(name)
 	local b = self.vars[name]
 	if not (b and b.ro) then
@@ -7420,10 +7430,11 @@ local function box(name, vars)
 end
 
 -- Is $LINENO an ordinary variable — unset once (its magic gone) or a plain `local LINENO`
--- shadowing it — rather than the live line number? (compiled $LINENO reads)
+-- shadowing it, or made an array (`declare -a LINENO`) — rather than the live line number?
+-- (compiled $LINENO reads)
 function M.lineno_plain(sh)
 	local b = sh.vars.LINENO
-	return (b ~= nil and not b.dyn) or (sh.unset_specials and sh.unset_specials.LINENO) or false
+	return (b ~= nil and (not b.dyn or b.arr ~= nil)) or (sh.unset_specials and sh.unset_specials.LINENO) or false
 end
 -- bash's sv_shcompat / sv_xtracefd value checks, on assignment: a malformed BASH_COMPAT
 -- (not `N.M`/`NM` within 3.1..5.2) or a BASH_XTRACEFD that isn't an open fd is reported
@@ -8666,6 +8677,30 @@ function M.dyn_live(sh, dn)
 end
 do
 local legal_number = M.legal_number -- (bash: legal_number, else 0)
+-- The dynamic scalars' own attributes as `declare -p` lists them ("i": an integer variable)
+M.DYN_SCALAR_ATTR = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
+	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-", BASH_ARGV0 = "-",
+	OSTYPE = "-", MACHTYPE = "-", HOSTTYPE = "-" }
+-- The value a scalar keeps as element 0 when it becomes an array (convert_var_to_array):
+-- its string, its int64 — or a live dynamic variable's current value (`declare -a LINENO`
+-- is ([0]=the line); the integer ones — RANDOM, SECONDS, BASHPID, … — stay integer). nil:
+-- no value.
+function M.scalar_value0(sh, dn, b)
+	if b.s ~= nil then
+		return b.s
+	end
+	if b.n ~= nil then
+		return i64_to_str(b.n)
+	end
+	if b.dyn and M.DYN_SCALAR[dn] and M.dyn_live(sh, dn) then
+		local v = sh:special_get(dn)
+		if M.DYN_SCALAR_ATTR[dn] == "i" then -- (an integer variable: SECONDS once read, as here)
+			b.int = true
+		end
+		return v
+	end
+	return nil
+end
 -- Run `dn`'s assign hook with value `s` (b: its dyn box or nil). False when `dn` is no
 -- longer dynamic (unset) — the caller then stores the value like any other variable.
 function M.dyn_assign(sh, dn, s, b)
@@ -10165,8 +10200,9 @@ function Shell:array_set(name, key, val, append, raw)
 	end
 	if not b.arr then
 		b.arr = {}
-		if b.s then
-			b.arr[0] = b.s
+		local v0 = M.scalar_value0(self, self:deref(name), b)
+		if v0 then
+			b.arr[0] = v0
 		end
 		b.s = nil
 		b.n = nil
@@ -17493,10 +17529,13 @@ do
 			end
 		end
 		sh.arrayargs_pending = {}
-		local wantassoc, inherit = false, sh.shopt.localvar_inherit
+		local wantassoc, wantarr, inherit = false, false, sh.shopt.localvar_inherit
 		for k = 2, #argv do
 			if argv[k]:match("^%-%a*A") then
 				wantassoc = true
+			end
+			if argv[k]:match("^%-%a*a") then
+				wantarr = true
 			end
 			if argv[k]:match("^%-%a*I") then
 				inherit = true
@@ -17514,6 +17553,22 @@ do
 				isassoc = sh:is_assoc(sh:deref(aa.name))
 			end
 			sh.arrayargs_pre[aa] = I.arrayassign_items(sh, aa, isassoc, wantassoc)
+			if glob and isassoc and not wantassoc and not wantarr and (sh.calldepth or 0) > 0
+				and (dcl == "declare" or dcl == "typeset") and not sh:is_local_anywhere(aa.name) then
+				-- `declare -g NAME=(…)` in a function over a global associative NAME (bash's
+				-- do_compound_assignment, mkglobal): the words are expanded and quoted for the
+				-- associative array, which is then converted to an INDEXED one
+				-- (convert_var_to_array) that takes them as they are — the quotes stay, and a
+				-- [key]'s quoted text is its arithmetic subscript
+				local q = {}
+				for i, it in ipairs(sh.arrayargs_pre[aa]) do
+					q[i] = { key = it.key ~= nil and "" or nil, xkey = it.key ~= nil and M.sh_single_quote(it.xkey or it.key) or nil,
+						op = it.op, val = it.val and M.sh_single_quote(it.val) or M.sh_single_quote(it.src or "") }
+				end
+				sh.arrayargs_pre[aa] = q
+				sh.arrayargs_pending.gconv = sh.arrayargs_pending.gconv or {}
+				sh.arrayargs_pending.gconv[aa.name] = true
+			end
 			if sh.opt_x then -- (`+ b=('4' '5 6')` as it expands: before a prefix assignment's
 				M.xtrace_arrlit(sh, aa.name, sh.arrayargs_pre[aa]) -- trace, and `+ declare -a b`)
 			end
@@ -17532,6 +17587,12 @@ do
 				if failed and not aaforce[aa.name] then
 				elseif aaskip and aaskip[aa.name] then
 				else
+					if pend.gconv and pend.gconv[aa.name] then -- (see sr_aa_pre: the associative
+						local b = sh.vars[sh:deref(aa.name)] -- array becomes an indexed one — an
+						if b and b.assoc then -- append's element 0 would be its hash table
+							b.assoc, b.order, b.arr = nil, nil, {} -- read as text: bash UB)
+						end
+					end
 					I.do_arrayassign(sh, aa)
 				end
 			end
