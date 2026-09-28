@@ -375,7 +375,501 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - afl-cmin/afl-showmap need `__AFL_DEFER_FORKSRV=1` with this harness, or they read only
   the ~180 bytes of C edges (the spike's afl-seeds-min was minimised on that).
 
-# F31+ fixed on branch fix-fuzz3 (the findings are on fuzz-docker; reconcile at merge)
+# Docker campaign (branch fuzz-docker) and the previous triage's unexplained signatures — F31+
+
+F53-F79 are from the 60-min `fuzz-docker` campaign's triage (and F37/F36 got variants);
+every repro below was run through the capped container (tools/fuzz/docker/run.sh exec).
+F31-F50 and F52 are the 38 NEW differential signatures the previous triage
+(main build/fuzz-work/triage/20260927-225416) left unexplained, re-checked against current
+main (F1-F30 fixed) and reduced by hand or with a ddmin over bytes; F48 came from the
+containment probe's AFL run, F51 from the 60-min `fuzz-docker` campaign
+(`gram:tiered gram:compiled`). Verified with tools/fuzz/cmp.sh against the pinned oracle
+(5.2.21). "All tiers" = interp, compiled, tiered (harness) and the static build/curse.
+The rest of those 38 were NOISE (output order of async constructs, a SIGPIPE race, a
+signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
+
+## F31. FIXED — `${!a[@]x}` (junk after the subscript of an indirect key list) expands instead of a bad substitution
+
+    a=(1 2); echo "${!a[@]x}"
+
+- bash: `S: line 1: ${!a[@]x}: bad substitution`, status 1.
+- curse (all tiers): `S: line 1: 1 2: invalid variable name` (the keys are expanded, then
+  used as an indirect name). Found as `"${!a[@][a-z]{a[@]}"`, `"${!a[@]while{a[@]}"`.
+
+## F32. FIXED — `${!a[@}` (unclosed subscript): bash's "no closing" wording missing
+
+    echo "${!a[@}"
+
+- bash: `S: line 1: bad substitution: no closing `}' in "${!a[@}"`.
+- curse (all tiers): `S: line 1: ${!a[@}: bad substitution`. Also `"${!a[@]{a[}"`
+  (curse: `a[@]: invalid indirect expansion`).
+
+## F33. FIXED — `${}a` expands to `a` instead of a bad substitution
+
+    echo "${}a"; echo "st=$?"
+
+- bash: `S: line 1: ${}a: bad substitution`, the command fails, `st=1`.
+- curse (all tiers): prints `a`, `st=0`. (`"${}"` alone agrees.)
+
+## F34. FIXED — `${!?x]}`: bash's bad substitution, curse the `${!?word}` error
+
+    echo "${!?x]}"
+
+- bash: `S: line 1: ${!?x]}: bad substitution`.
+- curse (all tiers): `S: line 1: !: x]` (read as `${!?word}` on `$!`).
+
+## F35. FIXED — A subscript on a special or positional parameter (`${*[0]}`, `${2[-1]}`) is not a bad substitution
+
+    set -- a; echo "${*[0]}" "${2[-1]~}"; echo "st=$?"
+
+- bash: `S: line 1: ${*[0]}: bad substitution`, `st=1`.
+- curse (all tiers): prints `a `, `st=0` (`${2[-1]~}` alone: `2: bad array subscript`).
+  Found as `"${*[-1]@a}"`.
+
+## F36. FIXED — `(( 1 ? 0 : $i ))` with an empty branch: no expression error
+
+    (( 1 ? 0 : $i )); echo "st=$?"
+
+- bash: `S: line 1: ((: 1 ? 0 :  : expression expected (error token is ":  ")`, `st=1`.
+- curse (all tiers): no message, `st=1`. (`$(( 1 ? 2 : ))` agrees, but
+  `echo $(( 1 - a[4]++ ? 0 : $x ))` doesn't: bash `… expression expected`, curse prints `0`.)
+
+## F37. FIXED — An empty subscript in arithmetic (`v[$a]`, a empty) is not a bad array subscript
+
+    a=; (( v[$a] ? 1 : 2 )); echo "st=$?"
+
+- bash: `S: line 1: v[]: bad array subscript` twice, `st=0`.
+- curse (all tiers): no message, `st=0`. Nested: `echo $(( A[x[$f]] ))` — bash
+  `x\[\]: syntax error: invalid arithmetic operator (error token is "\[\]")`, curse `0`
+  (in a recursive function the fuzz input then ran into curse's stack overflow).
+
+## F38. FIXED — `$(( "$"@ ))`: the error token loses the `$`
+
+    x=$(( "$"@ ))
+
+- bash: `S: line 1: $@ : syntax error: operand expected (error token is "$@ ")`.
+- curse (all tiers): `… @ : syntax error: operand expected (error token is "@ ")`.
+
+## F39. FIXED — A subscript spanning lines: `invalid arithmetic operator` becomes `syntax error in expression`
+
+    echo "${a[x
+    y@]}"
+
+- bash: `S: line 2: x` / `y@: syntax error: invalid arithmetic operator (error token is "@")`.
+- curse (all tiers): `… y@: syntax error in expression (error token is "y@")`. On one
+  line (`${a[y@]}`) both agree.
+
+## F40. FIXED — A function defined in an ERR trap action: its line numbers
+
+    trap 'f() {
+
+    foo
+    }' ERR; false; f
+
+- bash: `S: line 6: foo: command not found`.
+- curse (all tiers): `S: line 3: foo: command not found`. (A USR1 trap agrees.)
+
+## F41. FIXED — Syntax error from an alias-expanded token: the echoed line
+
+    shopt -s expand_aliases
+    alias local='}'
+    f() {
+      local a
+    }
+
+- bash: `S: line 4: syntax error near unexpected token `}'` then `S: line 4: ` '` (the
+  input line as bash's alias expansion left it).
+- curse (all tiers): the second line is the source line, `S: line 4: `  local a'`.
+
+## F42. FIXED — A here-document delimiter with quotes inside `${…}`: the warning names it unquoted
+
+    cat <<${x"y"}
+
+- bash: `… delimited by end-of-file (wanted `${x"y"}')` (quote removal leaves `${…}` alone).
+- curse (all tiers): `(wanted `${xy}')`. Found with a delimiter spanning lines (`<<${a() {`…),
+  where the `cat: command not found` line number differs as well (bash 2, curse 6).
+
+## F43. FIXED — `A[-1]` on an unset A next to an arithmetic syntax error: doubled / lost messages
+
+    (( (A[-1] || $a) ))
+    (( 2#101 < (A[-1] != 1 || $a) ))
+
+- bash: each prints `A: bad array subscript` once, then the `((: … operand expected` error.
+- curse (all tiers): the first prints `A: bad array subscript` twice; the second prints it
+  once and never the syntax error.
+
+## F44. FIXED — `A=1 export` lists the temporary assignment
+
+    A=1 export
+
+- bash: the exported variables, no `A`.
+- curse (all tiers): also `declare -x A="1"`. Same through `eval`.
+
+## F45. FIXED — A backslash-newline at end of file: bash's line number is one higher
+
+    cat <<EOF
+    x\
+
+- bash: `S: line 3: warning: here-document at line 1 delimited by end-of-file (wanted `EOF')`.
+- curse (all tiers): `S: line 2: …`. Same off-by-one for an unterminated quote ending
+  `'\`: `f() {⏎  echo '6⏎}⏎'\` → bash `line 6: syntax error: unexpected end of file`,
+  curse line 5.
+
+## F46. FIXED — `\001` / `\177` in a bad substitution's message: bash shows its CTLESC quoting
+
+    printf 'echo "${a\001}"\n' > s; . ./s
+
+- bash: `S: line 1: ${a^A^A}: bad substitution` (the byte doubled: CTLESC-escaped inside
+  double quotes, printed raw); `\177` shows as `^A^?`.
+- curse (all tiers): `${a^A}` (the byte once). A bash quirk to copy (bug-for-bug).
+
+## F47. FIXED — A here-document inside `>( )` / `<( )`: not read like one inside `$( )`
+
+    echo >(cat <<EOF)
+    body
+    EOF
+    echo after
+
+- bash: `S: line 1: warning: command substitution: 1 unterminated here-document`, then
+  the body lines are the here-document (`cat` runs at line 3), `after`.
+- curse (all tiers): `here-document at line 1 delimited by end-of-file`, then `body` and
+  `EOF` run as commands.
+
+## F48. FIXED — `"${x%${}"${"}"`: the parse error escapes (F2/F5 class, another path)
+
+    x=1; echo "${x%${}"${"}"; echo after
+
+- bash: `S: line 1: unexpected EOF while looking for matching `}'`, status 2.
+- curse (all tiers): an escaped Lua error (`interp:6555: … parser:707: unexpected EOF while
+  looking for matching `"'`), no `line N:` prefix, wrong delimiter. (`… ${; …` without
+  the second quote gives the prefix but the same wrong delimiter.) Found by the containment
+  probe's AFL run as `${0=*}…"${BASH_LINENO/%${*[0]%$""${_//${b^a}}…`.
+
+## F49. FIXED — `}` after a redirection-only prefix is a word, not a closer
+
+    <<F }; echo st=$?
+
+- bash: `S: line 1: }: command not found`, the here-doc warning, `st=127`.
+- curse (all tiers): `syntax error near unexpected token `}'`, status 2. Same for `>/dev/null }`.
+
+## F50. FIXED — A syntax error on a line with a pending here-document: reported before the body is read
+
+    cat <<EOF; }
+    x
+
+- bash: reads the body first: `S: line 2: syntax error near unexpected token `}'`,
+  `S: line 2: `cat <<EOF; }'`, then the here-doc EOF warning.
+- curse (all tiers): `line 1:` for both, no warning.
+
+## F51. FIXED — Compiled tier: a loop in a sourced file running `alias` / `set -v` — escaped `attempt to call … 'hook'`
+
+    printf 'for i in 1; do alias; done' > s; . ./s
+    printf 'for i in 1; do :; done' > s; set -v; . ./s
+
+- bash, curse interp / tiered / static: no output (resp. the line echoed), status 0.
+- curse compiled tier: `attempt to call local 'hook' (a nil value)` (interp.lua:6208 via
+  tier.lua:397, b_source; or `upvalue 'hook'`, interp.lua:5747/5798), an AFL crash. Any
+  loop kind (`for`, `for ((`, `while`, `select`); `for i in 1; do :; done` alone agrees.
+  Found as `select … do set -v; break; done` and `for((;;))do alias; done` sourced.
+
+## F52. FIXED — `set -v` inside a sourced file or an eval string echoes its own line
+
+    printf 'set -v\necho x\n' > s; . ./s
+
+- bash: `echo x` then `x` (verbose starts with the next line read).
+- curse (all tiers): also `set -v` itself first. Same for `eval 'set -v⏎echo x'` and for
+  `set -v; echo x` on one line in the file (bash: nothing echoed).
+
+## Not curse bugs (this triage)
+
+- Unbounded recursion through `local a[3]=4` (`f() { local a[3]=4; f; }; f`): bash runs
+  until killed (or segfaults) — UB-recursion. Note: curse's stack exhaustion surfaces as
+  `S: line 1: 3: syntax error in expression` (the subscript's arithmetic catches it)
+  instead of `stack overflow`.
+- Output order only (every line and the status equal, cmp.sh now labels these
+  `order-only:`): background jobs, coprocs, process substitutions, pipeline stages.
+- `f | <a command that fails at once>`: whether f's later lines run depends on when the
+  reader exits (SIGPIPE race). `{ trap ':' USR1; kill -USR1 $$; }` in a pipeline stage:
+  a signal to the main shell racing the other stage.
+
+## F53. `A=$((()))$(())`: the arithmetic error escapes as a parse error
+
+    A=$((()))$(())
+
+- bash: `S: line 1: (): syntax error: operand expected (error token is ")")`.
+- curse (all tiers): escaped `unexpected EOF while looking for matching `"'` (no prefix);
+  an AFL crash. `echo $((()))$(())` agrees: only in an assignment value.
+
+## F54. `$[${]`: escaped parse error instead of a bad substitution
+
+    echo $[${]
+
+- bash: `S: line 1: ${: bad substitution`.
+- curse (all tiers): escaped `unexpected EOF while looking for matching `}'`. Also `A=$[${]`.
+
+## F55. `${x/${/}}` still escapes (listed under "Variants of known entries" as F2/F5's, never fixed)
+
+    x=a; echo ${x/${/}}
+
+- bash: `S: line 1: ${/}: bad substitution`.
+- curse (all tiers): escaped `unexpected EOF while looking for matching `}'`. Found as
+  `{ "${#/${/}}";}`; 39 of the campaign's 46 crash inputs are F53/F54/F55.
+
+## F56. An arithmetic error in a subscript inside an EXIT trap: `(non-string error)` escapes
+
+    trap '$[a[!]]' EXIT
+
+- bash: `S: line 1: !: syntax error: operand expected (error token is "!")`, status 1.
+- curse interp/compiled/tiered: the same line, then `(non-string error)`; static:
+  `…/bash: (error object is not a string)`; status differs. An AFL crash.
+
+## F57. `for NAME in WORDS do` / `select NAME in WORDS do` (no `;`) is accepted
+
+    for i in a do :; done
+    select S in a do :; done
+
+- bash: `syntax error near unexpected token `done'`, status 2.
+- curse (all tiers): runs (`do` is taken as the loop keyword; select prints its menu).
+
+## F58. `$(for i in 1; do break 2; done)`: escaped `attempt to compare number with nil`
+
+    echo $(for i in 1; do break 2; done)
+
+- bash, curse compiled: an empty line.
+- curse interp / tiered / static: `curse:eval:16: attempt to compare number with nil` (the
+  comsub's lifted chunk), status 1. Found inside a `select` word list.
+
+## F59. The `select` menu is always one column
+
+    select x in aaaaaaaaaaaaaa b c d e; do break; done <<< 1
+
+- bash: columns across `COLUMNS` (80): `1) aaaaaaaaaaaaaa  3) c` / `2) b ...`.
+- curse (all tiers): one item per line (runtime select_menu has no print_select_list layout).
+
+## F60. A syntax error inside `<( )` / `>( )` is not a parse error of the script
+
+    cat <(:
+    function f)
+
+- bash: `S: line 2: syntax error near unexpected token `)'`, the script stops (status 2).
+- curse (all tiers): `cat: command not found`, then `line 4: syntax error: unexpected end
+  of file` (the body is parsed when it runs). `$( )` agrees. Probably F47's root.
+
+## F61. Interp/tiered: a missing operand after `?:` is not diagnosed
+
+    echo $(( i ? $v ? 1 : 2 : 3 ))
+    echo $(( 0 ? 1 : a && $a ))x
+
+- bash, curse compiled: `… syntax error: operand expected (error token is "? 1 : 2 : 3 ")` /
+  `(… "&&  ")`, status 1.
+- curse interp / tiered / static: print `3` / `0x`, status 0 (also `$[(FUNCNAME) ? $b : x]`).
+
+## F62. Compiled tier: an arithmetic error in a `for … in` word list names the line of `do`
+
+    for a in $(( 1 ? : 3 ))
+    do echo in; done
+
+- bash and the other tiers: `line 1:`; compiled: `line 2:`.
+
+## F63. `shift x 2`: argument count checked before the numeric check
+
+    shift x 2; echo after $?
+
+- bash: `shift: x: numeric argument required`, `after 1`.
+- curse (all tiers): `shift: too many arguments`, and the script exits.
+
+## F64. A trap handler re-entered from itself: line numbers restart
+
+    trap '((n++ < 1)) && kill -USR1 $$
+    foo' USR1; kill -USR1 $$
+
+- bash: `S: line 2: foo: command not found` twice.
+- curse (all tiers): `line 1:` for the inner run, `line 2:` for the outer.
+
+## F65. A quoted word before `()` is a function definition to bash's parser
+
+    'f'() { echo hi; }; echo st=$?
+    ''()
+
+- bash: `` `'f'': not a valid identifier ``, `st=1`; `''()` → `line 2: syntax error:
+  unexpected end of file`.
+- curse (all tiers): `syntax error near unexpected token `)'`, status 2.
+
+## F66. `${#v[x y]}` with v unset: bash never evaluates the subscript
+
+    echo ${#v[x y]}
+
+- bash: `0`. curse (all tiers): `x y: syntax error in expression (error token is "y")`.
+  With `v=(1)` both give the error.
+
+## F67. Compiled tier: a function definition does not reset `$?`
+
+    false; g () { :; }; echo $?
+
+- bash and the other tiers: `0`; compiled: `1`.
+
+## F68. Compiled tier: an internal name leaks into an arithmetic error
+
+    echo $(( x[ $v < ${#a} ] ))
+
+- bash and the other tiers: `< 0 : syntax error: operand expected (error token is "< 0 ")`.
+- compiled: `… "< __curse_len_a "`.
+
+## F69. `for x >&f`: the unexpected token is `>&`, not `>`
+
+    for x >&f
+
+- bash: `syntax error near unexpected token `>&'`. curse (all tiers): `` `>' ``. Same in eval.
+
+## F70. An unterminated `$[` in a here-document inside `$( )`
+
+    x=$(cat <<EOF
+    $[a[
+    EOF
+    )
+
+- bash: `S: line 4: bad substitution: no closing `]' in $[a[` (the rest of the body echoed).
+- curse (all tiers): an arithmetic error with the body's text: `S: line 4: a[` /
+  `: bad array subscript (error token is "a[` / `")`.
+
+## F71. A redirection error on a multi-line compound names its last line
+
+    for ((;;))
+    do
+    break
+    done {v}>> $a
+
+- bash: `S: line 1: v: ambiguous redirect`. curse (all tiers): `line 4:`.
+
+## F72. `(( BASH_COMMAND ))`: the recursion error's token (and compiled: no line)
+
+    (( BASH_COMMAND ))
+
+- bash: `… expression recursion level exceeded (error token is "BASH_COMMAND ))")`.
+- curse: `(error token is "(( BASH_COMMAND ))")`; compiled also drops `line 1: `. With
+  `!!BASH_COMMAND & $A` curse says `syntax error in expression` instead.
+
+## F73. An arithmetic error in `(( ))` shows `${…}` unexpanded
+
+    b=; (( 2 % (i /= i[${#b}]) ))
+
+- bash: `((: 2 % (i /= i[0]) : division by 0 …`. curse (all tiers): `… i[${#b}]) …`.
+
+## F74. `1 ? (0) ? ~x *= 1 : 2 : 3`: the wrong error
+
+    echo $(( 1 ? (0) ? ~x *= 1 : 2 : 3 ))
+
+- bash: `attempted assignment to non-variable (error token is "*= 1 : 2 : 3 ")`.
+- curse (all tiers): `` `:' expected for conditional expression `` (same token).
+  Same family: `echo $(( ((b) ^ A /= 2) ))` — bash `attempted assignment to non-variable`,
+  curse `` missing `)' ``.
+
+## F75. `$\A` in an arithmetic subscript: bash removes the backslash in the message
+
+    echo $[a[$\A]]
+
+- bash: `$A: syntax error: operand expected (error token is "$A")`. curse: `$\A` both places.
+
+## F76. Compiled tier: a backquote inside `[[ ]]` reports the previous line
+
+    (( 1 ))
+    [[ ( `export -f b[]=` -gt 1 ) ]]
+
+- bash and the other tiers: `S: line 2: export: b[]=: not a function`; compiled: `line 1:`.
+
+## F77. `[[ !(a >| b) ]]`: bash's parse-error wording
+
+    [[ !(a >| b) ]]
+
+- bash: `unexpected token `>|', conditional binary operator expected`, then `syntax error
+  near `|'`. curse (all tiers): `expected `)'`, `syntax error near `b)'`.
+
+## F78. `[[ x -le @(a|b) ]]` without extglob: a parse error in bash
+
+    [[ x -le @(a|b) ]]
+
+- bash: `syntax error in conditional expression: unexpected token `('`, status 2.
+- curse (all tiers): evaluates it: `[[: @(a|b): syntax error: operand expected`.
+
+## F79. Interp/tiered: `break` in a `for` word list's command substitution
+
+    for i in `break -1 b`; do :; done
+
+- bash, curse compiled: `break: too many arguments`.
+- curse interp / tiered / static: `break: only meaningful in a `for', `while', or `until' loop`.
+
+## F80. Two here-documents on one line: the second's EOF warning names line 1
+
+    cat << A << B
+
+- bash: `… here-document at line 1 … (wanted `A')`, then `… at line 2 … (wanted `B')`.
+- curse (all tiers): `at line 1` for both.
+
+## F81. An unterminated quoted here-doc delimiter inside `${v=$( … )}`: the EOF error's line
+
+    echo ${M=$(cat <<"\"
+    x
+    \
+    )}
+
+- bash: `S: line 1: unexpected EOF while looking for matching `"'`.
+- curse (all tiers): `S: line 4: …`.
+
+## F82. `{v}<&10` with fd 10 closed: no error
+
+    {v}<&10; echo st=$?
+
+- bash: `S: line 1: 10: Bad file descriptor` and `S: redirection error: cannot duplicate
+  fd: Bad file descriptor`, `st=1`.
+- curse (all tiers): silent, `st=0`.
+
+## F83. An unterminated `$(` in a here-document body: earlier expansions not run; compiled: line 1
+
+    cat <<F
+    $(nosuch)$(
+
+- bash: runs `$(nosuch)` first (`S: line 1: nosuch: command not found`), then `S: command
+  substitution: line 4: unexpected EOF while looking for matching `)'`, status 127.
+- curse (all tiers): no `nosuch` line, status 1; compiled also says `line 1:` for the EOF.
+
+## F84. Interp/tiered: the DEBUG trap misses a command after an async one
+
+    trap 'echo D' DEBUG; x=1 & wait
+
+- bash, curse compiled: `D` twice.
+- curse interp / tiered / static: once.
+
+## F85. `disown` in a pipeline in a command substitution before a command word (reduced, root open)
+
+    BASH_SOURCE=$(disown|while(())do c;done) p
+
+- bash: only `p: command not found`.
+- curse (all tiers): `disown: current: no such job` first. `x=$(disown | :)` agrees (both
+  print it); reduced by ddmin in the container, not narrowed further.
+
+## F86. `declare -n BASH_ARGV["a b"]=x`: no error for the special array
+
+    declare -n BASH_ARGV["a b"]=x
+
+- bash: `S: line 1: declare: BASH_ARGV[a b]: reference variable cannot be an array`, status 1.
+- curse (all tiers): silent, status 1. (`declare -n A["a b"]=x` agrees.)
+
+## F87. Interp/tiered: a redirection error of a group on the left of `||` loses `line N:`
+
+    { :; } > "$x" || :
+
+- bash, curse compiled: `S: line 1: : No such file or directory`.
+- curse interp / tiered / static: `S: : No such file or directory`.
+
+## Not curse bugs (campaign triage)
+
+- `kill -8 $$` (any crash signal a script sends itself): the harness counts it as a crash.
+- Unwaited `cat <(…) &` / coprocs / `>(read …)` racing the end of the script, the
+  interleaving of `select`'s `#? ` prompt with async stderr, and how many lines an endless
+  loop prints before the 5 s limit: NOISE. The per-exec pid namespace makes bash's
+  `$!`/coproc pids small; cmp.sh masks `coproc [N:` now.
+
+# Fix notes, F31–F52 (fix-fuzz3, merged 494327d)
 
 - F48 FIXED — a "…" inside ${…} nests its own expansions (parse_matched_pair), and a $[…]
   in ${…} is scanned as one, so `"${x%${}"${"}"` is the parse-time EOF error; a ${…}

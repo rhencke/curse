@@ -23,14 +23,14 @@ trap 'rm -rf "$T"' EXIT
 mask() {
   sed -i -E "s#^bash: #S: #; s#^$D/s\.sh: #S: #; s#$D/s\.sh#S#g" "$1"
   sed -i -E '/^FUZZ-ORACLE stderr:|^stack traceback|^\t/d; s/^FUZZ-ORACLE escaped: //; s/^.*(curse\.bundle:[0-9]+: )+//' "$1"
-  sed -i -E 's/[0-9]+m[0-9]+[.,][0-9]+s/T/g; s/[0-9]{4,}/N/g' "$1"
+  sed -i -E 's/[0-9]+m[0-9]+[.,][0-9]+s/T/g; s/coproc \[[0-9]+:/coproc [N:/g; s/[0-9]{4,}/N/g' "$1"
   { grep -avE '^\[[0-9]+\][-+ ] +(Running|Done|Stopped|Terminated|Exit|Killed)' "$1"
     grep -aE '^\[[0-9]+\][-+ ] +(Running|Done|Stopped|Terminated|Exit|Killed)' "$1" | LC_ALL=C sort; } > "$1.m"
   mv "$1.m" "$1"
 }
-run() { # name cmd...
+run() { # name cmd...  (own user+pid namespace: a `kill -9 -1` reaches only that run)
   local n=$1; shift
-  (ulimit -f 2048; exec unshare -Ur timeout -k 2 5 "$@") > "$T/$n.out" 2> "$T/$n.err"
+  (ulimit -f 2048; exec unshare -Urpf --kill-child timeout -k 2 5 "$@") > "$T/$n.out" 2> "$T/$n.err"
   echo $? > "$T/$n.st"
   mask "$T/$n.out"; mask "$T/$n.err"
 }
@@ -57,7 +57,17 @@ if [ -n "$Q" ]; then
   [ -z "$line" ] && line="status $(cat "$T/$m.st") vs $(cat "$T/bash.st")"
   line=$(printf '%s' "$line" | sed -E "s/line [0-9N]+/line L/g; s/\`[^']*'/\`X'/g; s/[0-9]+/N/g" | cut -c1-160)
   case "$bad" in "interp compiled tiered static ") who=all ;; *) who=${bad% } who=${who// /+} ;; esac
-  printf '%s\t%s|%s\n' "${v% }" "$who" "$line"
+  # (every disagreeing run has bash's status and bash's lines, only in another order:
+  # "order-only:" -- the interleaving of async output (jobs, coprocs, process
+  # substitutions, pipeline stages) is scheduling, not semantics; known.tsv buckets it
+  # when the script has such a construct)
+  oo=order-only:
+  for m in $bad; do
+    cmp -s "$T/bash.st" "$T/$m.st" &&
+      cmp -s <(LC_ALL=C sort "$T/bash.out") <(LC_ALL=C sort "$T/$m.out") &&
+      cmp -s <(LC_ALL=C sort "$T/bash.err") <(LC_ALL=C sort "$T/$m.err") || oo=
+  done
+  printf '%s\t%s%s|%s\n' "${v% }" "$oo" "$who" "$line"
   exit 1
 fi
 for m in bash interp compiled tiered static; do

@@ -110,14 +110,15 @@ void __wrap_lua_sethook(lua_State *L, lua_Hook f, int mask, int count)
 }
 
 /* ---- kill guard -------------------------------------------------------------- */
-static pid_t fs_pid;
+static pid_t fs_pid;  /* 0 inside the per-exec pid namespace (run_one): no guard needed */
+static int getenv_ns = 1;
 extern int __real_kill(pid_t, int);
 int __wrap_kill(pid_t pid, int sig)
 {
   /* Under fuzz.sh's pid namespace (in_ns) pids only grow: 1 = the namespace's init, 2 =
    * afl-fuzz, then the forkserver (fs_pid). Everything at or below fs_pid, and its
    * process groups, is off limits; the fuzz child is its own group, so kill 0 is safe. */
-  if (pid == -1 || (fs_pid && ((pid > 0 && pid <= fs_pid) || (pid < 0 && -pid <= fs_pid)))) { errno = EPERM; return -1; }
+  if ((pid == -1 && fs_pid) || (fs_pid && ((pid > 0 && pid <= fs_pid) || (pid < 0 && -pid <= fs_pid)))) { errno = EPERM; return -1; }
   return __real_kill(pid, sig);
 }
 
@@ -255,10 +256,41 @@ static void run_one(const char *sbx, const char *mode)
      * CRASH signal (abort -- our oracle --, SEGV, BUS, ILL, FPE, SYS) is passed on to
      * AFL. A script killing itself (`kill -USR1 $$` with no trap) is bash behaviour,
      * not a curse crash. The worker dies with us when AFL kills us on a timeout. */
-    pid_t w = fork();
+    /* The worker gets a pid namespace of its own, per exec: whatever the script leaves
+     * behind (background jobs, a `/bin/sh` fork bomb, orphans ignoring signals) dies
+     * with the exec instead of piling up in the instance's namespace -- where it would
+     * starve AFL's next fork (RLIMIT_NPROC, the container's pids limit) and burn CPU.
+     * A tiny init (pid 1) runs the worker as pid 2, so the script keeps normal signal
+     * semantics (`kill $$` works; pid 1 would ignore it), and hands back the worker's
+     * wait status through a shared page. The init dies with us (PDEATHSIG), and the
+     * whole namespace with it. */
+    static volatile int *wst;
+    int ns = 0;
+    pid_t w;
+    if (!wst) wst = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (wst != MAP_FAILED && getenv_ns && unshare(CLONE_NEWPID) == 0) ns = 1;
+    w = fork();
+    if (w == 0 && ns) {  /* the namespace's init */
+      pid_t w2;
+      int st2 = 0;
+      prctl(PR_SET_PDEATHSIG, SIGKILL);
+      *wst = -1;
+      w2 = fork();
+      if (w2 > 0) {
+        while (waitpid(w2, &st2, 0) < 0 && errno == EINTR);
+        *wst = st2;
+        _exit(0);  /* (as pid 1: the kernel kills the rest of the namespace) */
+      }
+      if (w2 < 0) _exit(111);
+      fs_pid = 0;  /* (nothing outside this namespace is reachable from here on) */
+    }
     if (w > 0) {
       int st = 0;
       while (waitpid(w, &st, 0) < 0 && errno == EINTR);
+      if (ns) {
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0 && *wst != -1) st = *wst;
+        else if (WIFSIGNALED(st)) st = SIGKILL;  /* (init killed from outside: not a crash) */
+      }
       if (keepout && savederr >= 0) {  /* (the worker's stderr, even when a signal ended it) */
         static char eb[1 << 16]; ssize_t en = pread(errfd, eb, sizeof eb, 0);
         if (en > 0) (void)!write(savederr, eb, en);
@@ -317,6 +349,7 @@ int main(int argc, char **argv)
   keepout = !!getenv("FUZZ_KEEPOUT");
   covdebug = !!getenv("FUZZ_COVDEBUG");
   nooracle = !!getenv("FUZZ_NOORACLE");
+  getenv_ns = !getenv("FUZZ_NO_EXEC_NS");
   sbx_enter(sbx);
   snprintf(pathbuf, sizeof pathbuf, "%s/nobin", sbx);
   snprintf(tmpbuf, sizeof tmpbuf, "%s/tmp", sbx);
