@@ -132,11 +132,13 @@ local DYN_ARR = { "BASH_ARGC", "BASH_ARGV", "BASH_LINENO", "BASH_SOURCE", "DIRST
 -- all_visible_variables (sorted, as vapply's sort_variables), filtered by pred(binding)
 local function var_list(sh, pred)
 	local names = {}
+	local hid = rt.tenv_hide(sh, sh.compgen_tcb) -- (compgen's own prefix bindings aren't listed)
 	for n, b in pairs(sh.vars) do
 		if visible(b) and pred(b, n) then
 			names[#names + 1] = n
 		end
 	end
+	rt.tenv_unhide(sh, hid)
 	local gone = sh.unset_specials or {}
 	for _, n in ipairs(DYN) do
 		if sh.vars[n] == nil and not gone[n] and pred(nil, n) and sh:get(n) ~= "" then
@@ -1409,9 +1411,16 @@ local function compopt(sh, args)
 	sh.status = st
 end
 
-return function(sh, cmd, args, hook)
+return function(sh, cmd, args, hook, tcb)
 	if cmd == "compgen" then
-		return compgen(sh, args, hook)
+		local st = sh.compgen_tcb
+		sh.compgen_tcb = tcb
+		local ok, e = pcall(compgen, sh, args, hook)
+		sh.compgen_tcb = st
+		if not ok then
+			error(e, 0)
+		end
+		return e
 	elseif cmd == "complete" then
 		return complete(sh, args)
 	elseif cmd == "compopt" then

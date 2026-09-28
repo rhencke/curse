@@ -118,6 +118,15 @@ function M.pcline(f, t, name)
 	M.PCLINE[f] = t
 	M.PCNAME[f] = name
 end
+-- the line of a registered pc: a trap handler's (trel) counts from the trapped line
+local function pc_line(sh, t, pc)
+	local ln = t[pc]
+	if ln and ln > 0 and t.trel then
+		return (sh.trap_base or 1) + ln - 1
+	end
+	return ln
+end
+M.pc_line = pc_line
 M.INTERP_FRAMES = setmetatable({}, { __mode = "k" }) -- interp functions that keep sh.cur_line
 M.SRC_FRAMES = setmetatable({}, { __mode = "k" }) -- the calls that set sh.cur_source (a function's, source's)
 -- (second result: the innermost compiled shell function running, if any — its file
@@ -159,7 +168,7 @@ local function current_line(sh)
 		if t then
 			if not line then
 				local _, pc = getlocal(level, 2)
-				local ln = t[pc]
+				local ln = pc_line(sh, t, pc)
 				if ln and ln > 0 then
 					line = ln
 				end
@@ -253,7 +262,7 @@ function M.call_site_line(sh)
 		local t = M.PCLINE[info.func]
 		if t and not M.PCNAME[info.func] then
 			local _, pc = getlocal(level, 2)
-			local ln = t[pc]
+			local ln = pc_line(sh, t, pc)
 			if ln and ln > 0 then
 				line = ln
 			end
@@ -2529,7 +2538,8 @@ function M.job_line(sh)
 		local t = M.PCLINE[f]
 		if t then
 			local _, pc = getlocal(level, 2)
-			return t.jl and t.jl[pc]
+			local l = t.jl and t.jl[pc]
+			return l and t.trel and (sh.trap_base or 1) + l - 1 or l
 		end
 	end
 	local c = sh.cur_cmd
@@ -13639,10 +13649,14 @@ end
 -- for the caller); an INDEXED array arith-evaluates the RAW subscript (empty -> 0). A subscript
 -- arith syntax error (`${a['3']}`) becomes the tier's non-fatal lineabort (interp's experr).
 local SUBSCRIPT_AST = {} -- raw subscript text -> parsed arith (bounded by the program text)
-function M.array_key(sh, name, raw, expanded)
+M.EMPTYSUB = setmetatable({}, { __tostring = function() return "" end }) -- (interp arith_key)
+function M.array_key(sh, name, raw, expanded, inarith)
 	if sh:is_assoc(name) then
 		if type(expanded) == "function" then -- (emit's subscript_word: a side-effecting key)
-			return expanded()
+			expanded = expanded()
+		end
+		if inarith and expanded == "" and raw:find("[$`]") and not raw:find("[\\'\"]") then
+			return M.EMPTYSUB -- (`A[$k]` in arithmetic, k empty: the expanded text reads `A[]`)
 		end
 		return expanded
 	end
@@ -13679,7 +13693,7 @@ function M.array_key(sh, name, raw, expanded)
 		end
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	end
-	return require("interp")._int.arith_key(sh, name, idx, raw)
+	return require("interp")._int.arith_key(sh, name, idx, raw, inarith)
 end
 
 -- Scalar `name+=value` (non-index) for the compiled tier, exactly interp's append path: an
@@ -13967,7 +13981,11 @@ function M.arith_read_elem(sh, name, raw, expanded)
 	if M.arith_badraw(sh, name, raw, "r") then
 		return i64(0)
 	end
-	local key = M.array_key(sh, name, raw, expanded)
+	local key = M.array_key(sh, name, raw, expanded, true)
+	if key == M.EMPTYSUB then
+		M.arith_badraw(sh, name, "", "r")
+		return i64(0)
+	end
 	if M.arith_badkey(sh, name, key, "r") then
 		return i64(0)
 	end
@@ -13998,7 +14016,11 @@ function M.arith_elem_write(sh, name, raw, expanded, read_first, compute)
 	if M.arith_badraw(sh, name, raw, how) then
 		return compute(read_first and i64(0) or nil)
 	end
-	local key = M.array_key(sh, name, raw, expanded)
+	local key = M.array_key(sh, name, raw, expanded, true)
+	if key == M.EMPTYSUB then
+		M.arith_badraw(sh, name, "", how)
+		return compute(read_first and i64(0) or nil)
+	end
 	if M.arith_badkey(sh, name, key, how) then -- (a bad element: 0 is read, nothing stored)
 		return compute(read_first and i64(0) or nil)
 	end
@@ -14015,7 +14037,10 @@ end
 -- OLD value for post or the NEW value for pre.
 function M.arith_elem_incr(sh, name, raw, expanded, delta, is_post)
 	require("interp")._int.arith_nounset(sh, name)
-	local key = not M.arith_badraw(sh, name, raw, "rw") and M.array_key(sh, name, raw, expanded)
+	local key = not M.arith_badraw(sh, name, raw, "rw") and M.array_key(sh, name, raw, expanded, true)
+	if key == M.EMPTYSUB then
+		key = not M.arith_badraw(sh, name, "", "rw")
+	end
 	if not key or M.arith_badkey(sh, name, key, "rw") then -- (a bad element: 0 is read, nothing stored)
 		return is_post and i64(0) or i64(delta)
 	end
@@ -15193,7 +15218,9 @@ function M.builtin_run(sh, argv, hook)
 	if prep then
 		prep(sh)
 	end
-	return M.run_builtin_mod(sh, cmd, argv, hook or _noop)
+	local tcb = sh.tenv_call_base -- (its own prefix bindings start there: exec_simple's tcb)
+	sh.tenv_call_base = nil
+	return M.run_builtin_mod(sh, cmd, argv, hook or _noop, tcb)
 end
 
 -- Does a builtin's own write to a prefix-assigned variable outlive the command? In bash
@@ -15358,7 +15385,8 @@ function M.parse_error_stmt(sh, st, label)
 	if st.line then
 		sh.cur_line = st.line
 		-- (a trap handler's text: its lines count from the line it runs at — run_trap)
-		if sh.trap_lbase and M.TRAP_TAGS[label or sh.perr_label] then
+		if sh.trap_lbase and M.TRAP_TAGS[label or sh.perr_label] and not sh.trap_abs then -- (the
+			-- interpreter's parse of it numbered them so already: trap_abs)
 			sh.cur_line = st.line + sh.trap_lbase - 1
 		end
 	end
@@ -15454,7 +15482,8 @@ function M.eval_run(sh, argv)
 		return
 	end
 	local ln = current_line(sh)
-	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
+	-- (set -v: the code's lines are echoed as the interpreter's reader reaches them)
+	local mod = not sh.opt_v and require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
 	if mod then
 		local sxd, iee = sh.xdepth, sh.ign_ee -- (eval'd commands trace one level deeper: `++ cmd`,
 		sh.xdepth = (sxd or 0) + 1 -- as b_eval; errexit-exempt, -e is cleared for them: M.report_exit)
@@ -15589,20 +15618,20 @@ function M.source_run(sh, argv, line)
 	end
 	local name = argv[j]
 	if not name or (j == 2 and name:match("^%-.")) then
-		return require("b_source")(sh, argv[1], argv, nil, nil) -- usage error: let b_source diagnose
+		return require("b_source")(sh, argv[1], argv, _noop, nil) -- usage error: let b_source diagnose
 	end
 	if sh.opt_r and name:find("/", 1, true) then -- (restricted: b_source refuses it)
-		return require("b_source")(sh, argv[1], argv, nil, nil)
+		return require("b_source")(sh, argv[1], argv, _noop, nil)
 	end
 	local file = M.source_path(sh, name)
 	if Ii.file_test("-d", file) then
-		return require("b_source")(sh, argv[1], argv, nil, nil) -- directory: b_source diagnoses
+		return require("b_source")(sh, argv[1], argv, _noop, nil) -- directory: b_source diagnoses
 	end
 	local f, en, hold = M.open_read(file, false, sh)
 	if not f then -- (b_source diagnoses — this errno, and releases the hold after: a FIFO
 		-- isn't opened twice)
 		sh.source_openerr = { file = file, en = en, hold = hold }
-		local r = require("b_source")(sh, argv[1], argv, nil, nil)
+		local r = require("b_source")(sh, argv[1], argv, _noop, nil)
 		local oe = sh.source_openerr
 		sh.source_openerr = nil
 		if oe then -- (b_source didn't get to it)
@@ -15615,11 +15644,12 @@ function M.source_run(sh, argv, line)
 	-- (a DEBUG/ERR trap reaching into the file: tier compiles its hooks in — trap_mode;
 	-- what its text reads joins the program's: tier.note_text)
 	require("tier").note_text(sh, code)
-	local mod = not M.source_empty(code) and require("tier").try_fragment(code, nil, sh)
+	-- (set -v: the file's lines are echoed as the interpreter's reader reaches them)
+	local mod = not M.source_empty(code) and not sh.opt_v and require("tier").try_fragment(code, nil, sh)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
 		sh.source_preread = { file = file, code = code }
-		return require("b_source")(sh, argv[1], argv, nil, nil)
+		return require("b_source")(sh, argv[1], argv, _noop, nil)
 	end
 	-- Compiled path: swap in the file's positional params, run, restore. `return` in the
 	-- file surfaces as __curse_return (fragment mode) and ends the source; exit/break/
@@ -17413,6 +17443,29 @@ do
 	-- there the command traces under the binding's PS4 after all: find_variable_internal)
 	function M.in_subshell(sh)
 		return sh.subenv or (sh.subdepth or 0) + M.fork_depth > 0
+	end
+	-- A listing builtin (`export`, `declare -p`, `set`, …) run with prefix bindings of its
+	-- own doesn't show them: bash keeps a builtin's temporary environment apart from the
+	-- variables it lists (a named lookup still finds them). tcb: where the command's own
+	-- bindings start on sh.tenv (exec_simple's). Returns what M.tenv_unhide puts back.
+	function M.tenv_hide(sh, tcb)
+		if not tcb or #sh.tenv <= tcb then
+			return nil
+		end
+		local hid = {}
+		for k = #sh.tenv, tcb + 1, -1 do
+			local te = sh.tenv[k]
+			if not te.consumed then
+				hid[#hid + 1] = { te.name, sh.vars[te.name] }
+				sh.vars[te.name] = te.box or nil
+			end
+		end
+		return hid
+	end
+	function M.tenv_unhide(sh, hid)
+		for k = #(hid or {}), 1, -1 do
+			sh.vars[hid[k][1]] = hid[k][2]
+		end
 	end
 	function M.outer_ps4(sh, base)
 		for k = base + 1, #sh.tenv do

@@ -250,6 +250,12 @@ local function scan_program(node, acc)
 	if node.lit == "history" or node.lit == "histexpand" or node.lit == "fc" then
 		acc.lex = acc.lex or "history" -- command history is recorded (and `!` expanded) by the reader
 	end
+	-- (`set -v` in text the program hands to eval/source/a trap: from then on the reader
+	-- echoes the program's own lines too)
+	if node.lit and node.lit:find("set", 1, true) and node.lit:find("%f[%w_]set[ \t]")
+		and (node.lit:find("verbose", 1, true) or node.lit:find("[ \t]%-%a*v")) then
+		acc.lex = acc.lex or "set -v"
+	end
 	if node.lit and node.lit:find("\\#", 1, true) then
 		acc.lex = acc.lex or "prompt \\#" -- a prompt's \# (command number) counts the reader's lines
 	end
@@ -368,7 +374,7 @@ end
 -- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
 local function lineno_expr()
 	if EF.trapline and not EF.cur_infunc then -- (the handler's line k: the trapped line + k-1)
-		local tl = ("((sh.cur_line or 0) + %d)"):format(math.max((EF.cur_line or 1) - 1, 0))
+		local tl = ("((sh.trap_base or sh.cur_line or 0) + %d)"):format(math.max((EF.cur_line or 1) - 1, 0))
 		return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
 			.. ("(sh.ldrift and rt.ldrift_str(sh, %s)) or tostring(%s))"):format(tl, tl)
 	end
@@ -1211,7 +1217,7 @@ emit_value = function(e, lifted)
 	end
 	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
 		if EF.trapline and not EF.cur_infunc then
-			return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.cur_line or 0) + %d))"):format(
+			return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.trap_base or sh.cur_line or 0) + %d))"):format(
 				math.max((EF.cur_line or 1) - 1, 0))
 		end
 		return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or %sLL)"):format(
@@ -2517,7 +2523,7 @@ local function strop_pat_ok(pe)
 	return emit_pattern_glob(pe.arg or "", {}) ~= nil and pexp_literal_arg(pe.arg2)
 end
 function pexp_compilable(pe, quoted)
-	if pe.via_indirect then
+	if pe.via_indirect or pe.posixalt then -- (posixalt: `${!?…}` reads by the posix mode)
 		return false
 	end -- ${!ref} indirection (its own path)
 	if pe.index then
@@ -2649,7 +2655,7 @@ local function indirect_ok(pe)
 	-- Exclude the array-multi indirect forms (${!a[@]-op}, ${!a[*]…}): the name resolves to a
 	-- space-joined list -> "invalid variable name", which raises; inside a compiled subshell the
 	-- fork doesn't contain that lineabort. Rare — delegate them. Scalar / [i] / $N / @ refs compile.
-	return pe.op == "indirect" and pe.index ~= "@" and pe.index ~= "*" and type(pe.name) == "string" and pe.name ~= ""
+	return pe.op == "indirect" and not pe.posixalt and pe.index ~= "@" and pe.index ~= "*" and type(pe.name) == "string" and pe.name ~= ""
 end
 local function array_multi_op(pe)
 	local is_arr = (pe.index == "@" or pe.index == "*") -- ${a[@]OP}: array subscript
@@ -8998,9 +9004,12 @@ assemble = function(cfg, sig, opts)
 	-- pc -> source line, for error-message prefixes (read only on the error path)
 	local fname = sig:match("^local function ([%w_]+)") or sig:match("^([%w_]+) = function")
 		or sig:match("^(__CS%[%d+%]) = function")
-	if fname and cfg.pcline and not (EF.trapline and fname == "run") then -- (a handler's
-		-- errors carry the interrupted line: sh.cur_line, via the INTERP_FRAMES runner)
+	if fname and cfg.pcline then -- (a handler's lines count from the trapped one: trel,
+		-- rt.pc_line adds sh.trap_base)
 		local lt = {}
+		if EF.trapline and fname == "run" then
+			lt[1] = "trel=true"
+		end
 		for p = 0, cfg.npc - 1 do
 			local ln = cfg.pcline[p]
 			if ln and ln > 0 then

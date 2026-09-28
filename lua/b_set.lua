@@ -25,6 +25,7 @@ return function(sh, cmd, args, hook, tcb)
 		if #args == 1 then -- bare `set` (and bare `declare`): all shell variables, sorted by
 			-- name, then — outside posix mode — every function's definition (bash's set_builtin)
 			local names, virt = {}, {}
+			local hid = rt.tenv_hide(sh, tcb) -- (its own prefix bindings aren't listed)
 			for nm in pairs(sh.vars) do
 				names[#names + 1] = nm
 			end
@@ -43,6 +44,7 @@ return function(sh, cmd, args, hook, tcb)
 					sh.out(fmt_set_var(nm, b) .. "\n")
 				end
 			end
+			rt.tenv_unhide(sh, hid)
 			-- then the functions, outside posix mode (print_all_shell_variables)
 			if not sh.opt_posix then
 				names = {}

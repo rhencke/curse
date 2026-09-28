@@ -204,6 +204,7 @@ return function(sh, cmd, args, hook, tcb)
 			if bare then -- (no attribute: bash's `return set_builtin (NULL)`)
 				return require("b_set")(sh, "set", { "set", as = cmd }, hook, tcb) -- (reported as `declare`)
 			end
+			local hid = rt.tenv_hide(sh, tcb) -- (its own prefix bindings aren't listed)
 			local names = {}
 			for nm in pairs(sh.vars) do
 				names[#names + 1] = nm
@@ -233,9 +234,10 @@ return function(sh, cmd, args, hook, tcb)
 			end
 			table.sort(names)
 			sh.bav_nolazy = true -- (a listing isn't a reference: BASH_ARGV/ARGC stay unset — bash)
+			local lok, lerr = pcall(function()
 			for _, nm in ipairs(names) do
 				local box = sh.vars[nm] or virt[nm]
-				if decl_match(nm, box) then
+				if box and decl_match(nm, box) then
 					local d = bare and fmt_set_var(nm, box) or fmt_decl(sh, nm)
 					if d and sh.opt_posix and (cmd == "readonly" or cmd == "export") then
 						-- posix mode lists `readonly [-a|-A] name=value` / `export …` (bash)
@@ -249,6 +251,12 @@ return function(sh, cmd, args, hook, tcb)
 						sh:echo(d)
 					end
 				end
+			end
+			end)
+			rt.tenv_unhide(sh, hid)
+			if not lok then
+				sh.bav_nolazy = nil
+				error(lerr, 0)
 			end
 			sh.bav_nolazy = nil
 			sh.status = 0

@@ -108,7 +108,7 @@ local function builtin(sh, cmd, args, hook, tcb)
 							if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup)
 								rt.jobs_line(sh)
 							end
-							if sh.opt_v and lg.pline then
+							if lg.pline then
 								M.v_echo(sh, src, lg.pline, vst)
 							end
 							if lg.perr then -- syntax error: reported (bash's message), source returns 2
