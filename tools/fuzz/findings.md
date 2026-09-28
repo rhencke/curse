@@ -352,7 +352,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   `v=v; echo ${v:v}` (`expression recursion level exceeded`). `echo ${v:1+}` agrees.
   (byte-level instance; a tier-disagreement found by the equal-sample differential.)
 
-## F31. Interp mode: a recursive function that turns hot mid-recursion loses `BASH_LINENO` frames
+## F53. Interp mode: a recursive function that turns hot mid-recursion loses `BASH_LINENO` frames
 
     h() { r="${BASH_LINENO[*]}"; }
     x=$(:)
@@ -367,7 +367,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - Found by the tier oracle (FUZZ_ORACLE=tiers, interp vs compiled) on test/cases/2492 run
   in the sandbox (no `seq` there: its loops don't run, which leaves the `$(seq …)` alone).
 
-## F32. A process substitution's output leaks into `$( )` when the command isn't found
+## F54. A process substitution's output leaks into `$( )` when the command isn't found
 
     x=$(nosuch <(echo leak)); echo "[$x]"
 
@@ -378,7 +378,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   at top level (`nosuch <(echo leak)`) nothing leaks. Found (tier-oracle host smoke,
   test/cases/2019 in the sandbox: `declare -a arr=($(cat <(echo 1 2)))` with no `cat`).
 
-## F33. Compiled tier: `command not found` inside `$( )` in an assignment names an earlier line
+## F55. Compiled tier: `command not found` inside `$( )` in an assignment names an earlier line
 
     eval 'cat' <(echo x) 2>/dev/null; echo "st=$?"
     declare -a arr=($(cat <(echo 1 2)))
@@ -389,7 +389,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   (the nameref cycle at the end changes how the file compiles). Found by the tier oracle
   (compiled vs interp) on test/cases/2019 in the sandbox (no `cat`).
 
-## F34. Compiled tier: a special builtin's usage error leaves its `2>/dev/null` in place
+## F56. Compiled tier: a special builtin's usage error leaves its `2>/dev/null` in place
 
     shift 1 2 2>/dev/null
     ( nosuch )
@@ -399,7 +399,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   arguments" abandons the line, for the rest of the script. Found by the tier oracle
   (compiled vs interp) on test/cases/1640 in the sandbox.
 
-## F35. Interp / tiered under `set -x`: `[[ $s == "…" ]]` with a quoted high byte fails to match
+## F57. Interp / tiered under `set -x`: `[[ $s == "…" ]]` with a quoted high byte fails to match
 
     s=$'a\x81b'; set -x; [[ $s == "a<0x81>b" ]]; echo $?
 
@@ -410,7 +410,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   it). Found by the tier oracle (interp vs compiled status) on test/cases/2560 run in
   LC_ALL=C.
 
-## F36. `bash -c`: an expansion error in a subshell exits it with 127 instead of 1
+## F58. `bash -c`: an expansion error in a subshell exits it with 127 instead of 1
 
     bash -c '( : ${x?} ); echo "sub=$?"'
 
@@ -419,7 +419,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   subshell. `( : $((1/0)) )` agrees (1). Found while building the targeted fuzzers'
   driver (host smoke); the drivers run as a script file, which doesn't hit it.
 
-## F37. `set -n`: a `time` pipeline still prints its timing report
+## F59. `set -n`: a `time` pipeline still prints its timing report
 
     set -n
     time echo hi
@@ -429,7 +429,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - curse (all tiers): the `real/user/sys` report for the pipeline that didn't run.
   Found by the parse target (host smoke over test/cases: 780-time).
 
-## F38. `set -n`: no "here-document … delimited by end-of-file" warning for a here-doc in `$( )`
+## F60. `set -n`: no "here-document … delimited by end-of-file" warning for a here-doc in `$( )`
 
     set -n
     z=$(cat <<EOF
@@ -441,7 +441,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - curse (all tiers): nothing under `set -n` (without it, the same warning as bash) — the
   `$( )` body is only read when it runs. Found by the parse target (test/cases/2521).
 
-## F39. `declare -f`: `$'…'` in an array literal or a `${…}` operand printed untranslated
+## F61. `declare -f`: `$'…'` in an array literal or a `${…}` operand printed untranslated
 
     f() { a=(x $'t\tu' p$'\0'q); echo "${x-$'a\tb'}"; }; declare -f f
 
@@ -451,7 +451,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   agrees (`'t<TAB>u'`). Found by the deparse target (test/cases 1480, 1950, 2140, 2210,
   2360, 2402, 2474, 2567, 2675).
 
-## F40. `declare -f` drops a literal `$` inside `"${x+"…"}"`
+## F62. `declare -f` drops a literal `$` inside `"${x+"…"}"`
 
     f() { p "${x+"$"}" "${u-"a$"}" "${x+$"t"}"; }; declare -f f
 
@@ -460,7 +460,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
   `f` itself is right: `echo "${x+"$"}"` prints `$`), so re-sourcing the printed function
   changes it. Found by the deparse target (test/cases/2220).
 
-## F41. `declare -f`: other printer differences (deparse target over test/cases; not minimised)
+## F63. `declare -f`: other printer differences (deparse target over test/cases; not minimised)
 
 - `echo d >&4294967297` printed as `echo d 1>&4294967297` (bash: `>&4294967297`) (1910).
 - A brace group / function body ending a line: `};` vs bash's `}` (2180); `for ((i=0; i<1;
