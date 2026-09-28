@@ -29,52 +29,203 @@ end
 
 local deparse_list -- forward: re-print a $(…) body
 
--- A word as bash prints it: its source text, with $'…' decoded into '…' and each $(…)
--- body re-printed. Quote-aware: $' is literal inside "…", nothing is special in '…'.
+-- A word as bash prints it: its source text as parse.y read it (read_token_word and
+-- parse_matched_pair), with the text rewrites that reading does — `$'…'` translated and
+-- each $(…) body re-printed:
+--   - unquoted, `$'…'` becomes '…' and `$"…"` "…"; inside "…" both are literal;
+--   - inside a ${…} / $((…)) / $[…] (a grouping construct), `$'…'` is translated too
+--     (extquote), then single-quoted — unless the group is itself inside "…" and, for a
+--     ${…}, its operator is not a pattern one (# % ^ , / — DOLBRACE_QUOTE/QUOTE2): then the
+--     translated text goes in bare (`"${x-$'a\tb'}"` prints `"${x-a<TAB>b}"`); `$"…"` in a
+--     group becomes "…". A "…" nested in a ${…} is a plain double-quoted string again.
+local DB_OPS = "#%^,~:-=?+/"
+local CUT = {} -- (a word cut short at a translated NUL)
 local function norm_word(s)
-	if not s:find("$", 1, true) then
+	if not s:find("[$<>]") then
 		return s
 	end
-	local out, i, n, indq = {}, 1, #s, false
-	while i <= n do
-		local c = s:sub(i, i)
-		if c == "\\" then
-			out[#out + 1] = s:sub(i, i + 1)
-			i = i + 2
-		elseif c == "`" or c == "'" and not indq then
-			local j = P.quote_end(s, i, c == "`")
-			out[#out + 1] = s:sub(i, j - 1)
-			i = j
-		elseif c == '"' then
-			indq = not indq
-			out[#out + 1] = c
-			i = i + 1
-		elseif c == "$" and s:sub(i + 1, i + 1) == "$" then -- `$$` (read_token_word: one token —
-			out[#out + 1] = "$$" -- `$$'x'` is $$ then 'x', never $'…')
-			i = i + 2
-		elseif c == "$" and s:sub(i + 1, i + 1) == "'" and not indq then
-			local j = P.quote_end(s, i + 1, true)
-			out[#out + 1] = sq(rt.ansi_unescape(s:sub(i + 2, j - 2), true))
-			i = j
-		elseif c == "$" and s:sub(i + 1, i + 1) == '"' and not indq then
-			i = i + 1 -- $"…": the parser drops the $ (the translated text stays double-quoted)
-		elseif c == "$" and s:sub(i + 1, i + 1) == "(" and s:sub(i + 2, i + 2) ~= "(" then
-			local ok, e = pcall(P.scan_cmdsub, s, i + 2)
-			if not ok then
-				P.trap_flow(e)
-			end
-			local body = ok and e and deparse_list(s:sub(i + 2, e - 2))
-			if body then -- (parse_comsub: a space keeps `$( (` from reading as `$((`)
-				out[#out + 1] = (body:sub(1, 1) == "(" and "$( " or "$(") .. body .. ")"
-				i = e
-			else
-				out[#out + 1] = c
-				i = i + 1
-			end
-		else
-			out[#out + 1] = c
-			i = i + 1
+	local out, n = {}, #s
+	local dqpair, group
+	local function put(x)
+		out[#out + 1] = x
+	end
+	local function bq(i) -- a `…` from s[i]: as written
+		local j = P.quote_end(s, i, true)
+		put(s:sub(i, j - 1))
+		return j
+	end
+	-- s[i] is `$`, `<` or `>`, s[i+1] == "(" (not `$((`): parse_comsub's body, re-printed
+	local function comsub(i)
+		local ok, e = pcall(P.scan_cmdsub, s, i + 2)
+		if not ok then
+			P.trap_flow(e)
 		end
+		local body = ok and e and deparse_list(s:sub(i + 2, e - 2))
+		if body then -- (parse_comsub: a space keeps `$( (` from reading as `$((`)
+			put(s:sub(i, i) .. (body:sub(1, 1) == "(" and "( " or "(") .. body .. ")")
+			return e
+		end
+		put(s:sub(i, i))
+		return i + 1
+	end
+	-- a `$` construct at s[i] (s[i] == "$") that nests: returns the index past it, or nil
+	local function dollar(i, dq)
+		local c2 = s:sub(i + 1, i + 1)
+		if c2 == "(" and s:sub(i + 2, i + 2) ~= "(" then
+			return comsub(i)
+		elseif c2 == "(" then
+			put("$(")
+			return group(i + 2, "(", ")", false, dq)
+		elseif c2 == "{" then
+			put("${")
+			return group(i + 2, "{", "}", true, dq)
+		elseif c2 == "[" then
+			put("$[")
+			return group(i + 2, "[", "]", false, dq)
+		end
+		return nil
+	end
+	dqpair = function(i) -- inside "…" (just past the opening quote): through the closing one
+		while i <= n do
+			local c = s:sub(i, i)
+			if c == "\\" then
+				put(s:sub(i, i + 1))
+				i = i + 2
+			elseif c == '"' then
+				put(c)
+				return i + 1
+			elseif c == "`" then
+				i = bq(i)
+			elseif c == "$" and s:sub(i + 1, i + 1) == "$" then
+				put("$$")
+				i = i + 2
+			else
+				local j = c == "$" and dollar(i, true)
+				if j then
+					i = j
+				else
+					put(c)
+					i = i + 1
+				end
+			end
+		end
+		return i
+	end
+	-- a grouping construct's text from s[i] (past its opener) through its closer
+	group = function(i, open, close, dolbrace, dq)
+		local count, st, nread, wasdol = 1, dolbrace and "param" or nil, 0, false
+		while i <= n do
+			local c = s:sub(i, i)
+			nread = nread + 1
+			if st then -- (parse.y's dolbrace_state, advanced by each character read)
+				if st == "param" and nread > 1 and (c == "%" or c == "#" or c == "^" or c == ",") then
+					st = "quote"
+				elseif st == "param" and nread > 1 and c == "/" then
+					st = "quote2"
+				elseif st == "param" and DB_OPS:find(c, 1, true) then
+					st = "op"
+				elseif st == "op" and not DB_OPS:find(c, 1, true) then
+					st = "word"
+				end
+			end
+			if c == "\\" then
+				put(s:sub(i, i + 1))
+				i = i + 2
+				wasdol = false
+			elseif c == close then
+				put(c)
+				i = i + 1
+				count = count - 1
+				if count == 0 then
+					return i
+				end
+				wasdol = false
+			elseif c == open and not dolbrace then -- (P_FIRSTCLOSE: only a `${` nests a ${…})
+				put(c)
+				i = i + 1
+				count = count + 1
+				wasdol = false
+			elseif c == "'" and wasdol then -- $'…': translated here (extquote)
+				out[#out] = nil -- (the `$` put before it)
+				local j = P.quote_end(s, i, true)
+				if not dq or st == "quote" or st == "quote2" then
+					put(sq(rt.ansi_unescape(s:sub(i + 1, j - 2), true)))
+				else -- (bare: a NUL in it ends the WORD's C string — the rest of it is gone)
+					local t = rt.ansi_unescape(s:sub(i + 1, j - 2), "z")
+					local z = t:find("\0", 1, true)
+					put(z and t:sub(1, z - 1) or t)
+					if z then
+						error(CUT, 0)
+					end
+				end
+				i, wasdol = j, false
+			elseif c == "'" then
+				local j = P.quote_end(s, i, false)
+				put(s:sub(i, j - 1))
+				i, wasdol = j, false
+			elseif c == '"' then
+				if wasdol then -- $"…": its (untranslated) text double-quoted
+					out[#out] = nil
+				end
+				put(c)
+				i, wasdol = dqpair(i + 1), false
+			elseif c == "`" then
+				i, wasdol = bq(i), false
+			elseif c == "$" and s:sub(i + 1, i + 1) == "$" then
+				put("$$")
+				i, wasdol = i + 2, false
+			else
+				local j = c == "$" and (dolbrace or s:sub(i + 1, i + 1) == "(") and dollar(i, dq)
+				if j then
+					i, wasdol = j, false
+				else
+					put(c)
+					i, wasdol = i + 1, c == "$"
+				end
+			end
+		end
+		return i
+	end
+	local ok, e = pcall(function()
+		local i = 1
+		while i <= n do
+			local c = s:sub(i, i)
+			if c == "\\" then
+				put(s:sub(i, i + 1))
+				i = i + 2
+			elseif c == "'" then
+				local j = P.quote_end(s, i, false)
+				put(s:sub(i, j - 1))
+				i = j
+			elseif c == "`" then
+				i = bq(i)
+			elseif c == '"' then
+				put(c)
+				i = dqpair(i + 1)
+			elseif c == "$" and s:sub(i + 1, i + 1) == "$" then -- `$$` (read_token_word: one token —
+				put("$$") -- `$$'x'` is $$ then 'x', never $'…')
+				i = i + 2
+			elseif c == "$" and s:sub(i + 1, i + 1) == "'" then
+				local j = P.quote_end(s, i + 1, true)
+				put(sq(rt.ansi_unescape(s:sub(i + 2, j - 2), true)))
+				i = j
+			elseif c == "$" and s:sub(i + 1, i + 1) == '"' then
+				i = i + 1 -- $"…": the parser drops the $ (the translated text stays double-quoted)
+			elseif (c == "<" or c == ">") and s:sub(i + 1, i + 1) == "(" then -- <(…) >(…): as $(…)
+				i = comsub(i)
+			else
+				local j = c == "$" and dollar(i, false)
+				if j then
+					i = j
+				else
+					put(c)
+					i = i + 1
+				end
+			end
+		end
+	end)
+	if not ok and e ~= CUT then
+		error(e, 0)
 	end
 	return table.concat(out)
 end
@@ -102,7 +253,7 @@ local function assign_text(a)
 		if not a.raw then
 			unsupported()
 		end
-		return a.name .. (a.append and "+=" or "=") .. a.raw
+		return a.name .. (a.index and ("[" .. a.index .. "]") or "") .. (a.append and "+=" or "=") .. norm_word(a.raw)
 	end
 	local rhs = a.rhs and wtext(a.rhs) or (a.rhssrc and norm_word(a.rhssrc)) or ""
 	return a.name .. (a.index and ("[" .. a.index .. "]") or "") .. (a.append and "+=" or "=") .. rhs
@@ -155,13 +306,13 @@ conv = function(st)
 		local aa, ai = st.arrayargs, 1
 		for i, w in ipairs(st.words or {}) do
 			while aa and aa[ai] and aa[ai].pos == i do
-				ws[#ws + 1] = aa[ai].src or unsupported()
+				ws[#ws + 1] = aa[ai].src and norm_word(aa[ai].src) or unsupported()
 				ai = ai + 1
 			end
 			ws[#ws + 1] = wtext(w)
 		end
 		while aa and aa[ai] do
-			ws[#ws + 1] = aa[ai].src or unsupported()
+			ws[#ws + 1] = aa[ai].src and norm_word(aa[ai].src) or unsupported()
 			ai = ai + 1
 		end
 		if #ws == 1 and ws[1] == "time" and not st.redirs then
@@ -223,7 +374,7 @@ conv = function(st)
 		end
 		local sl = {}
 		for k = 1, 3 do
-			local s = (st.src[k] or ""):gsub("^%s+", "")
+			local s = (st.src[k] or ""):gsub("^[ \t]+", "") -- (make_arith_for_expr skips blanks only)
 			sl[k] = s == "" and "1" or s -- an empty slot prints as 1 (bash)
 		end
 		c = { k = "arith_for", slots = sl, body = conv_list(st.body) }
@@ -247,7 +398,7 @@ conv = function(st)
 		c = { k = "cond", expr = st.expr }
 	elseif t == "funcdef" then
 		return { k = "funcdef", name = st.name, body = M.fbody(st), fredirs = not st.subbody and st.redirs or nil }
-	elseif t == "noop" then
+	elseif t == "noop" or t == "warn" then -- (a parse-time warning: no command)
 		return nil
 	else
 		unsupported()
@@ -344,8 +495,10 @@ local function print_redir(p, r)
 		local arrow = op == "dup" and ">&" or "<&"
 		if tgt == "-" then
 			cprintf(p, fd .. ">&-") -- (bash prints every close as >&-)
-		elseif tgt:match("^%d+%-?$") then
-			cprintf(p, fd .. arrow .. tgt)
+		elseif tgt:match("^%d+%-?$") and tonumber(tgt:match("^%d+")) <= 2147483647 then
+			-- (a NUMBER token — one that fits an int — is printed as %d: `>&007` is `1>&7`;
+			-- a bigger one is a WORD, printed as written)
+			cprintf(p, fd .. arrow .. string.format("%d", tonumber(tgt:match("^%d+"))) .. (tgt:match("%-$") or ""))
 		else
 			cprintf(p, (op == "dup" and redir_fd(r, 1) or redir_fd(r, 0)) .. arrow .. tgt)
 		end
@@ -419,6 +572,7 @@ local function print_fdef(p, c) -- a function defined inside a printed body
 		print_redirs(p, c.fredirs)
 	else
 		newline(p, "}")
+		p.was_hd = false -- (not printing any here-documents now: the `;` after it prints)
 	end
 end
 
@@ -704,7 +858,7 @@ end
 -- A $(…) body, re-printed as bash's print_comsub does (`a; b`, newlines kept); nil if it
 -- doesn't parse or holds something unprintable (the caller keeps the text as is).
 deparse_list = function(src)
-	local ok, ast = pcall(P.parse, src)
+	local ok, ast = pcall(P.parse, src, nil, nil, nil, nil, nil, nil, nil, nil, true) -- (cs: a $(…) body)
 	if not ok then
 		P.trap_flow(ast)
 	end

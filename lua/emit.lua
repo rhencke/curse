@@ -1853,10 +1853,10 @@ local function compile_cmdsub(...)
 	return unpack(r)
 end
 function compile_cmdsub_inner(src, backtick, lifted, aenv, noalias, posix)
-	local fallback = ("sh:capture_src(%q, %s, %s, %d)"):format(src, tostring(backtick or false),
+	local fallback = ("sh:capture_src(%q, %s, %s, %d)"):format(src, backtick == "late" and '"late"' or tostring(backtick or false),
 		tostring(noalias or false), EF.cur_cline or EF.cur_line or 0)
-	if aenv and aenv.dirty and not noalias then -- (its line changed the alias state first)
-		return fallback
+	if (aenv and aenv.dirty and not noalias) or backtick == "late" then -- (its line changed the
+		return fallback -- alias state first; a `$((`'s text read at expansion: capture_src)
 	end
 	if aenv == nil and not noalias and EF.lm_aenv ~= nil then -- (line mode: the live aliases)
 		if EF.lm_aenv == false then
@@ -9007,9 +9007,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- re-seeds lifted from sh). Once per TOP-LEVEL statement (never in a hot loop body).
 		-- Signal traps are delivered by the async VM hook (lib_cursesig.c), not polled here.
 		local wbs = lifted_flush(cx.lifted)
-		local nxperr = {} -- [k]: the marker of the first syntax error at/after statement k
+		local nxperr = {} -- [k]: the marker of the first syntax error (or parse-time warning) at/after k
 		for k = #stmts, 1, -1 do
-			nxperr[k] = stmts[k].t == "parse_error" and mark[k] or nxperr[k + 1]
+			nxperr[k] = (stmts[k].t == "parse_error" or stmts[k].t == "warn") and mark[k] or nxperr[k + 1]
 		end
 		for k = 1, #stmts do
 			local ff = ffs[k]
@@ -9027,7 +9027,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 			-- rt.jobs_line)
 			local jw = stmts[k].lgstart and ("if sh.jobs_waited or sh.jobs_pending then rt.jobs_line(sh, %s) end; "):format(
 				stmts[k].lgread or "nil") or ""
-			if stmts[k].t == "parse_error" then
+			if stmts[k].t == "parse_error" or stmts[k].t == "warn" then -- (reported under noexec too)
 				cx.blocks[mark[k]] = ("sh._ff = %d; %spc = %d"):format(ff, wbs, cx.stmtPc[k])
 			else
 				cx.blocks[mark[k]] = ("%sif sh.opt_n then pc = %d else sh._ff = %d; %spc = %d end"):format(

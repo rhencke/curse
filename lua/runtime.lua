@@ -3371,6 +3371,13 @@ function M.no_refs(sh, vnames)
 end
 
 function Shell:capture_src(src, backtick, noalias, line0)
+	-- (backtick "late": a `$((`'s text that is no arithmetic, read by bash with the P_ARITH
+	-- scan and so only parsed now, at expansion — its syntax errors are reported as a
+	-- backtick's are, but the body reads as a $(…)'s)
+	local late = backtick == "late"
+	if late then
+		backtick = false
+	end
 	local P = require("parser")
 	local I = require("interp")
 	-- A SYNTAX error in the body: bash makes `$(…)` fatal to the whole containing
@@ -3388,7 +3395,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 		P.mark_tail(parsed.stmts)
 	end
 	if not pok then
-		if backtick then
+		if backtick or late then
 			io.stderr:write("curse: command substitution: " .. tostring(parsed) .. "\n")
 			self.status = 1
 			return ""
@@ -3469,7 +3476,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 				error({ __curse_exit = 1, __curse_lineabort = true }, 0) -- contains the DISCARD)
 			end
 			has_perr = true
-			if backtick then -- (read at expansion time: `NAME: command substitution: line N:`)
+			if backtick or late then -- (read at expansion time: `NAME: command substitution: line N:`)
 				st.plabel = "command substitution"
 			end
 		end
@@ -3484,9 +3491,9 @@ function Shell:capture_src(src, backtick, noalias, line0)
 		if iso and not has_perr then
 			return self:capture_compiled_iso(function(self)
 				return run_compiled(mod, self, nil, true)
-			end, backtick)
+			end, backtick or late)
 		end
-		return self:capture_inproc(backtick, function(self)
+		return self:capture_inproc(backtick or late, function(self)
 			return run_compiled(mod, self, nil, true)
 		end)
 	end
@@ -3525,7 +3532,7 @@ function Shell:capture_src(src, backtick, noalias, line0)
 	end
 	-- Run via exec_list (NOT interp.run): an `exit`/`return` inside $() ends only
 	-- the sub (sets its status), and the parent's EXIT trap must NOT fire here.
-	return self:capture_inproc(backtick, function(self)
+	return self:capture_inproc(backtick or late, function(self)
 		return body(self, function() end)
 	end)
 end
