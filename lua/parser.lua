@@ -145,6 +145,7 @@ local function arith(src, nodefer)
 	-- (`let`'s arguments were already expanded and quote-removed: bash strips nothing
 	-- more — `let 'x="1"+2'` is an error and an assoc_expand_once key keeps its quotes)
 	local qtxt = dtxt -- (the quote-stripped text: what bash's errors show, `1 + '2' `)
+	local noexp = nodefer == "let" and M.let_noexpand -- (see nameSub)
 	-- (nor does any text that is expansion OUTPUT — "strict", "expanded": the quotes a value
 	-- holds are just characters, `e='2**"1"'; $(( $e ))` is an operand-expected error)
 	if nodefer == "let" then
@@ -296,7 +297,15 @@ local function arith(src, nodefer)
 			-- `\`, nested `[ ]` and $( ) ${ } skipped); none -> "bad array subscript" naming the
 			-- text from the name on (`p[++${'k]}]`: the unclosed quote runs past every `]`)
 			local rs = i + 1
-			local j = subscript_close(src, i)
+			local j
+			if noexp and noexp(nm) then
+				-- let's already-expanded text, assoc_expand_once on and NAME an associative
+				-- array: expr_skipsubscript's VA_NOEXPAND — the first `]`, quotes and all
+				-- (`let "++a[80's]"` keys `80's`)
+				j = src:find("]", rs, true)
+			else
+				j = subscript_close(src, i)
+			end
 			if not j then
 				error({ __curse_arith = true, msg = "bad array subscript", tok = src:sub(ns) }, 0)
 			end
@@ -2304,7 +2313,9 @@ do
 	local acache, an = {}, 0
 	local aimpl = arith
 	arith = function(src, nodefer)
-		if type(src) == "string" then
+		-- (not memoized: a let under assoc_expand_once, whose subscripts' extent depends on
+		-- which names are associative arrays — M.let_noexpand)
+		if type(src) == "string" and not (nodefer == "let" and M.let_noexpand) then
 			local key = (nodefer == "expanded" and "\3" or nodefer == "strict" and "\2" or nodefer == "let" and "\4" or nodefer and "\1" or "\0") .. src
 			local hit = acache[key]
 			if hit ~= nil then
