@@ -5579,7 +5579,7 @@ exec_stmt = function(sh, st, hook)
 	end
 	-- `time [-p] pipeline` reserved word: run the pipeline (with its own type/negate
 	-- preserved for errexit), then report elapsed real/user/sys to STDERR like bash.
-	if st.timed then
+	if st.timed and not (sh.opt_n and not sh.opt_i) then -- (noexec: no report either)
 		st.timed = false
 		local r0, c0 = wall_secs(), os.clock()
 		local ok, err = pcall(exec_stmt, sh, st, hook)
@@ -5593,7 +5593,8 @@ exec_stmt = function(sh, st, hook)
 	end
 	-- set -n (noexec): a non-interactive shell reads but does not execute. Once on,
 	-- every later statement (including `set +n`) is skipped — matches bash.
-	if sh.opt_n and not sh.opt_i and t ~= "parse_error" then -- (a syntax error is still reported)
+	if sh.opt_n and not sh.opt_i and t ~= "parse_error" and t ~= "warn" then -- (a syntax error, a
+		-- parse-time warning — a here-document at EOF — is still reported: noexec reads)
 		sh.status = 0
 		return
 	end
