@@ -72,6 +72,9 @@ local function set_opt(sh, field, on)
 	-- bash's posix_initialize (general.c): posix mode turns expand_aliases, inherit_errexit
 	-- and shift_verbose on; leaving it (nothing saved) resets expand_aliases to
 	-- interactive_shell and shift_verbose off (inherit_errexit stays)
+	if field == "opt_v" then -- (set -v / +v: the reader's echo follows it — rt.v_on)
+		sh.vecho = nil
+	end
 	if field == "opt_posix" and not on ~= not was and sh.shopt then
 		local so = sh.shopt
 		if on then
@@ -5583,6 +5586,8 @@ exec_stmt = function(sh, st, hook)
 			-- calls, whose lines count as usual — bash); the interpreter's parse numbered them
 			-- so already (trap_abs), a compiled handler's delegated commands didn't
 			sh.cur_line = sh.trap_abs and ln or sh.trap_base + ln - 1
+			local cl = st.cline or st.line -- (and its $(…) bodies number from there too)
+			sh.cur_cline = sh.trap_abs and cl or sh.trap_base + cl - 1
 		end
 	end
 	if t == "assign" then
@@ -6355,11 +6360,15 @@ run_trap = function(sh, code, tag)
 	-- state): the first run interprets it, so a one-shot EXIT trap never loads the compiler.
 	local seen = trap_seen[code]
 	local mod
-	M.v_echo(sh, code, nil, {}) -- (set -v: the handler's text as it's read)
+	-- (set -v: the handler's lines are echoed as parse_and_execute reads them — a group at a
+	-- time, so a `set -v` in it echoes the rest; the reader's echo state is the parser
+	-- state's, restored when the handler ends — $- keeps the option: rt.v_on)
+	local vst, vsave = {}, rt.v_on(sh)
+	local vtext = rt.v_on(sh) or code:find("%-o%s*verbose") or code:find("%f[%w_]set%f[^%w_][^\n;&|]*%-%a*v")
 	-- (a function the handler defines numbers its lines from the handler's first line, as
 	-- the text is parsed — the interpreter's parse, below; the compiled fragment is keyed by
 	-- the text alone)
-	if seen and not (code:find("%(%s*%)") or code:find("%f[%w_]function%f[^%w_]")) then
+	if seen and not vtext and not (code:find("%(%s*%)") or code:find("%f[%w_]function%f[^%w_]")) then
 		mod = require("tier").try_fragment(code, false, sh, true)
 	elseif not seen then
 		trap_seen_n = trap_seen_n + 1
@@ -6382,6 +6391,14 @@ run_trap = function(sh, code, tag)
 		while k < #stmts do
 			k = k + 1
 			local st = stmts[k]
+			if vtext and st.lgstart and st.line then -- (its group's lines, read before it runs)
+				local nx = k + 1
+				while stmts[nx] and not (stmts[nx].lgstart and stmts[nx].line) do
+					nx = nx + 1
+				end
+				local b0 = sh.trap_base or 1
+				M.v_echo(sh, code, stmts[nx] and (stmts[nx].line - b0) or nil, vst)
+			end
 			exec_stmt(sh, st, function() end)
 			-- a failed eligible command INSIDE a handler fires the ERR trap (bash), but
 			-- NOT the errexit-exit half; in_err_trap keeps the ERR handler from re-firing.
@@ -6413,6 +6430,12 @@ run_trap = function(sh, code, tag)
 			k = k + 1
 		end
 		ok, err = pcall(body)
+	end
+	if vtext and not mod then
+		M.v_echo(sh, code, nil, vst) -- (the rest, read to the end of the text)
+	end
+	if rt.v_on(sh) ~= vsave then
+		sh.vecho = vsave
 	end
 	sh.in_trap = sh.in_trap - 1
 	sh.xdepth = sxd
@@ -6776,7 +6799,7 @@ end
 -- once the parser has read into it — through line UPTO (1-based, relative to TEXT; nil =
 -- all of it). `st` carries what's been echoed.
 local function v_echo(sh, text, upto, st)
-	if not sh.opt_v then -- (the lines read while it's off are behind the reader: a `set -v`
+	if not rt.v_on(sh) then -- (the lines read while it's off are behind the reader: a `set -v`
 		if upto and upto > (st.done or 0) then -- among them doesn't echo itself, bash)
 			st.done = upto
 		end
@@ -6790,7 +6813,30 @@ local function v_echo(sh, text, upto, st)
 	end
 	upto = math.min(upto or #st.lines, #st.lines)
 	for k = st.done + 1, upto do
-		io.stderr:write(st.lines[k], "\n")
+		-- (a line a $( … ) body is read from isn't echoed — see run_history_lines; its
+		-- here-document lines are, and each document again at the substitution's end)
+		local line, hdq = st.lines[k], st.hdq or {}
+		st.hdq = hdq
+		if not P.in_open_cmdsub(table.concat(st.lines, "\n", 1, k - 1) .. "\n") then
+			io.stderr:write(line, "\n")
+		elseif #hdq > 0 then
+			io.stderr:write(line, "\n")
+			st.vdocs = st.vdocs or {}
+			st.vdocs[#st.vdocs + 1] = hdq[1].strip and line:gsub("^\t+", "") or line
+		end
+		if #hdq > 0 then
+			if (hdq[1].strip and line:gsub("^\t+", "") or line) == hdq[1].word then
+				table.remove(hdq, 1)
+			end
+		else
+			for _, d in ipairs(heredoc_opens(line)) do
+				hdq[#hdq + 1] = d
+			end
+		end
+		if st.vdocs and #hdq == 0 and not P.in_open_cmdsub(table.concat(st.lines, "\n", 1, k) .. "\n") then
+			io.stderr:write(table.concat(st.vdocs, "\n"), "\n")
+			st.vdocs = nil
+		end
 	end
 	st.done = math.max(st.done, upto)
 end
@@ -6852,6 +6898,7 @@ end
 local function run_history_lines(sh, text, line1, hook, k)
 	local pos, lnum, n = 1, line1, #text
 	local buf, bufline, st, hdq = {}, line1, {}, {}
+	local vdocs -- (set -v: the here-documents read inside a $( … ), echoed again at its end)
 	local function flush()
 		if #buf == 0 then
 			return
@@ -6874,8 +6921,17 @@ local function run_history_lines(sh, text, line1, hook, k)
 		local e = text:find("\n", pos, true) or (n + 1)
 		local line = text:sub(pos, e - 1)
 		pos = e + 1
-		if sh.opt_v then -- set -v: each input line is echoed as it's read (bash)
-			io.stderr:write(line, "\n")
+		if rt.v_on(sh) then -- set -v: each input line is echoed as it's read (bash) — but not
+			-- one a $( … ) body is read from (parse_comsub: shell_getc echoes nothing while
+			-- shell_eof_token is set), except a here-document's lines there: read_secondary_line
+			-- echoes them, and the substitution's end echoes each document again (as stored)
+			if not (#buf > 0 and P.in_open_cmdsub(table.concat(buf, "\n") .. "\n")) then
+				io.stderr:write(line, "\n")
+			elseif #hdq > 0 then
+				io.stderr:write(line, "\n")
+				vdocs = vdocs or {}
+				vdocs[#vdocs + 1] = hdq[1].strip and line:gsub("^\t+", "") or line
+			end
 		end
 		local this = lnum
 		lnum = lnum + 1
@@ -6887,6 +6943,10 @@ local function run_history_lines(sh, text, line1, hook, k)
 			buf[#buf + 1] = line
 		else
 			lnum = lnum - 1 -- (a discarded line isn't counted: bash's line numbers lag)
+		end
+		if vdocs and #hdq == 0 and not P.in_open_cmdsub(table.concat(buf, "\n") .. "\n") then
+			io.stderr:write(table.concat(vdocs, "\n"), "\n")
+			vdocs = nil
 		end
 		if #hdq == 0 and #buf > 0 and not needs_more(table.concat(buf, "\n")) then
 			flush()

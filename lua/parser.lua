@@ -2412,6 +2412,109 @@ function M.parse_heredoc(body, is_body, aenv, prompt)
 	return { k = "word", parts = parts }
 end
 
+-- set -v: does TEXT (a command being read, through its last complete line) end inside an
+-- open $( … ) / <( … ) / >( … )? bash reads such a body with parse_comsub, whose lines
+-- shell_getc doesn't echo (shell_eof_token set). A quote-aware scan of the top level: '…',
+-- "…", `…`, comments, $(( … )) and here-document bodies are skipped.
+function M.in_open_cmdsub(text)
+	local i, n, hd, wstart = 1, #text, {}, true
+	local function sub_open(k) -- the $( / <( / >( at text[k]: true when it never closes
+		local ok, e = pcall(scan_cmdsub, text, k + 2)
+		if not ok then
+			trap_flow(e)
+			return true, nil
+		end
+		return false, e
+	end
+	while i <= n do
+		local c = text:sub(i, i)
+		local c2 = text:sub(i + 1, i + 1)
+		if c == "\\" then
+			i, wstart = i + 2, false
+		elseif c == "'" then
+			local e = text:find("'", i + 1, true)
+			if not e then
+				return false
+			end
+			i, wstart = e + 1, false
+		elseif c == "`" then
+			local k = i + 1
+			while k <= n and text:sub(k, k) ~= "`" do
+				k = k + (text:sub(k, k) == "\\" and 2 or 1)
+			end
+			if k > n then
+				return false
+			end
+			i, wstart = k + 1, false
+		elseif c == '"' then
+			local k = i + 1
+			while k <= n and text:sub(k, k) ~= '"' do
+				local d = text:sub(k, k)
+				if d == "\\" then
+					k = k + 2
+				elseif d == "$" and text:sub(k + 1, k + 1) == "(" and text:sub(k + 2, k + 2) ~= "(" then
+					local open, e = sub_open(k)
+					if open then
+						return true
+					end
+					k = e
+				else
+					k = k + 1
+				end
+			end
+			if k > n then
+				return false
+			end
+			i, wstart = k + 1, false
+		elseif c == "#" and wstart then
+			i = text:find("\n", i, true) or n + 1
+		elseif c == "\n" then
+			i, wstart = i + 1, true
+			for _, d in ipairs(hd) do -- (the bodies the line opened: text, not syntax)
+				while true do
+					if i > n then
+						return false
+					end
+					local e = text:find("\n", i, true) or n + 1
+					local l = text:sub(i, e - 1)
+					i = e + 1
+					if (d.strip and l:gsub("^\t+", "") or l) == d.word then
+						break
+					end
+				end
+			end
+			hd = {}
+		elseif c == "<" and c2 == "<" and text:sub(i + 2, i + 2) ~= "<" then
+			local k = i + 2
+			local strip = text:sub(k, k) == "-"
+			k = text:match("^[ \t]*()", strip and k + 1 or k)
+			local w = text:match("^[^%s;&|()<>]+", k)
+			if w then
+				hd[#hd + 1] = { word = (w:gsub("[\\'\"]", "")), strip = strip }
+				i = k + #w
+			else
+				i = k
+			end
+			wstart = false
+		elseif c == "$" and c2 == "(" and text:sub(i + 2, i + 2) == "(" then
+			local e = delim_close_x(text, i + 3)
+			if e > n then
+				return false
+			end
+			i, wstart = e + 1, false
+		elseif (c == "$" or c == "<" or c == ">") and c2 == "(" then
+			local open, e = sub_open(i)
+			if open then
+				return true
+			end
+			i, wstart = e, false
+		else
+			wstart = c == " " or c == "\t" or c == ";" or c == "&" or c == "|" or c == "(" or c == ")"
+			i = i + 1
+		end
+	end
+	return false
+end
 -- A here-document body that doesn't parse (parse_heredoc failed): the position of the
 -- top-level $( that never closes, or nil. bash reads the substitution from there to the end
 -- of the body (its error is reported at the here-document's line + 1 + the lines it read).

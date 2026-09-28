@@ -6254,8 +6254,9 @@ local function co_launch(ctx, self, stage_fns, inproc, base, lastpipe, upv)
 				ctx.vpid, ctx.task = g.vpid, t
 				M.vpid_ctx[g.vpid] = ctx
 				-- without job control an async compound command starts with SIGINT ignored
-				-- (execute_in_subshell's setup_async_signals), which `trap` then lists
-				if not (g.simple or g.pipe or sh.opt_m) then
+				-- (execute_in_subshell's setup_async_signals), which `trap` then lists — also a
+				-- compound stage of an async pipeline (`{ trap -p; } | cat &`); a simple one not
+				if not (g.simple or sh.opt_m) and not (g.pipe and t.scmd) then
 					M.iso_save_traps(sh)
 					sh.traps.SIGINT, ctx.igint = "", { [2] = true, [3] = true }
 					-- (listed as a hard-ignored signal only once initialize_terminating_signals
@@ -8677,6 +8678,14 @@ function M.dyn_live(sh, dn)
 end
 do
 local legal_number = M.legal_number -- (bash: legal_number, else 0)
+-- set -v's echo of input as it's read (bash's echo_input_at_read): the option, unless a
+-- trap handler changed it — the parser state its end restored (sh.vecho), $- keeping v
+function M.v_on(sh)
+	if sh.vecho ~= nil then
+		return sh.vecho
+	end
+	return sh.opt_v and true or false
+end
 -- The dynamic scalars' own attributes as `declare -p` lists them ("i": an integer variable)
 M.DYN_SCALAR_ATTR = { BASHPID = "i", HISTCMD = "i", RANDOM = "i", SRANDOM = "i", SECONDS = "i", LINENO = "-",
 	EPOCHSECONDS = "-", EPOCHREALTIME = "-", BASH_SUBSHELL = "-", BASH_COMMAND = "-", BASH_ARGV0 = "-",
@@ -15556,7 +15565,7 @@ function M.eval_run(sh, argv)
 	end
 	local ln = current_line(sh)
 	-- (set -v: the code's lines are echoed as the interpreter's reader reaches them)
-	local mod = not sh.opt_v and require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
+	local mod = not M.v_on(sh) and require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
 	if mod then
 		local sxd, iee = sh.xdepth, sh.ign_ee -- (eval'd commands trace one level deeper: `++ cmd`,
 		sh.xdepth = (sxd or 0) + 1 -- as b_eval; errexit-exempt, -e is cleared for them: M.report_exit)
@@ -15718,7 +15727,7 @@ function M.source_run(sh, argv, line)
 	-- what its text reads joins the program's: tier.note_text)
 	require("tier").note_text(sh, code)
 	-- (set -v: the file's lines are echoed as the interpreter's reader reaches them)
-	local mod = not M.source_empty(code) and not sh.opt_v and require("tier").try_fragment(code, nil, sh)
+	local mod = not M.source_empty(code) and not M.v_on(sh) and require("tier").try_fragment(code, nil, sh)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
 		sh.source_preread = { file = file, code = code }
