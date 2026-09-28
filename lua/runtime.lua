@@ -4424,7 +4424,15 @@ function M.defer_loading(sh, sig)
 	return false
 end
 end
+-- (the hold is the SHELL's: a scheduler task — a background job, a pipeline stage — holds
+-- nothing here, its signals go to task_held anyway (M.defer_signal). Counted in a task, a
+-- job suspended inside its `( … )` or $(…) held the shell's signals meanwhile, and one
+-- abandoned there — its request over, in a daemon worker — held them for good: every
+-- later request's traps never ran, stress sig-wait-storm)
 cap_enter = function()
+	if CO then
+		return
+	end
 	local pid = C.getpid()
 	if cap_pid ~= pid then -- (a forked child starts its own count)
 		cap_pid, cap_depth = pid, 0
@@ -4432,9 +4440,16 @@ cap_enter = function()
 	cap_depth = cap_depth + 1
 end
 cap_leave = function()
-	if cap_pid == C.getpid() and cap_depth > 0 then
+	if not CO and cap_pid == C.getpid() and cap_depth > 0 then
 		cap_depth = cap_depth - 1
 	end
+end
+-- A daemon worker's next request starts with nothing held (whatever a request abandoned).
+function M.sig_hold_reset()
+	cap_depth = 0
+	while C.curse_held_take(0) ~= 0 do -- (HELD)
+	end
+	M.drop_task_held()
 end
 
 
@@ -4550,7 +4565,7 @@ local function iso_undo(sh, ctx)
 			local num = SIGNUM[canon:match("^SIG(.+)$") or ""]
 			if num then
 				if sv.sigtraps and sv.sigtraps[canon] then
-					if sv.traps[canon] == "" then
+					if (sv.traps and sv.traps[canon]) == "" then
 						C.curse_sig_ignore(num)
 					else
 						C.curse_sig_catch(num)
