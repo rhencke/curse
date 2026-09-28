@@ -384,7 +384,7 @@ function M.run_compiled(mod, sh, pc, nested)
 			end
 			lastff = sh._ff
 			rt.posix_arith_fatal(sh, err)
-			rt.line_aborted(sh, not nested and err.__curse_badusage and not sh.opt_c and 2 or 1, pf0) -- (a failed ${x:=w})
+			rt.line_aborted(sh, not nested and err.__curse_badusage and not sh.opt_c and 2 or 1, pf0, err) -- (a failed ${x:=w})
 			local sp = not nested and mod.lgspan and mod.lgspan[sh._ff]
 			if sp then -- (bash's line numbers drift from here: rt.line_drift)
 				rt.line_drift(sh, sp[1], sp[2])

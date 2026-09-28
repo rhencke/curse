@@ -495,6 +495,14 @@ return function(sh, cmd, args, hook, tcb)
 				end
 				local localize = localize and not propagated
 				local nan = isdecl and a:match("^([%a_][%w_]*)")
+				if nref and nan and not plusn and (not localize or a:find("^[%a_][%w_]*%[")) and rt.noassign_live(sh, nan) then
+					-- (`declare -n BASH_ARGV[x]=v`: GROUPS, FUNCNAME, … are arrays — a reference
+					-- can't be one, reported before their noassign is: declare_internal)
+					io.stderr:write("curse: " .. cmd .. ": " .. (a:match("^([^=]-)%+?=") or a)
+						.. ": reference variable cannot be an array\n")
+					allok = false
+					goto continue
+				end
 				if nan and (localize or a:find("=", 1, true)) and rt.noassign_live(sh, nan) then
 					-- (GROUPS, FUNCNAME, …: no local copy, no value — bash's make_local_variable
 					-- reports it; a global declare's value fails silently)

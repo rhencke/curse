@@ -30,5 +30,5 @@ t 'echo a ((1))'
 t 'x=1 ((1))'
 echo "$$(x"; echo "not reached"
 echo "st=$?"
-z="a$$(echo x)b"; [ "$z" = "a$$(echo x)b" ] && echo "extracted $(( ${#z} - ${#$} ))" # (not the pid's digits)
+z="a$$(echo x)b"; [ "$z" = "a$$(echo x)b" ] && echo "extracted $(( ${#z} - ${#$} ))" # (not the pid's digit count: a flake)
 printf 'echo $[ 2 * "3" ]\necho $[ 1 + `\n' > src2701.sh; . ./src2701.sh; echo "source st=$?"; rm -f src2701.sh

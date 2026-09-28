@@ -66,6 +66,7 @@ return function(sh, cmd, args, hook, tcb)
 				-- execute_builtin's exit_immediately_on_error = 0, so a report_error doesn't exit)
 				local iee = sh.ign_ee
 				sh.ign_ee = iee or sh.noerr > 0
+				local sbl = sh.base_line -- (each line group of the text: rt.compound_line)
 				local ok, err = pcall(function()
 					local ln = rt.current_line(sh)
 					local nextf = eval_groups(sh, code, ln) or P.open(code, sh, ln > 0 and ln or nil)
@@ -76,6 +77,7 @@ return function(sh, cmd, args, hook, tcb)
 							require("interp").v_echo(sh, code, nil, vst)
 							break
 						end
+						sh.base_line = lg.eline
 						if sh.jobs_waited or sh.jobs_pending then -- (reading a line: notify_and_cleanup)
 							rt.jobs_line(sh)
 						end
@@ -112,7 +114,7 @@ return function(sh, cmd, args, hook, tcb)
 										error({ __curse_exit = 1 }, 0)
 									end
 									sh.noerr = ne0
-									rt.line_aborted(sh, 1, pf0)
+									rt.line_aborted(sh, 1, pf0, serr)
 									break -- div0/failglob: abort the rest of this line
 								else
 									error(serr)
@@ -122,6 +124,7 @@ return function(sh, cmd, args, hook, tcb)
 					end
 				end)
 				sh.xdepth, sh.cur_cmd, sh.ign_ee = sxd, scc, iee
+				sh.base_line = sbl
 				sh.spb_err = badsyntax and 2 or nil -- (a builtin the code ran flagged its own: not eval's)
 				if not ok then
 					error(err)

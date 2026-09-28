@@ -13,46 +13,46 @@
 # out to be a known bug gets a better line here.
 # (fuzz-docker triage, F31-F79: before the older lines, whose *-fixed patterns are generic
 # bash wording -- F2/F10 would otherwise claim F48/F49/F50 as "variants")
-F53-55	sig	escaped: .*parser:[0-9]+: unexpected EOF while looking for matching
-F53	both	unexpected EOF while looking for matching|operand expected	=\$\(\(\(\)\)\)
-F54	both	unexpected EOF while looking for matching|bad substitution	\$\[\$\{\]
-F55	both	unexpected EOF while looking for matching|bad substitution	\$\{[^}]*/\$\{/\}
-F56	sig	non-string error|error object is not a string
-F58	sig	attempt to compare number with nil
-F57	both	near unexpected token	(for|select) +[A-Za-z_]+ +in [^;&|]* do( |$)
-F59	both	\|N\) 	select 
-F60	both	near unexpected token|unexpected end of file|unexpected EOF while looking	[<>]\([^)]*$
-F61	sig	^interp\+tiered\+static\|.*(operand|expression) expected
-F61	sig	\?.*: syntax error: operand expected
+F53-55	sig-fixed	escaped: .*parser:[0-9]+: unexpected EOF while looking for matching
+F53	both-fixed	unexpected EOF while looking for matching|operand expected	=\$\(\(\(\)\)\)
+F54	both-fixed	unexpected EOF while looking for matching|bad substitution	\$\[\$\{\]
+F55	both-fixed	unexpected EOF while looking for matching|bad substitution	\$\{[^}]*/\$\{/\}
+F56	sig-fixed	non-string error|error object is not a string
+F58	sig-fixed	attempt to compare number with nil
+F57	both-fixed	near unexpected token	(for|select) +[A-Za-z_]+ +in [^;&|]* do( |$)
+F59	both-fixed	\|N\) 	select 
+F60	both-fixed	near unexpected token|unexpected end of file|unexpected EOF while looking	[<>]\([^)]*$
+F61	sig-fixed	^interp\+tiered\+static\|.*(operand|expression) expected
+F61	sig-fixed	\?.*: syntax error: operand expected
 F36	sig-fixed	\? [^:]*:  : expression expected
-F62	both	^compiled\|	for [A-Za-z_]+ in [^;]*\$\(\(
-F63	sig	shift: .*numeric argument required|shift: too many arguments
-F64	src	trap '[^']*kill -[A-Z0-9]+ \$\$
-F65	both	near unexpected token|unexpected end of file|not a valid identifier	['"][^'" ]*['"][^ ()]*\(\)
-F66	both	syntax error in expression	\$\{#[A-Za-z_]+\[[^]]* [^]]*\]\}
-F67	both	^compiled\|stdout	\(\) *\{
-F68	sig	__curse_
-F68	both	^compiled\|.*operand expected	\$\{#[A-Za-z_]
-F69	both	near unexpected token	for [^;&|]*>&
-F70	both	bad substitution: no closing .X' in	<<
-F71	both	ambiguous redirect	^ *done .*[<>]
-F72	sig	BASH_COMMAND
-F73	both	\(\(: 	\(\([^)]*\$\{
-F74	sig	attempted assignment to non-variable
-F80	both	here-document at line	<<[^<]*<<
-F82	both	redirection error: cannot duplicate fd|Bad file descriptor	\{[A-Za-z_]+\}[<>]&[0-9]
-F83	both	command substitution: line|command not found	\$\([^)]*\)\$\($
-F83	src	# \(PS4 prefix, quoting, \$\(
-F86	both	reference variable cannot be an array	declare -n BASH_[A-Z]+\[
-F87	both	^interp\+tiered\+static\|.*No such file or directory	\} *>
-F84	both	^interp\+tiered\+static\|stdout	trap [^;]* DEBUG
-F85	both	disown: current: no such job	\$\([^)]*disown
-F81	both	unexpected EOF while looking for matching	\$\{[^}]*\$\(.*<<
-F75	both	operand expected	\$\\[A-Za-z]
-F76	both	^compiled\|	`
-F77	sig	conditional binary operator expected
-F78	sig	syntax error in conditional expression: unexpected token
-F79	sig	break: too many arguments
+F62	both-fixed	^compiled\|	for [A-Za-z_]+ in [^;]*\$\(\(
+F63	sig-fixed	shift: .*numeric argument required|shift: too many arguments
+F64	src-fixed	trap '[^']*kill -[A-Z0-9]+ \$\$
+F65	both-fixed	near unexpected token|unexpected end of file|not a valid identifier	['"][^'" ]*['"][^ ()]*\(\)
+F66	both-fixed	syntax error in expression	\$\{#[A-Za-z_]+\[[^]]* [^]]*\]\}
+F67	both-fixed	^compiled\|stdout	\(\) *\{
+F68	sig-fixed	__curse_
+F68	both-fixed	^compiled\|.*operand expected	\$\{#[A-Za-z_]
+F69	both-fixed	near unexpected token	for [^;&|]*>&
+F70	both-fixed	bad substitution: no closing .X' in	<<
+F71	both-fixed	ambiguous redirect	^ *done .*[<>]
+F72	sig-fixed	BASH_COMMAND
+F73	both-fixed	\(\(: 	\(\([^)]*\$\{
+F74	sig-fixed	attempted assignment to non-variable
+F80	both-fixed	here-document at line	<<[^<]*<<
+F82	both-fixed	redirection error: cannot duplicate fd|Bad file descriptor	\{[A-Za-z_]+\}[<>]&[0-9]
+F83	both-fixed	command substitution: line|command not found	\$\([^)]*\)\$\($
+F83	src-fixed	# \(PS4 prefix, quoting, \$\(
+F86	both-fixed	reference variable cannot be an array	declare -n BASH_[A-Z]+\[
+F87	both-fixed	^interp\+tiered\+static\|.*No such file or directory	\} *>
+F84	both-fixed	^interp\+tiered\+static\|stdout	trap [^;]* DEBUG
+F85	both-fixed	disown: current: no such job	\$\([^)]*disown
+F81	both-fixed	unexpected EOF while looking for matching	\$\{[^}]*\$\(.*<<
+F75	both-fixed	operand expected	\$\\[A-Za-z]
+F76	both-fixed	^compiled\|	`
+F77	sig-fixed	conditional binary operator expected
+F78	sig-fixed	syntax error in conditional expression: unexpected token
+F79	sig-fixed	break: too many arguments
 F37	sig-fixed	\\\[[^]]*\\\]
 NOISE	both	crash signal, no oracle message	kill -(s )?(0?[4678]|11|31|ABRT|SEGV|BUS|FPE|ILL|SYS)([^0-9]|$)
 NOISE	src	cat <\(seq 3; sleep 0\.1\)|echo fork[^&]*&|(^|[;&|{ ])coproc 
@@ -119,5 +119,27 @@ F26	sig-fixed	\[\\\[:
 F2	sig-fixed	unexpected EOF while looking for matching
 F11	sig-fixed	^all\|status N vs N
 F10	sig-fixed	near unexpected token `X'.*
+F88	both	^tiers:compiled:out	BASH_LINENO
+F89	both	command not found	\$\([^)]*<\(
+F90	both	^tiers:compiled:err\|< S: line N: .*command not found	(declare|typeset|local) -n
+F91	both	^tiers:compiled:err	(shift|return|break|continue|exit|set|shopt|unset|readonly|export)( [^;&|]*)? [^;&|]* 2>
+F92	both	^tiers:.*status	[^[:print:][:space:]]
+F94	both	^target:(de)?parse:	(^|[;&|{( \t])time[ \t]
+F95	both	^target:(de)?parse:.*here-document	<<
+F96	both	^target:deparse:	\$'
+F97	both	^target:deparse:	\$\{[^}]*"[^"]*\$"
+F99	sig	^target:arith:.*operand expected.*\|> .*operand expected
+F100	sig	^target:arith:.*bad array subscript\|> .*bad array subscript
+F101	both	^target:arith:	"
+F104	both	^target:arith:	\x0c
+F106	sig	escaped: .*b_eval.*parser:[0-9]+: unexpected EOF
+F107	both	^target:pexp:	\$\{[^}]*:[^}]*\$[@*]
+F109	both	^target:printf:	%[^a-zA-Z%]*\.-
+F110	both	^target:glob:	[@*+?!]\(
+F112	both	^target:read:	-N
+F115	both	^target:regex:	^l 
+F116	sig	^target:(de)?parse:.*\|> parse=N
+F117	sig	^target:(de)?parse:.*unexpected token
+F118	both	^target:pexp:output\|< S: line N: X: bad array subscript	\[-[0-9]
 NOISE	src	`set`|\$\(set\)|\$\{?BASH\}?([^_A-Za-z0-9]|$)|^[ \t]*(set|declare|typeset|readonly|export)( -p)?[ \t]*$
 NOISE	src	RANDOM|SRANDOM|EPOCH|BASHPID|SECONDS|\btimes\b|\bjobs\b|\$!|%[0-9%+-]|\bwait -n

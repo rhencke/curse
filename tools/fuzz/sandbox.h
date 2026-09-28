@@ -1,6 +1,6 @@
 /* Sandbox shared by the AFL harness and the triage runner (sbx).
  * Needs to run as root inside a user namespace (`unshare -Ur ...`): makes a private
- * mount namespace, turns the WHOLE mount tree read-only (a fuzzed `> /some/path`
+ * mount namespace (and network namespace), turns the WHOLE mount tree read-only (a fuzzed `> /some/path`
  * gets EROFS), mounts a small tmpfs on DIR (the only writable place), and makes
  * DIR/w (the script's cwd), DIR/tmp ($TMPDIR: the shells' own temp files -- with / read-only
  * and no writable $TMPDIR, curse and bash both fall back to other code paths) and
@@ -33,7 +33,8 @@ static void sbx_enter(const char *dir)
 {
   struct mount_attr ma;
   char p[4096];
-  if (unshare(CLONE_NEWNS) != 0) sbx_die("unshare(CLONE_NEWNS) (run under `unshare -Ur`)");
+  /* (a network namespace of its own too: nothing fuzzed reaches a network, /dev/tcp included) */
+  if (unshare(CLONE_NEWNS | CLONE_NEWNET) != 0) sbx_die("unshare(CLONE_NEWNS|CLONE_NEWNET) (run under `unshare -Ur`)");
   if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) sbx_die("make-rprivate");
   memset(&ma, 0, sizeof ma);
   ma.attr_set = MOUNT_ATTR_RDONLY;

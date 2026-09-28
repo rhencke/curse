@@ -240,7 +240,9 @@ if [ "${1:-}" = --run-unit ]; then
     for ((k = 0; k < ${#A[@]}; k++)); do
       if [ "${A[k]}" = "${B[k]}" ]; then [ "${C[k]}" = "${A[k]}" ] || return 1
       else
-        [ "${A[k]//+([0-9])/N}" = "${B[k]//+([0-9])/N}" ] && [ "${C[k]//+([0-9])/N}" = "${A[k]//+([0-9])/N}" ] || return 1
+        # (blanks before a digit run go with it: a job report pads its pid to 5 columns —
+        # ` 8080 Hangup` against `10060 Hangup`, a pid of another width)
+        [ "${A[k]//*( )+([0-9])/N}" = "${B[k]//*( )+([0-9])/N}" ] && [ "${C[k]//*( )+([0-9])/N}" = "${A[k]//*( )+([0-9])/N}" ] || return 1
       fi
     done
   }
