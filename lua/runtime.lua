@@ -4411,7 +4411,7 @@ local SUB_KEEP = { "hashpath", "tcwd", "random_plain", "shellopts_exported", "ar
 	"sec_int", "sec_cell", "start_time", "_sy",
 	"subsh_off", "hosts", "nparams", "params", "getopts_state", "complete", "savedstack", "tenv" }
 local SUB_COPY = { "shopt", "functions", "dirstack", "hashcache", "bav", "fn_ro", "unset_specials",
-	"disabled_builtins" }
+	"disabled_builtins", "dynlast" }
 -- sub_save(self, copy) -> the saved values (SUB_COPY's then replaced by copy(v)) and
 -- sub_put(self, saved), compiled from the two lists so each field is a constant-key access
 -- (the JIT's fast path; a subshell per loop iteration is common), not a loop over names.
@@ -10081,6 +10081,7 @@ function M.dyn_assign(sh, dn, s, b)
 			error(v, 0)
 		end
 		M.random_seed(sh, tonumber(v))
+		M.dyn_note(sh, "RANDOM", i64_to_str(i64(v))) -- (set_int_value: the seed is its value)
 	elseif k == "seconds" then
 		-- (assign_seconds: SECONDS is an integer variable once it has been READ — get_seconds'
 		-- set_int_value(…, 1) — or given -i, and then the value is evalexp'd: an overflowing
@@ -10101,6 +10102,7 @@ function M.dyn_assign(sh, dn, s, b)
 		end
 		sh.sec_off, sh.start_time = i64(n), os.time()
 		sh.sec_cell = i64_to_str(sh.sec_off) -- (set_int_value: value_cell, what += appends to)
+		M.dyn_note(sh, "SECONDS", sh.sec_cell)
 	elseif k == "subshell" then -- (assign_subshell: subshell_environment's level — legal_number'd,
 		-- an integer BASH_SUBSHELL too: `declare -i BASH_SUBSHELL; BASH_SUBSHELL=2+3` is 0)
 		local n = legal_number(s) or 0
@@ -10111,7 +10113,60 @@ function M.dyn_assign(sh, dn, s, b)
 	return true
 end
 end
+-- The dynamic scalars' value cells: bash's getters store each value they compute in the
+-- variable (set_int_value / set_string_value), so a listing — `set`, `declare -p` with no
+-- names — shows the LAST value read, and one never read is listed with no value (`declare
+-- -i RANDOM`) or not at all (`set`). sh.dynlast[name] holds that last value.
+do -- (a block of its own: the main chunk is at LuaJIT's 200-local limit)
+local DYN_NOTE = { BASHPID = true, HISTCMD = true, RANDOM = true, SRANDOM = true, SECONDS = true,
+	LINENO = true, EPOCHSECONDS = true, EPOCHREALTIME = true, BASH_SUBSHELL = true, BASH_COMMAND = true,
+	BASH_ARGV0 = true }
+M.DYN_NOTE = DYN_NOTE
+function M.dyn_note(sh, name, v)
+	local d = sh.dynlast
+	if not d then
+		d = {}
+		sh.dynlast = d
+	end
+	d[name] = v
+	return v
+end
+local special_get0
 function Shell:special_get(name)
+	local v = special_get0(self, name)
+	if DYN_NOTE[name] then
+		local d = self.dynlast
+		if not d then
+			d = {}
+			self.dynlast = d
+		end
+		d[name] = v
+	end
+	return v
+end
+-- A dynamic scalar as a variable listing shows it: its last value (nil: never read), and
+-- its attribute letters (SECONDS is -i once read). Constant ones (OSTYPE…) always have one.
+-- Is dynamic scalar `name` still dynamic, with no value stored as an ordinary variable's?
+function M.dyn_unstored(sh, name)
+	local b = sh.vars[name]
+	return (b == nil or (b.dyn and b.s == nil and b.n == nil and not b.arr))
+		and not (sh.unset_specials and sh.unset_specials[name]) and not (name == "RANDOM" and sh.random_plain)
+end
+function M.dyn_listed(sh, name)
+	local v = sh.dynlast and sh.dynlast[name]
+	if not DYN_NOTE[name] then
+		v = special_get0(sh, name)
+	end
+	if type(v) == "cdata" then
+		v = i64_to_str(v)
+	end
+	local fl = M.DYN_SCALAR_ATTR[name]
+	if name == "SECONDS" and v == nil and not sh.sec_int then
+		fl = "-"
+	end
+	return v, fl
+end
+function special_get0(self, name)
 	-- the one-char specials as the BASE of an operator form (${?:-x} ${$:+y} ${-+z} ${!-w});
 	-- the bare $? $$ $- $! go through their own dedicated nodes
 	if name == "?" then
@@ -10188,8 +10243,7 @@ function Shell:special_get(name)
 	-- the last argument, $DIRSTACK the cwd)
 	if (name == "GROUPS" or name == "BASH_ARGV" or name == "BASH_ARGC" or name == "DIRSTACK")
 		and M.virt_live(self, name) then
-		local a = name == "GROUPS" and self:groups_array() or name == "DIRSTACK" and self:dirstack_array()
-			or name == "BASH_ARGV" and self:bash_argv_array() or self:bash_argc_array()
+		local a = M.virt_arr_read(self, name)
 		return a[1] or ""
 	end
 	if name == "BASH_SOURCE" then
@@ -10245,6 +10299,7 @@ function Shell:special_get(name)
 		return tostring((self.hist_base or 1) + #(self.history or {}) - 1)
 	end
 	return ""
+end
 end
 
 -- Follow nameref (declare -n) chains to the effective variable name. A nameref
@@ -11863,9 +11918,45 @@ local VIRT_ARR = {
 	BASH_LINENO = "bash_lineno_array",
 	DIRSTACK = "dirstack_array",
 }
+-- A read of a dynamic array: GROUPS and DIRSTACK keep the value it computes (their
+-- get_groupset / get_dirstack assign the variable — what `set` lists afterwards)
+local function virt_read(self, name)
+	local a = self[VIRT_ARR[name]](self)
+	if name == "GROUPS" or name == "DIRSTACK" then
+		local c = {}
+		for i = 1, #a do
+			c[i] = a[i]
+		end
+		M.dyn_note(self, name, c)
+	end
+	return a
+end
+M.VIRT_ARR = VIRT_ARR
+M.virt_arr_read = virt_read
+-- A dynamic array as `set` lists it (0-based, as a box's arr): nil when bash shows none —
+-- FUNCNAME outside a function, one unset or shadowed by a variable
+function M.virt_listed(sh, name)
+	if sh.vars[name] ~= nil or not M.virt_live(sh, name) then
+		return nil
+	end
+	local a
+	if name == "GROUPS" or name == "DIRSTACK" then
+		a = sh.dynlast and sh.dynlast[name] or {}
+	else
+		a = sh[VIRT_ARR[name]](sh)
+		if name == "FUNCNAME" and #a == 0 then
+			return nil
+		end
+	end
+	local arr = {}
+	for i = 1, #a do
+		arr[i - 1] = a[i]
+	end
+	return arr
+end
 function Shell:array_get(name, key)
 	if VIRT_ARR[name] and M.virt_live(self, name) then
-		return self[VIRT_ARR[name]](self)[(tonumber(key) or 0) + 1] or ""
+		return virt_read(self, name)[(tonumber(key) or 0) + 1] or ""
 	end
 	local b = self.vars[self:deref(name)]
 	if b and b.arr then
@@ -12081,7 +12172,7 @@ end
 
 function Shell:array_indices(name)
 	if VIRT_ARR[name] and M.virt_live(self, name) then
-		local a = self[VIRT_ARR[name]](self)
+		local a = virt_read(self, name)
 		local t = {}
 		for i = 1, #a do
 			t[i] = i - 1
@@ -12166,7 +12257,7 @@ function M.assoc_keys(b)
 end
 function Shell:array_values(name)
 	if VIRT_ARR[name] and M.virt_live(self, name) then
-		return self[VIRT_ARR[name]](self)
+		return virt_read(self, name)
 	end
 	local idx = self:array_indices(name)
 	local t = {}

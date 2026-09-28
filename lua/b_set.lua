@@ -37,9 +37,30 @@ return function(sh, cmd, args, hook, tcb)
 					names[#names + 1] = nm
 				end
 			end
+			-- …and the dynamic arrays (rt.virt_listed)
+			local sbn = sh.bav_nolazy
+			sh.bav_nolazy = true -- (a listing isn't a reference: BASH_ARGV/ARGC stay unbuilt)
+			for nm in pairs(rt.VIRT_ARR) do
+				local arr = rt.virt_listed(sh, nm)
+				if arr then
+					names[#names + 1] = nm
+					virt[nm] = { arr = arr }
+				end
+			end
+			sh.bav_nolazy = sbn
+			-- …and the dynamic scalars that have a value: the last one read (rt.dyn_listed)
+			for nm in pairs(rt.DYN_SCALAR_ATTR) do
+				local v = rt.dyn_unstored(sh, nm) and rt.dyn_listed(sh, nm)
+				if v then
+					if sh.vars[nm] == nil then
+						names[#names + 1] = nm
+					end
+					virt[nm] = { s = v }
+				end
+			end
 			table.sort(names)
 			for _, nm in ipairs(names) do
-				local b = sh.vars[nm] or virt[nm]
+				local b = virt[nm] or sh.vars[nm]
 				-- (a declared-but-never-assigned array isn't listed either)
 				if b and not (b.s == nil and b.n == nil and b.arr == nil) and not (b.empty_decl and b.arr and next(b.arr) == nil) then
 					sh.out(fmt_set_var(nm, b) .. "\n")

@@ -419,15 +419,16 @@ end
 -- magic it is an ordinary variable (bash), as is a function's plain `local LINENO`
 -- (a trap handler's own commands keep the line of the command it interrupted — interp's
 -- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
+-- (rt.dyn_note: the value read is LINENO's value cell — what `set` lists afterwards)
 local function lineno_expr()
 	if EF.trapline and not EF.cur_infunc then -- (the handler's line k: the trapped line + k-1)
 		local tl = ("((sh.trap_base or sh.cur_line or 0) + %d)"):format(math.max((EF.cur_line or 1) - 1, 0))
-		return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
-			.. ("(sh.ldrift and rt.ldrift_str(sh, %s)) or tostring(%s))"):format(tl, tl)
+		return "rt.dyn_note(sh, 'LINENO', ((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
+			.. ("(sh.ldrift and rt.ldrift_str(sh, %s)) or tostring(%s)))"):format(tl, tl)
 	end
 	-- (sh.ldrift: bash's lines drifted after a discarded command — rt.line_drift)
-	return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
-		.. "(sh.ldrift and rt.ldrift_str(sh, %d)) or %q)"):format(EF.cur_line or 0, tostring(EF.cur_line or 0))
+	return ("rt.dyn_note(sh, 'LINENO', ((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
+		.. "(sh.ldrift and rt.ldrift_str(sh, %d)) or %q))"):format(EF.cur_line or 0, tostring(EF.cur_line or 0))
 end
 -- A non-literal command word (`c=unset; $c f`) or an `unset` passed on as an argument
 -- (`run unset f`, to a function that runs "$@") may unset any literal name after it too.
@@ -1380,10 +1381,10 @@ emit_value = function(e, lifted)
 	end
 	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
 		if EF.trapline and not EF.cur_infunc then
-			return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.trap_base or sh.cur_line or 0) + %d))"):format(
+			return ("rt.dyn_note(sh, 'LINENO', ((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.trap_base or sh.cur_line or 0) + %d)))"):format(
 				math.max((EF.cur_line or 1) - 1, 0))
 		end
-		return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or %sLL)"):format(
+		return ("rt.dyn_note(sh, 'LINENO', ((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or %sLL))"):format(
 			tostring(EF.cur_line or 0))
 	end
 	if k == "var" and e.idxraw then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
