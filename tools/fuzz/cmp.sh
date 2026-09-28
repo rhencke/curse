@@ -23,7 +23,7 @@ trap 'rm -rf "$T"' EXIT
 mask() {
   sed -i -E "s#^bash: #S: #; s#^$D/s\.sh: #S: #; s#$D/s\.sh#S#g" "$1"
   sed -i -E '/^FUZZ-ORACLE stderr:|^stack traceback|^\t/d; s/^FUZZ-ORACLE escaped: //; s/^.*(curse\.bundle:[0-9]+: )+//' "$1"
-  sed -i -E 's/[0-9]+m[0-9]+[.,][0-9]+s/T/g; s/[0-9]{4,}/N/g' "$1"
+  sed -i -E 's/[0-9]+m[0-9]+[.,][0-9]+s/T/g; s/coproc \[[0-9]+:/coproc [N:/g; s/[0-9]{4,}/N/g' "$1"
   { grep -avE '^\[[0-9]+\][-+ ] +(Running|Done|Stopped|Terminated|Exit|Killed)' "$1"
     grep -aE '^\[[0-9]+\][-+ ] +(Running|Done|Stopped|Terminated|Exit|Killed)' "$1" | LC_ALL=C sort; } > "$1.m"
   mv "$1.m" "$1"

@@ -11,10 +11,54 @@
 # IDs are tools/fuzz/findings.md entries; UB/NOISE are not curse bugs (docs/bash-ub.md class,
 # or nondeterminism the masks don't cover). Heuristic by nature: a NEW bucket that turns
 # out to be a known bug gets a better line here.
-# (fuzz-docker triage, F31-F52: before the older lines, whose *-fixed patterns are generic
+# (fuzz-docker triage, F31-F79: before the older lines, whose *-fixed patterns are generic
 # bash wording -- F2/F10 would otherwise claim F48/F49/F50 as "variants")
+F53-55	sig	escaped: .*parser:[0-9]+: unexpected EOF while looking for matching
+F53	both	unexpected EOF while looking for matching|operand expected	=\$\(\(\(\)\)\)
+F54	both	unexpected EOF while looking for matching|bad substitution	\$\[\$\{\]
+F55	both	unexpected EOF while looking for matching|bad substitution	\$\{[^}]*/\$\{/\}
+F56	sig	non-string error|error object is not a string
+F58	sig	attempt to compare number with nil
+F57	both	near unexpected token	(for|select) +[A-Za-z_]+ +in [^;&|]* do( |$)
+F59	both	\|N\) 	select 
+F60	both	near unexpected token|unexpected end of file|unexpected EOF while looking	[<>]\([^)]*$
+F61	sig	^interp\+tiered\+static\|.*(operand|expression) expected
+F61	sig	\?.*: syntax error: operand expected
+F36	sig	\? [^:]*:  : expression expected
+F62	both	^compiled\|	for [A-Za-z_]+ in [^;]*\$\(\(
+F63	sig	shift: .*numeric argument required|shift: too many arguments
+F64	src	trap '[^']*kill -[A-Z0-9]+ \$\$
+F65	both	near unexpected token|unexpected end of file|not a valid identifier	['"][^'" ]*['"][^ ()]*\(\)
+F66	both	syntax error in expression	\$\{#[A-Za-z_]+\[[^]]* [^]]*\]\}
+F67	both	^compiled\|stdout	\(\) *\{
+F68	sig	__curse_
+F68	both	^compiled\|.*operand expected	\$\{#[A-Za-z_]
+F69	both	near unexpected token	for [^;&|]*>&
+F70	both	bad substitution: no closing .X' in	<<
+F71	both	ambiguous redirect	^ *done .*[<>]
+F72	sig	BASH_COMMAND
+F73	both	\(\(: 	\(\([^)]*\$\{
+F74	sig	attempted assignment to non-variable
+F80	both	here-document at line	<<[^<]*<<
+F82	both	redirection error: cannot duplicate fd|Bad file descriptor	\{[A-Za-z_]+\}[<>]&[0-9]
+F83	both	command substitution: line|command not found	\$\([^)]*\)\$\($
+F83	src	# \(PS4 prefix, quoting, \$\(
+F86	both	reference variable cannot be an array	declare -n BASH_[A-Z]+\[
+F87	both	^interp\+tiered\+static\|.*No such file or directory	\} *>
+F84	both	^interp\+tiered\+static\|stdout	trap [^;]* DEBUG
+F85	both	disown: current: no such job	\$\([^)]*disown
+F81	both	unexpected EOF while looking for matching	\$\{[^}]*\$\(.*<<
+F75	both	operand expected	\$\\[A-Za-z]
+F76	both	^compiled\|	`
+F77	sig	conditional binary operator expected
+F78	sig	syntax error in conditional expression: unexpected token
+F79	sig	break: too many arguments
+F37	sig	\\\[[^]]*\\\]
+NOISE	both	crash signal, no oracle message	kill -(s )?(0?[4678]|11|31|ABRT|SEGV|BUS|FPE|ILL|SYS)([^0-9]|$)
+NOISE	src	cat <\(seq 3; sleep 0\.1\)|echo fork[^&]*&|(^|[;&|{ ])coproc 
+NOISE	both	warning: execute_coproc|: No such file or directory	coproc|select 
 F48	both	unexpected EOF while looking for matching	%\$\{\}"\$\{
-F51	sig	attempt to call local 'hook'
+F51	sig	attempt to call (local|upvalue) 'hook'
 F31	src	\$\{![A-Za-z_][A-Za-z_0-9]*\[[@*]\][^}"]
 F32	sig	bad substitution: no closing .X. in "\$\{!
 F33	sig	\$\{\}[^ ]*: bad substitution
@@ -34,12 +78,15 @@ F46	both	bad substitution	\$\{[^}]*[^[:print:][:space:]]
 F47	both	unterminated here-document|here-document at line	[<>]\(.*<<
 F49	both	near unexpected token .X'|command not found	^[ \t]*[0-9]*(<<?-?|>>?)[^ ]* +\}
 F50	both	near unexpected token .X'	<<-?[^;]*; *\}
-F52	both	\|set -v	set -v
+F52	both	.	set -v
 UB-recursion	both	syntax error in expression	local [A-Za-z_]+\[
 NOISE	both	^order-only:	&|coproc|[<>]\(|\|
 NOISE	both	\|#\? 	[<>]\(
 NOISE	src	trap '[^']*' [A-Z0-9]+; kill -[A-Z0-9]+ \$\$
 NOISE	src	^[a-z]+ \|[^[:alnum:] ]
+# (fuzz-docker campaign: differential groups that did not reproduce on re-runs in the
+# container -- async/timing, NOISE -- matched on a snippet of the input that produced them)
+NOISE	src	jobs -x echo %1|OLDPWD\+=>\(continue >\| \$a\) x=9 (shopt|1>&-')|popd >=<-|until \(\(pipefail>= 3\)\)|i\[\$x\]\+=/ exec nosuch|trap echo \$\{###\}|while read '.1'
 F1	sig-fixed	table index is nil
 F3	sig-fixed	attempt to index local '(first|prev)'
 F13	sig-fixed	not enough memory

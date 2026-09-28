@@ -44,8 +44,10 @@ without it the target only prints how to get it. The differential step needs the
   unmatched is printed as **NEW**. The summary is `triage/DATE/summary.txt`;
   `buckets.tsv` has every group.
 
-`cmp.sh` masks: the sandbox script path, digit runs of 4+ (pids, `$!`), `time`/`times`
-figures, and the order of job-status lines. Inputs using `$RANDOM`, `jobs`, `$!`, `times`
+`cmp.sh` masks: the sandbox script path, digit runs of 4+ (pids, `$!`), coproc pids,
+`time`/`times` figures, and the order of job-status lines. A disagreement where every run
+has bash's status and lines in another order is signed `order-only:` (known.tsv buckets it
+as NOISE when the script has an async construct). Inputs using `$RANDOM`, `jobs`, `$!`, `times`
 etc. are bucketed as NOISE rather than reported.
 
 ## Docker (`fuzz-docker`): one contained, globally budgeted campaign
