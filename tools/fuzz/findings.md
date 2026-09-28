@@ -1359,3 +1359,34 @@ wired through `docker/run.sh`'s env passthrough.
   Found by `gram:regex`; confirmed fresh with `harness-plain`, then reduced with `cmp.sh`
   (a same-value simplification with `x\\` written directly, no `\w`/`[^a]` regex classes
   or `$'...\x..'` escapes, did not reproduce — those pieces matter, not just the value).
+
+## Campaign 5 (gram:read + gram:printf, containerized, 18 min), branch fuzz-night
+
+## F124. `declare -p` of a `read`/`printf -v`-assigned value under-escapes embedded backslashes by one level (same family as F123)
+
+    #@ xpg_echo nopatsub
+    =:,
+    -r -r -r
+    a,b\:xa\:
+
+    #@ posix xpg_echo utf8
+    %s %s
+    1\\a%.3G\x41%#099999999999(%s)T)T
+
+(read target: `IFS=':,' ; read -r __r1 __r2 __r3 <<< "$__d"` on the data line, then
+`declare -p __r1 __r2 __r3`; printf target: `printf -v __v -- '%s %s' ARG` with the data
+line as `ARG`, then `declare -p __v`.)
+
+- bash: `declare -- __rN="a\\\\"` / `declare -- __v="…\\\\a%.NG\\xN…"` — a run of literal
+  backslashes in the captured/assigned value is doubled for `declare -p`'s re-parseable
+  double-quoted form (as F123 for a regex capture: `declare -a BASH_REMATCH=([0]="x\\")`).
+- curse (all tiers): one backslash short — `declare -- __rN="a\\"` /
+  `declare -- __v="…\\a%.NG\xN…"` — not valid re-parseable syntax. The same shape as F123
+  (`x\` -> `"x\"` instead of `"x\\"`) but through `read` and `printf -v`, not `[[ =~ ]]`;
+  likely one shared root cause (a value built by anything other than a literal `NAME=...`
+  assignment loses one level of the internal escaping `declare -p`'s printer expects).
+  Found by `gram:read`/`gram:printf`; the crash re-run (`sig.sh`, `harness-plain`, one
+  process) is the fresh verification — a hand-reduced plain-shell repro (`read -r v <<< $'a\\'`,
+  `printf -v v %s $'a\\'`) did *not* reproduce with only one trailing backslash, so the
+  exact trigger (more than one backslash? a specific `read`/`printf` option combination?)
+  needs a further session; not reduced outside the harness for lack of time.
