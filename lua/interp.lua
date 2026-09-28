@@ -7,6 +7,24 @@
 local rt = require("runtime")
 local PREEMPT = rt.preempt_flag -- (raised when a background job's CPU slice runs out: see rt.preempt)
 local P = require("parser") -- parser has no load-time dep on interp, so this is cycle-safe
+-- A word's text re-read at expansion (a ${…}'s operand word, stored raw at parse time):
+-- the reader already vetted it, but a construct the re-read finds left open must not
+-- escape as a Lua error — it becomes an error part, raised when the word expands after
+-- what precedes it: bash's "bad substitution: no closing `}'" (extract_dollar_brace_string),
+-- else the scanner's own message. (dq: the operand of a ${…} inside "…")
+local function lazy_word(txt, dq, hd)
+	local ok, w = pcall(dq and P.parse_default_quoted or P.parse_word, txt, hd)
+	if ok then
+		return w
+	end
+	if type(w) ~= "string" then
+		error(w, 0)
+	end
+	local m = P.unpos(w)
+	local close = m:match("^unexpected EOF while looking for matching `([}%]])'$")
+	return { k = "word", src = txt, parts = { close and { nulcut = txt, nocl = close == "]" and "]" or nil, q = true }
+		or { xperr = m, q = true } } }
+end
 local i64 = rt.i64
 local ffi = require("ffi")
 local u64 = ffi.typeof("uint64_t") -- string.format formats int64_t/uint64_t cdata directly
@@ -1630,9 +1648,9 @@ local function expand_pexp(sh, p, assign)
 	-- yields `a b` — strip the unescaped `"` before the heredoc-style parse.
 	local function pw(txt)
 		if not p.q then
-			return P.parse_word(txt)
+			return lazy_word(txt)
 		end
-		return P.parse_default_quoted(txt, pe.hd)
+		return lazy_word(txt, true, pe.hd)
 	end
 	local arg
 	if TESTOP[pe.op] then
@@ -1647,18 +1665,18 @@ local function expand_pexp(sh, p, assign)
 	elseif patmode then -- (the pattern and replacement expand only if the value takes them:
 		-- expand_param asks rt.pe_nopat first)
 		arg = function()
-			return pe.arg and expand_pattern(sh, P.parse_word(pe.arg), true) or nil
+			return pe.arg and expand_pattern(sh, lazy_word(pe.arg), true) or nil
 		end
 	elseif pe.op ~= "sub" then -- (a substring's offset is expanded below — not when the var is unset)
-		arg = pe.arg and expand_word(sh, P.parse_word(pe.arg), true) or nil
+		arg = pe.arg and expand_word(sh, lazy_word(pe.arg), true) or nil
 	end
 	local arg2
 	if patmode and pe.arg2 then
 		arg2 = function()
-			return expand_repl(sh, P.parse_word(pe.arg2))
+			return expand_repl(sh, lazy_word(pe.arg2))
 		end
 	else
-		arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+		arg2 = pe.arg2 and pe.op ~= "sub" and expand_repl(sh, lazy_word(pe.arg2)) or nil
 	end
 	if pe.op == "sub" and not pe.index and rt.sub_unset(sh, pe.name) then
 		return ""
@@ -1685,6 +1703,9 @@ expand_part_str = function(sh, p, assign)
 		sh.force_line = (fl or rt.current_line(sh)) + 1
 		sherr(sh, "curse: " .. p.cserr .. "\n")
 		sh.in_perr, sh.perr_label, sh.force_line = ip, pl, fl
+		error({ __curse_exit = 1, __curse_lineabort = true })
+	elseif p.xperr then -- (lazy_word: a re-read operand's own syntax error — a line abort)
+		sherr(sh, "curse: " .. p.xperr .. "\n")
 		error({ __curse_exit = 1, __curse_lineabort = true })
 	elseif p.bterr or p.nulcut then -- (a brace range's unclosed backquote: bq_word in the
 		-- parser; a word cut at a $'…' NUL: parser.dq_nulcut)
@@ -2245,9 +2266,9 @@ local function default_hda(sh, p)
 		return false
 	end
 	if p.q then
-		return word_hda(sh, P.parse_default_quoted(pe.arg, pe.hd), true)
+		return word_hda(sh, lazy_word(pe.arg, true, pe.hd), true)
 	end
-	return word_hda(sh, P.parse_word(pe.arg), false)
+	return word_hda(sh, lazy_word(pe.arg), false)
 end
 multi_hda = function(sh, p)
 	local pe = p.pexp
@@ -2276,9 +2297,9 @@ multi_hda = function(sh, p)
 			return false
 		end
 		if p.q then
-			return word_hda(sh, P.parse_default_quoted(pe.arg, pe.hd), true)
+			return word_hda(sh, lazy_word(pe.arg, true, pe.hd), true)
 		end
-		return word_hda(sh, P.parse_word(pe.arg), false)
+		return word_hda(sh, lazy_word(pe.arg), false)
 	end
 	if pe.op == "indirect" then
 		local ip = indirect_part(sh, pe, true)
@@ -2313,7 +2334,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			if arg == nil then
 				return { "" }
 			end
-			local w = P.parse_word(arg)
+			local w = lazy_word(arg)
 			if #w.parts == 1 and is_multi(sh, w.parts[1]) then
 				local part = w.parts[1]
 				part.q = p.q or part.q -- inner quoting is significant
@@ -2369,7 +2390,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			els = rt.array_slice_values(sh, pe.name, els, off, len, pe.arg2)
 		elseif (pe.op == "?" or pe.op == ":?") and (#els == 0 or (pe.op == ":?" and #els == 1 and els[1] == "")) then
 			-- ${@?} ${a[@]:?msg}: no elements (or, for :?, a lone empty one) is the error
-			local msg = pe.arg and pe.arg ~= "" and expand_word(sh, P.parse_word(pe.arg))
+			local msg = pe.arg and pe.arg ~= "" and expand_word(sh, lazy_word(pe.arg))
 				or (pe.op == "?" and "parameter not set" or "parameter null or not set")
 			io.stderr:write("curse: " .. rt.pe_label(pe) .. ": " .. msg .. "\n")
 			error({ __curse_exit = sh.opt_c and 127 or 1, __curse_lineabort = sh.opt_i or nil })
@@ -2377,7 +2398,7 @@ multi_elems = function(sh, p) -- returns element list, star?
 			-- ${@=x} / ${a[@]=x}: nothing to assign to — bash aborts the line. An ASSOC
 			-- takes `@`/`*` as a literal key (bash: ${A[@]:=foo} sets A[@])
 			if pe.index and sh:is_assoc(pe.name) then
-				local v = pe.arg and expand_word(sh, P.parse_word(pe.arg), true) or ""
+				local v = pe.arg and expand_word(sh, lazy_word(pe.arg), true) or ""
 				sh:array_set(pe.name, pe.index, v)
 				return { sh:array_get(pe.name, pe.index) or "" }, star
 			end
@@ -2469,8 +2490,8 @@ multi_elems = function(sh, p) -- returns element list, star?
 			-- replacement (arg2) expands via expand_repl (tilde + patsub_replacement marking).
 			-- (neither expands when the value takes no pattern: rt.pe_nopat_elems)
 			if not rt.pe_nopat_elems(pe.op, els) then
-				local arg = pe.arg and expand_pattern(sh, P.parse_word(pe.arg)) or ""
-				local arg2 = pe.arg2 and expand_repl(sh, P.parse_word(pe.arg2)) or nil
+				local arg = pe.arg and expand_pattern(sh, lazy_word(pe.arg)) or ""
+				local arg2 = pe.arg2 and expand_repl(sh, lazy_word(pe.arg2)) or nil
 				local out = {}
 				for i, v in ipairs(els) do
 					out[i] = sh:apply_str_op(pe.op, v, arg, arg2)
@@ -2663,7 +2684,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 				-- is quoted text. Never zero fields (bash: "${x:-$@}" with no params is "").
 				fb:add("", false)
 				if useword then
-					for _, sp in ipairs(P.parse_default_quoted(pe.arg, pe.hd).parts) do
+					for _, sp in ipairs(lazy_word(pe.arg, true, pe.hd).parts) do
 						if is_multi(sh, sp) then
 							sp.q = true
 							local els, star = multi_elems(sh, sp)
@@ -2678,7 +2699,7 @@ expand_fields_full = function(sh, w, pre1) -- pre1: part 1 already expanded (a $
 			elseif useword and pe.arg then
 				-- expand the default's parts: a QUOTED part is one atomic (sub)field, an
 				-- unquoted part word-splits — so 'a b' stays one field but a b splits.
-				for k, sp in ipairs(P.parse_word(pe.arg).parts) do
+				for k, sp in ipairs(lazy_word(pe.arg).parts) do
 					if is_multi(sh, sp) then -- $@/$*: as at the top level of a word
 						local els, star = multi_elems(sh, sp)
 						fb:multi(els, sp.q, star, nil, not sp.dqat)
@@ -6726,7 +6747,10 @@ end
 -- once the parser has read into it — through line UPTO (1-based, relative to TEXT; nil =
 -- all of it). `st` carries what's been echoed.
 local function v_echo(sh, text, upto, st)
-	if not sh.opt_v then
+	if not sh.opt_v then -- (the lines read while it's off are behind the reader: a `set -v`
+		if upto and upto > (st.done or 0) then -- among them doesn't echo itself, bash)
+			st.done = upto
+		end
 		return
 	end
 	if not st.lines then

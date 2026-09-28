@@ -754,8 +754,8 @@ local function scan_braces(s, bi, dq)
 			i = quote_end(s, i + 1, true, true)
 		elseif c == "'" and not sq_lit then
 			i = quote_end(s, i, false, true)
-		elseif c == '"' then
-			i = quote_end(s, i, true, true)
+		elseif c == '"' then -- (a "…" nests its own expansions: `${x%"${"}"…` — parse_matched_pair)
+			i = dq_end(s, i)
 		elseif c == "{" then
 			-- only a nested `${` opens a level; a bare `{` is an ordinary char, so
 			-- `${X//a/{x,y,z}}` ends at the FIRST `}` (bash: replacement `{x,y,z`, then `}`)
@@ -765,6 +765,8 @@ local function scan_braces(s, bi, dq)
 			i = i + 1
 		elseif c == "$" and s:sub(i + 1, i + 1) == "(" then
 			i = scan_cmdsub(s, i + 2) -- a `}` inside $(…) doesn't close (unclosed: its error)
+		elseif c == "$" and s:byte(i + 1) == 91 then -- …nor one inside $[…] (unclosed: its error)
+			i = expansion_end(s, i, dq)
 		elseif c == "`" then -- …nor one inside `…`
 			i = quote_end(s, i, true, true)
 		elseif c == "}" then
@@ -1820,6 +1822,7 @@ local function parse_word(w)
 	return { k = "word", parts = parts, src = src }
 end
 M.parse_word = parse_word
+M.unpos = unpos
 M.scan_cmdsub = scan_cmdsub
 M.strip_contin = strip_contin
 M.quote_end = quote_end

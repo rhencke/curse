@@ -15454,7 +15454,8 @@ function M.eval_run(sh, argv)
 		return
 	end
 	local ln = current_line(sh)
-	local mod = require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
+	-- (set -v: the code's lines are echoed as the interpreter's reader reaches them)
+	local mod = not sh.opt_v and require("tier").try_fragment(code, ln > 0 and ln or nil, sh, nil, "eval")
 	if mod then
 		local sxd, iee = sh.xdepth, sh.ign_ee -- (eval'd commands trace one level deeper: `++ cmd`,
 		sh.xdepth = (sxd or 0) + 1 -- as b_eval; errexit-exempt, -e is cleared for them: M.report_exit)
@@ -15589,20 +15590,20 @@ function M.source_run(sh, argv, line)
 	end
 	local name = argv[j]
 	if not name or (j == 2 and name:match("^%-.")) then
-		return require("b_source")(sh, argv[1], argv, nil, nil) -- usage error: let b_source diagnose
+		return require("b_source")(sh, argv[1], argv, _noop, nil) -- usage error: let b_source diagnose
 	end
 	if sh.opt_r and name:find("/", 1, true) then -- (restricted: b_source refuses it)
-		return require("b_source")(sh, argv[1], argv, nil, nil)
+		return require("b_source")(sh, argv[1], argv, _noop, nil)
 	end
 	local file = M.source_path(sh, name)
 	if Ii.file_test("-d", file) then
-		return require("b_source")(sh, argv[1], argv, nil, nil) -- directory: b_source diagnoses
+		return require("b_source")(sh, argv[1], argv, _noop, nil) -- directory: b_source diagnoses
 	end
 	local f, en, hold = M.open_read(file, false, sh)
 	if not f then -- (b_source diagnoses — this errno, and releases the hold after: a FIFO
 		-- isn't opened twice)
 		sh.source_openerr = { file = file, en = en, hold = hold }
-		local r = require("b_source")(sh, argv[1], argv, nil, nil)
+		local r = require("b_source")(sh, argv[1], argv, _noop, nil)
 		local oe = sh.source_openerr
 		sh.source_openerr = nil
 		if oe then -- (b_source didn't get to it)
@@ -15615,11 +15616,12 @@ function M.source_run(sh, argv, line)
 	-- (a DEBUG/ERR trap reaching into the file: tier compiles its hooks in — trap_mode;
 	-- what its text reads joins the program's: tier.note_text)
 	require("tier").note_text(sh, code)
-	local mod = not M.source_empty(code) and require("tier").try_fragment(code, nil, sh)
+	-- (set -v: the file's lines are echoed as the interpreter's reader reaches them)
+	local mod = not M.source_empty(code) and not sh.opt_v and require("tier").try_fragment(code, nil, sh)
 	if not mod then -- alias / syntax error / uncompilable / empty: b_source runs the text it was handed
 		-- (never re-opening the file — a FIFO or /dev/stdin can only be read once)
 		sh.source_preread = { file = file, code = code }
-		return require("b_source")(sh, argv[1], argv, nil, nil)
+		return require("b_source")(sh, argv[1], argv, _noop, nil)
 	end
 	-- Compiled path: swap in the file's positional params, run, restore. `return` in the
 	-- file surfaces as __curse_return (fragment mode) and ends the source; exit/break/

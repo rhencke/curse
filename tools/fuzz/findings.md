@@ -374,3 +374,15 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - No writable TMPDIR in the sandbox (read-only /): see F22.
 - afl-cmin/afl-showmap need `__AFL_DEFER_FORKSRV=1` with this harness, or they read only
   the ~180 bytes of C edges (the spike's afl-seeds-min was minimised on that).
+
+# F31+ fixed on branch fix-fuzz3 (the findings are on fuzz-docker; reconcile at merge)
+
+- F48 FIXED — a "…" inside ${…} nests its own expansions (parse_matched_pair), and a $[…]
+  in ${…} is scanned as one, so `"${x%${}"${"}"` is the parse-time EOF error; a ${…}
+  operand re-read at expansion can no longer raise an escaped Lua error (interp lazy_word).
+  test/cases/2729-dolbrace-nested-quote-eof.sh
+- F51 FIXED — the compiled tier's `.` never hands the interpreter a nil hook, and eval/source
+  text under `set -v` is read by the interpreter's reader (echoed). test/cases/2727-set-v-sourced-loop.sh
+- F52 FIXED — lines read while -v was off are behind the reader: a `set -v` in sourced/eval'd
+  text doesn't echo its own line; `set -v` in text the program hands to eval/source/a trap
+  puts a compiled program in line mode. test/cases/2728-set-v-own-line.sh

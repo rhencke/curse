@@ -250,6 +250,12 @@ local function scan_program(node, acc)
 	if node.lit == "history" or node.lit == "histexpand" or node.lit == "fc" then
 		acc.lex = acc.lex or "history" -- command history is recorded (and `!` expanded) by the reader
 	end
+	-- (`set -v` in text the program hands to eval/source/a trap: from then on the reader
+	-- echoes the program's own lines too)
+	if node.lit and node.lit:find("set", 1, true) and node.lit:find("%f[%w_]set[ \t]")
+		and (node.lit:find("verbose", 1, true) or node.lit:find("[ \t]%-%a*v")) then
+		acc.lex = acc.lex or "set -v"
+	end
 	if node.lit and node.lit:find("\\#", 1, true) then
 		acc.lex = acc.lex or "prompt \\#" -- a prompt's \# (command number) counts the reader's lines
 	end
