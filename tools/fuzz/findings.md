@@ -1474,3 +1474,117 @@ expected for conditional expression (error token is …)`, e.g.:
   e.g. `echo "$(( 1?2 { ))"` -> bash `syntax error: invalid arithmetic operator (error token
   is "{ ")`, curse still `\`:' expected for conditional expression`.
 
+## Campaign 1 (gram:tiered + gram:compiled, containerized, 30 min), branch fuzz-hunt
+
+82 differential signatures (49 NEW, 33 tagged "regression or variant of a FIXED finding").
+Verified a representative sample of each (fresh, in the container, via `cmp.sh` on the
+actual crashing queue file and on hand-reduced minimizations): most of the volume traces to
+two mechanisms that are not fresh findings — (1) `gen-script`/token mutations occasionally
+strip a `for`/`until` loop's bound out of `for ((1;1;1))`-style headers, producing a
+genuinely unbounded loop whose runaway output is truncated by the sandbox's `ulimit -f`
+(SIGXFSZ, status 153) at a byte offset that depends on bash's vs. curse's internal stdio
+buffer size — a real difference, but not an actionable behavioral one (confirmed
+deterministic across 3 repeats; same first ~40 lines, diverges only in the exact truncated
+tail); (2) a backgrounded `(( … )) &` whose stderr races the foreground script's own
+output/next builtin — which worker (interp/compiled/tiered/static) the live campaign
+timing flagged as disagreeing was not reproducible run-to-run (confirmed by rerunning the
+same queue file 2+ times: the disagreeing worker changed between runs), i.e. genuine
+scheduling nondeterminism, the same family cmp.sh's `order-only:` check already targets
+but doesn't fully catch when the split lands mid-line rather than mid-stream. Of the 33
+FIXED-finding tags, 6 were individually verified against the original finding's actual
+mechanism (not just its loose bash-wording regex): F72, F74 and F76 below are genuine
+(an incomplete fix and two new variants in the same families); F10 and F45's tags were
+coincidental (bash's generic "syntax error near .../unexpected EOF" wording matched a
+different, new mechanism — see F129); a sample of the F37 tags (nested/special-variable
+array subscripts, e.g. `BASH_SUBSHELL[COLUMNS[a]]`) reproduced only in a large, entangled
+generated script and did not survive hand reduction in the time available — left open,
+not recorded as a finding. The remaining FIXED-tags were not individually re-verified
+(time-boxed); given how loose their known.tsv wording is (see fuzz.sh's own comment on
+this category) and that none sampled were genuine, they are treated as coincidental
+pending a future pass.
+
+## F126. Compiled tier: `exit` inside a command substitution silently discards stderr the
+## substitution already produced
+
+    `f=$[i[$OLDPWD]] exit`
+
+- bash, interp, tiered, and the static `build/curse` binary: `S: line 1: i[]: bad array
+  subscript` (twice — bash's own double-report for a bad subscript), status 0 (the
+  backquoted command's stdout is empty, so the outer bare command-substitution statement
+  runs nothing).
+- curse **compiled tier only**: no output at all (stdout empty, stderr empty), status 0 —
+  the bad-subscript error that fired earlier in the same command substitution is dropped
+  entirely once `exit` runs afterward. Reproduces with `exit` specifically; the same
+  script with `true` in place of `exit` agrees with bash (error printed normally), and
+  with `return` in place of `exit` all tiers agree (bash's own "can only `return' from a
+  function" error, status 2) — so it's `exit`'s in-process unwind out of the command
+  substitution (curse never forks for `` ` ` ``/`$( )`, see docs on in-process subshells)
+  that loses the buffered diagnostic, specific to the compiled tier. Reduced from
+  gram-tiered queue entry `id:006398` (`set -o errtrace $"hi" \`f="${HOME##?}x"${1?$[i[$OLDPWD]]}5 OLDPWD+=( [1]+=y) exit\``);
+  confirmed fresh via `cmp.sh` in the container on the reduced one-liner.
+
+## F127. Regression/incomplete fix of F72 — `(( BASH_COMMAND++ ))`: the leading `((` is
+## still left in the recursion error's token when a postfix operator is attached
+
+    (( BASH_COMMAND++ ))
+
+- bash: `S: line 1: ((: (( BASH_COMMAND++ )): expression recursion level exceeded (error
+  token is "BASH_COMMAND++ ))")` — the token starts at `BASH_COMMAND`, not `((`.
+- curse (all tiers): same message but `(error token is "(( BASH_COMMAND++ ))")` — the
+  leading `((` is still in the token, exactly F72's original defect. F72's fix evidently
+  covers `BASH_COMMAND` as a bare operand (`(( BASH_COMMAND & 1 ))` now agrees with bash)
+  but not when a postfix `++`/`--` is attached directly to it (confirmed `(( BASH_COMMAND-- ))`
+  also reproduces). Reduced from gram-tiered queue entry `id:006407`
+  (`(( BASH_COMMAND++ & 7 >> 18446744073709551616 || ${#f} ))`); confirmed fresh via
+  `cmp.sh` in the container on both the reduced form and the original.
+
+## F128. Arithmetic: a readonly-variable check fires before bash's own "not an lvalue"
+## check on an unrelated nested compound assignment
+
+    echo $(( (UID >>= 3 >= b %= a) ))
+
+- bash: `S: line 1: (UID >>= 3 >= b %= a) : attempted assignment to non-variable (error
+  token is "%= a) ")` — `%=` binds lower than `>=`, so its left side is the comparison
+  result `3 >= b`, not a variable; bash catches this (an inner operator's target isn't an
+  lvalue) before ever touching `UID`, regardless of whether `UID` itself is writable.
+- curse (all tiers): `S: line 1: UID: readonly variable` — curse validates (and rejects)
+  the *outer* `UID >>=` target's readonly-ness before it has parsed/validated far enough
+  to notice the inner `%=`'s target is invalid. Confirmed the readonly-ness is the
+  deciding factor: the same shape with a plain writable variable (`echo $(( (x >>= 3 >= b
+  %= a) ))`) already agrees with bash (both report the `%=` error). Same family as F74
+  (bash's parse-time lvalue check vs. curse's eager evaluation order) but a distinct
+  trigger (a readonly target masks the deeper error, rather than a ternary/paren
+  confusing which side is the lvalue) — recorded as a new finding, not a regression, since
+  F74's fixed cases never involved a readonly variable. Reduced from gram-tiered queue
+  entry `id:006711`; confirmed fresh via `cmp.sh` in the container.
+
+## F129. A syntax error inside `$( )` that bash defers to run time (confined to the
+## substitution) is a fatal top-level parse error in curse
+
+    echo "$((( 1 )) &
+    ( while true; do
+    )
+    )"
+
+- bash: status 0, prints one blank line (the substitution's content fails its own,
+  separate parse — reported as `S: command substitution: line 4: syntax error near
+  unexpected token ')'`, note the `command substitution:` prefix marking a deferred,
+  run-time parse of the extracted substitution text) — but the failure is confined to the
+  substitution (which contributes nothing to the word), and `echo` still runs.
+- curse (all tiers): status 2, **no stdout at all** — `S: line 4: syntax error near
+  unexpected token ')'` (no `command substitution:` prefix) is instead treated as a fatal
+  top-level parse error, aborting the whole script before `echo` ever runs. Only
+  reproduces through the `$((`/`$( (` ambiguity (bash's ambiguous-paren heuristic falls
+  back to a deferred/run-time parse of the substitution's raw extracted text in some
+  cases but not others — a plain unambiguous case like `echo "$(if)"` is a fatal top-level
+  error on both sides, agreeing); the trigger is narrow and fragile under hand
+  simplification (several straightforward-looking trims stopped reproducing it — e.g.
+  swapping `while true; do` for `if true; then`, or removing the split between the two
+  closing-paren lines, made both sides agree again). Reduced from gram-tiered queue entries
+  `id:006441` and (independently, with a different inner syntax error — `unexpected end of
+  file` after an unterminated here-document) `id:006267`, both showing the identical
+  bash-status-0-vs-curse-status-2 pattern; confirmed fresh via `cmp.sh` in the container on
+  the reduced 4-line form. (Tagged by triage as a regression of F10/F45 respectively —
+  coincidental: both are bash's generic "syntax error near .../unexpected EOF" wording
+  attached to an unrelated mechanism, not the originally-fixed constructs.)
+
