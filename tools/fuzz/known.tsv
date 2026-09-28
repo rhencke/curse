@@ -11,6 +11,35 @@
 # IDs are tools/fuzz/findings.md entries; UB/NOISE are not curse bugs (docs/bash-ub.md class,
 # or nondeterminism the masks don't cover). Heuristic by nature: a NEW bucket that turns
 # out to be a known bug gets a better line here.
+# (fuzz-docker triage, F31-F52: before the older lines, whose *-fixed patterns are generic
+# bash wording -- F2/F10 would otherwise claim F48/F49/F50 as "variants")
+F48	both	unexpected EOF while looking for matching	%\$\{\}"\$\{
+F51	sig	attempt to call local 'hook'
+F31	src	\$\{![A-Za-z_][A-Za-z_0-9]*\[[@*]\][^}"]
+F32	sig	bad substitution: no closing .X. in "\$\{!
+F33	sig	\$\{\}[^ ]*: bad substitution
+F34	sig	\$\{!\?[^}]*\}: bad substitution
+F35	sig	\$\{[*@#?$!0-9N-]\[[^]]*\][^}]*\}: bad substitution
+F36	sig	\(\(: .*: +: expression expected
+F37	sig	[A-Za-z_][A-Za-z_0-9]*\[\]: bad array subscript
+F38	sig	error token is "\$@
+F39	sig	^[a-z+]*\|[^S].*syntax error: invalid arithmetic operator
+F40	both	line L	trap ['"] *(function |[A-Za-z_]+ *\(\))
+F41	both	S: line L: .X'$	alias [A-Za-z_]+=['"]?[})]
+F42	both	here-document at line|^[a-z+:]*\|  	<<-? *\$\{[^}]*($|["'])
+F43	both	bad array subscript|operand expected	\[-[0-9]+\][^)]*(\|\||&&) *\$
+F44	both	^[a-z+:]*\|stdout|declare -x	[A-Za-z_]+=[^ ;]* export[ \t]*($|[;'"&|])
+F45	both	unexpected end of file|here-document at line	\\$
+F46	both	bad substitution	\$\{[^}]*[^[:print:][:space:]]
+F47	both	unterminated here-document|here-document at line	[<>]\(.*<<
+F49	both	near unexpected token .X'|command not found	^[ \t]*[0-9]*(<<?-?|>>?)[^ ]* +\}
+F50	both	near unexpected token .X'	<<-?[^;]*; *\}
+F52	both	\|set -v	set -v
+UB-recursion	both	syntax error in expression	local [A-Za-z_]+\[
+NOISE	both	^order-only:	&|coproc|[<>]\(|\|
+NOISE	both	\|#\? 	[<>]\(
+NOISE	src	trap '[^']*' [A-Z0-9]+; kill -[A-Z0-9]+ \$\$
+NOISE	src	^[a-z]+ \|[^[:alnum:] ]
 F1	sig-fixed	table index is nil
 F3	sig-fixed	attempt to index local '(first|prev)'
 F13	sig-fixed	not enough memory

@@ -57,7 +57,17 @@ if [ -n "$Q" ]; then
   [ -z "$line" ] && line="status $(cat "$T/$m.st") vs $(cat "$T/bash.st")"
   line=$(printf '%s' "$line" | sed -E "s/line [0-9N]+/line L/g; s/\`[^']*'/\`X'/g; s/[0-9]+/N/g" | cut -c1-160)
   case "$bad" in "interp compiled tiered static ") who=all ;; *) who=${bad% } who=${who// /+} ;; esac
-  printf '%s\t%s|%s\n' "${v% }" "$who" "$line"
+  # (every disagreeing run has bash's status and bash's lines, only in another order:
+  # "order-only:" -- the interleaving of async output (jobs, coprocs, process
+  # substitutions, pipeline stages) is scheduling, not semantics; known.tsv buckets it
+  # when the script has such a construct)
+  oo=order-only:
+  for m in $bad; do
+    cmp -s "$T/bash.st" "$T/$m.st" &&
+      cmp -s <(LC_ALL=C sort "$T/bash.out") <(LC_ALL=C sort "$T/$m.out") &&
+      cmp -s <(LC_ALL=C sort "$T/bash.err") <(LC_ALL=C sort "$T/$m.err") || oo=
+  done
+  printf '%s\t%s%s|%s\n' "${v% }" "$oo" "$who" "$line"
   exit 1
 fi
 for m in bash interp compiled tiered static; do
