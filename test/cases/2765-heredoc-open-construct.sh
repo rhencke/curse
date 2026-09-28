@@ -3,7 +3,7 @@
 # is the substitution's syntax error, reported at the line the body ends on — after what
 # precedes it ran. A DISCARD that sets no status of its own leaves a non-zero one (127 from
 # a command not found before it). curse evaluated `$[a[…` as arithmetic, ran an open `…`,
-# and failed an open $( before expanding anything (fuzz F70, F83).
+# and failed an open $( before expanding anything (fuzz F70, F83; the open `…` also leftover L6).
 x=$(cat <<EOF
 $[a[
 EOF
@@ -28,6 +28,12 @@ x $(echo hi >&2)$(
 y
 F
 echo "cs2 $?"
+cat <<F
+a
+b $(
+c
+F
+echo "cs3 $?"
 f() { cat <<F
 $(false)$[1+
 F

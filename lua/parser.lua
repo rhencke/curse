@@ -1887,10 +1887,10 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			end
 			-- a $( a here-document body never closes: expanding the body runs what precedes
 			-- it, then fails there (parse_comsub's EOF error, reported at the line the body
-			-- ends on — csnl: its newlines — then DISCARD)
+			-- ends on — csnl: the newlines from the `$(` — then DISCARD)
 			if heredoc == true and inner:byte(i + 1) == 40 and not (inner:byte(i + 2) == 40 and dparen_is_arith(inner, i + 3))
 				and not pcall(scan_cmdsub, inner, i + 2) then
-				add({ cserr = M.open_comsub_err(inner:sub(i + 2)), csnl = select(2, inner:gsub("\n", "")), q = true })
+				add({ cserr = M.open_comsub_err(inner:sub(i + 2)), csnl = select(2, inner:sub(i):gsub("\n", "")), q = true })
 				return
 			end
 			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
@@ -1910,8 +1910,8 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			-- (not in a heredoc body or a prompt: `\"` reaches the command as is).
 			local body, i0 = nil, i
 			body, i = bq_body(inner, i, bt_keep and "[`$\\]" or '[`$\\"]')
-			if i > #inner + 1 then -- (one the text never closes — a here-document body read as
-				-- it expands: "bad substitution: no closing "`" in `…", the rest of the text)
+			if heredoc == true and i > #inner + 1 then -- (a here-document body's `…` that never
+				-- closes: expanding the body fails — string_extract's "no closing "`" in `…")
 				add({ bterr = inner:sub(i0), q = true })
 				return
 			end
