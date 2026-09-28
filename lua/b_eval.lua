@@ -67,7 +67,7 @@ return function(sh, cmd, args, hook, tcb)
 				local iee = sh.ign_ee
 				sh.ign_ee = iee or sh.noerr > 0
 				local sbl = sh.base_line -- (each line group of the text: rt.compound_line)
-				local ok, err = pcall(function()
+				local ok, err = rt.nest_pcall(sh, function()
 					local ln = rt.current_line(sh)
 					local nextf = eval_groups(sh, code, ln) or P.open(code, sh, ln > 0 and ln or nil)
 					local vst = {}

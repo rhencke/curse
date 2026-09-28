@@ -6519,12 +6519,12 @@ simple_compiled = function(cx, st, after)
 				call = inl_sync(cmd, fnwrap(
 					cmd,
 					st.line,
-					ff.locals and ("sh:pushCall(unpack(__a)); %s(sh); sh:popCall()"):format(fnlname(cmd))
-						or ("sh:pushParams(unpack(__a)); %s(sh); sh:popParams()"):format(fnlname(cmd))
+					ff.locals and ("sh:pushCall(unpack(__a)); rt.ncall(sh, %s); sh:popCall()"):format(fnlname(cmd))
+						or ("sh:pushParams(unpack(__a)); rt.ncall(sh, %s); sh:popParams()"):format(fnlname(cmd))
 				), cx)
 			elseif cx.funcflags[cmd] then -- bare function (references NO positional params): build argv
 				from = 2 -- to run the args' side effects, then a bare call (params unread)
-				call = inl_sync(cmd, fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd))), cx)
+				call = inl_sync(cmd, fnwrap(cmd, st.line, ("rt.ncall(sh, %s)"):format(fnlname(cmd))), cx)
 			elseif
 				cmd ~= nil
 				and not NATIVE_BUILTIN[cmd]
@@ -6835,16 +6835,16 @@ simple_compiled = function(cx, st, after)
 			body = fnwrap(
 				cmd,
 				st.line,
-				("sh:pushCall(%s); %s(sh); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd))
+				("sh:pushCall(%s); rt.ncall(sh, %s); sh:popCall()"):format(table.concat(args, ", "), fnlname(cmd))
 			)
 		elseif ff.params then -- positional swap only (no per-call frame table)
 			body = fnwrap(
 				cmd,
 				st.line,
-				("sh:pushParams(%s); %s(sh); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd))
+				("sh:pushParams(%s); rt.ncall(sh, %s); sh:popParams()"):format(table.concat(args, ", "), fnlname(cmd))
 			)
 		else -- neither: bare call, no allocation
-			body = fnwrap(cmd, st.line, ("%s(sh)"):format(fnlname(cmd)))
+			body = fnwrap(cmd, st.line, ("rt.ncall(sh, %s)"):format(fnlname(cmd)))
 		end
 		body = inl_sync(cmd, body, cx)
 	else -- external command — OR a function DEFINED AT RUNTIME (via source/eval).

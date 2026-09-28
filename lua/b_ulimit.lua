@@ -146,6 +146,9 @@ return function(sh, cmd, args, hook, tcb)
 					.. ffi.string(C.strerror(err)) .. "\n")
 				return false
 			end
+			if r[1] == 3 then -- (RLIMIT_STACK bounds the nesting depth: rt.nest_pcall)
+				rt.nest_reset()
+			end
 			if ctx and sethard then
 				ctx.vhard[r[1]] = nv
 			end

@@ -96,7 +96,7 @@ local function builtin(sh, cmd, args, hook, tcb)
 					local iee = sh.ign_ee -- (errexit-exempt: -e cleared for the file, as eval does)
 					sh.ign_ee = iee or sh.noerr > 0
 					local sbl = sh.base_line -- (each line group of the file: rt.compound_line)
-					local rok, err = pcall(function()
+					local rok, err = rt.nest_pcall(sh, function()
 						local nextf = P.open(src, sh)
 						local vst = {}
 						local ran = false -- (a command ran before a syntax error: not fatal — rt.perr_lead)

@@ -1055,7 +1055,12 @@ local function co_task()
 		return nil
 	end
 	local co = coroutine.running()
-	return co and CO.bycoro[co] or nil
+	local t = co and CO.bycoro[co]
+	while co and not t and M.HOP_UP[co] do -- (a deep call's hop coroutine: M.nest_pcall)
+		co = M.HOP_UP[co]
+		t = CO.bycoro[co]
+	end
+	return t or nil
 end
 M.co_task = co_task
 -- Save a copy of `fd` for a later restore — the way bash does: close-on-exec (a
@@ -3674,7 +3679,7 @@ function Shell:capture_inproc(backtick, runner, capfd, ctx)
 	self.xdepth = (sv_xd or 0) + 1 -- xtrace: PS4's first char repeats per $(…) level
 	local sv_cj, sv_xs = self.cap_jobs, self.xsigint
 	self.cap_jobs, self.xsigint = {}, nil
-	local ok, err = pcall(runner, self)
+	local ok, err = M.nest_pcall(self, runner, self)
 	if not ok then
 		err = M.lua_overflow(self, err)
 	end
@@ -5117,6 +5122,92 @@ end
 -- stack — SIGSEGV — or nests without end; bash UB, not copied: docs/bash-ub.md). The shell
 -- running it — the script, or a subshell / $(…) / job running in-process — stops with this
 -- diagnostic, status 1, as a crashed child would stop alone. Any other error: itself.
+-- ---- deep nesting: function calls, eval, source, subshells, $(…) ---------------------
+-- LuaJIT gives one coroutine at most 65500 stack slots, which an interpreted shell level
+-- (a function call, an eval) spends ~100-160 of: curse stopped with "stack overflow"
+-- 400-700 levels deep, bash (its C stack) near 5500-6800 (stress-attack S10). Each such
+-- level runs through M.nest_pcall: every NEST_HOP levels the rest runs on a fresh
+-- coroutine (a new Lua stack; its yields are passed on, so a pipeline stage's scheduler
+-- still sees them — co_task follows HOP_UP), so the depth is bounded only by
+-- NEST_MAX: one level per 600 bytes of RLIMIT_STACK (8 MiB: 13981 — past where bash's C
+-- stack has overflowed, SIGSEGV, for every kind of recursion: docs/bash-ub.md); none
+-- when the stack is unlimited (memory then bounds it: M.oom).
+local NEST_HOP = 32
+local HOP_UP = setmetatable({}, { __mode = "k" }) -- hop coroutine -> the coroutine it runs for
+M.HOP_UP = HOP_UP
+local NEST_MAX
+local function nest_max()
+	local r = ffi.new("struct curse_rt_rlimit")
+	if C.curse_rt_getrlimit(3, r) ~= 0 or r.cur == ffi.cast("unsigned long", -1) then
+		return math.huge
+	end
+	return math.max(1000, math.floor(tonumber(r.cur) / 600))
+end
+local function hop_body(f, ...)
+	return f(...)
+end
+local cyield, cresume, cstatus = coroutine.yield, coroutine.resume, coroutine.status
+local function hop_forward(co, ok, ...)
+	if cstatus(co) == "dead" then
+		return ok, ...
+	end
+	if not ok then
+		return false, ...
+	end
+	return hop_forward(co, cresume(co, cyield(...)))
+end
+local function hop_pcall(f, ...)
+	local co = coroutine.create(hop_body)
+	HOP_UP[co] = coroutine.running()
+	return hop_forward(co, cresume(co, f, ...))
+end
+function M.nest_pcall(sh, f, ...)
+	local d0 = sh.nest or 0
+	local d = d0 + 1
+	if d > (NEST_MAX or 0) then
+		NEST_MAX = NEST_MAX or nest_max()
+		if d > NEST_MAX then
+			return false, "stack overflow" -- (reported as LuaJIT's own: M.lua_overflow)
+		end
+	end
+	sh.nest = d
+	local ok, e, e2
+	if d % NEST_HOP == 0 then
+		ok, e, e2 = hop_pcall(f, ...)
+	else
+		ok, e, e2 = pcall(f, ...)
+	end
+	sh.nest = d0
+	return ok, e, e2
+end
+-- A compiled call of a compiled shell function (emit's fnwrap sites): the same count and
+-- hops, no pcall of its own (an error unwinds to the nearest nest_pcall, which restores
+-- the count)
+function M.ncall(sh, f)
+	local d0 = sh.nest or 0
+	local d = d0 + 1
+	if d > (NEST_MAX or 0) then
+		NEST_MAX = NEST_MAX or nest_max()
+		if d > NEST_MAX then
+			error("stack overflow", 0)
+		end
+	end
+	sh.nest = d
+	if d % NEST_HOP == 0 then
+		local ok, e = hop_pcall(f, sh)
+		sh.nest = d0
+		if not ok then
+			error(e, 0)
+		end
+	else
+		f(sh)
+		sh.nest = d0
+	end
+end
+-- (a `ulimit -s` changes the bound: bash's stack is the new one)
+function M.nest_reset()
+	NEST_MAX = nil
+end
 function M.lua_overflow(sh, err)
 	if type(err) == "string" and err:find("not enough memory$") then
 		return M.oom(sh)
@@ -5187,7 +5278,7 @@ function Shell:subshell_run(runner, saves, paren, inplace)
 	if self.pstage and up0 and up0.task and up0.task == co_task() then
 		ctx.task_proc = up0.task
 	end
-	local ok, err = pcall(runner, self)
+	local ok, err = M.nest_pcall(self, runner, self)
 	local status = self.status
 	local rethrow, killed
 	if not ok then

@@ -4647,7 +4647,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		if f2 then
 			fn = f2
 		end
-		ok, err = pcall(fn, sh) -- a COMPILED function closure
+		ok, err = rt.nest_pcall(sh, fn, sh) -- a COMPILED function closure
 	else
 		-- a hot function in a cold run: its compiled version, once the tier has it
 		local def = sh.func_def and sh.func_def[cmd]
@@ -4656,9 +4656,9 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 			cfn = M.fn_hook(sh, cmd, def)
 		end
 		if cfn then
-			ok, err = pcall(cfn, sh)
+			ok, err = rt.nest_pcall(sh, cfn, sh)
 		else
-			ok, err = pcall(exec_list, sh, fn, hook, false)
+			ok, err = rt.nest_pcall(sh, exec_list, sh, fn, hook, false)
 		end
 		-- the tier compiled this function while a loop in it ran hot: the rest of THIS call
 		-- continues compiled from that loop (err.pc), in the frame already set up here
