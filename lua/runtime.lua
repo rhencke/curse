@@ -8328,6 +8328,18 @@ function M.tilde_prefix(sh, s)
 	return s
 end
 
+-- A word-initial `~…` literal of an unquoted ${x:-WORD}/${x:+WORD} operand that goes on
+-- to be split (the field builder `fb`): the tilde-prefix's expansion is quoted text (bash
+-- quotes it: an empty $HOME is still a field) — added to `fb` here; the rest is returned
+function M.tilde_split(sh, fb, s)
+	local t = M.tilde_prefix(sh, s)
+	if t == s then
+		return s
+	end
+	local tl = #s - (s:find("[/:]") or #s + 1) + 1 -- (the text after the tilde-prefix)
+	fb:add(t:sub(1, #t - tl), false)
+	return t:sub(#t - tl + 1)
+end
 -- `more`: further (quoted/expansion) parts follow this literal, so a LAST segment with
 -- no `/` has its tilde-prefix running into them — not a pure literal, so no expansion.
 -- `cont`: this literal continues text before it (a later part of the word), so its first
@@ -10211,6 +10223,20 @@ function M.neg_oob(sh, name, key)
 	local mx = (b and b.arr) and arr_max(b.arr) or ((b and (b.s or b.n)) and i64(0) or i64(-1))
 	return mx + 1 + key_i64(key) < 0
 end
+-- A READ of a negative subscript of a variable that is no array (array_value_internal /
+-- array_length_reference): only an indexed array counts back from its end — a scalar's
+-- `${n[-1]}` is a bad array subscript (an assignment converts the scalar first: neg_oob)
+function M.neg_scalar(sh, name, key)
+	if type(key) == "number" then
+		if key >= 0 then
+			return false
+		end
+	elseif type(key) ~= "string" or key:byte(1) ~= 45 then
+		return false
+	end
+	local b = sh.vars[sh:deref(name)]
+	return b ~= nil and not b.arr and not b.assoc
+end
 -- bash's report_error (error.c), the diagnostic most expansion errors use (a bad array
 -- subscript, `no match`, a bad substitution): under `set -e` it exits the shell AT ONCE
 -- with $? (1 if that's 0) — even in an errexit-exempt `if`/`&&`/`!` context, since it
@@ -10249,9 +10275,10 @@ end
 -- (an empty associative key too: bash's get_array_value, `${E['']}`)
 -- (the variable a bad subscript names: a nameref's target — bash reports the variable
 -- the lookup landed on, `w: bad array subscript` for `declare -n ref=w; ${ref[-9]}`)
+-- (…but a nameref whose target is unset is named itself, as bash's INDEX_ERROR does)
 function M.badsub_name(sh, name)
 	local d = sh:deref(name)
-	return d ~= "" and d or name
+	return (d ~= "" and sh.vars[d]) and d or name
 end
 function M.elem_read_check(sh, name, key)
 	if key == "" then
@@ -10260,8 +10287,9 @@ function M.elem_read_check(sh, name, key)
 			io.stderr:write("curse: " .. M.badsub_name(sh, name) .. ": bad array subscript\n")
 			M.report_exit(sh)
 		end
-	elseif M.neg_oob(sh, name, key) then
-		io.stderr:write("curse: " .. M.badsub_name(sh, name) .. ": bad array subscript\n")
+	elseif M.neg_oob(sh, name, key) or M.neg_scalar(sh, name, key) then
+		io.stderr:write("curse: " .. M.badsub_name(sh, name) .. ": bad array subscript
+")
 		M.report_exit(sh)
 	end
 end
@@ -10278,7 +10306,7 @@ function M.len_badsub(sh, name, sub, key)
 		return
 	end
 	local b = sh.vars[sh:deref(name)]
-	if (key == "" and b.assoc) or M.neg_oob(sh, name, key) then
+	if (key == "" and b.assoc) or M.neg_oob(sh, name, key) or M.neg_scalar(sh, name, key) then
 		io.stderr:write("curse: " .. sub .. "]: bad array subscript\n")
 		M.report_exit(sh) -- (err_badarraysub: report_error)
 		error({ __curse_exit = 1, __curse_lineabort = true })
@@ -11402,6 +11430,11 @@ local function glob_conv(glob, pn, patsub, noext)
 				j = j + 1
 			end
 		end
+		if isext and d ~= 0 then
+			-- an unclosed group: sm_loop's `*` run still hands it to EXTMATCH (`**([[:`
+			-- matches anything, `*!(Q` the empty string) — only the faithful matcher does that
+			M._gh = bit.bor(M._gh, 1)
+		end
 		if isext and d == 0 then
 			starrun = false
 			local arms = split_arms(glob:sub(i + 2, j - 1))
@@ -11478,6 +11511,9 @@ local function glob_conv(glob, pn, patsub, noext)
 							local name = glob:sub(k + 2, e - 1)
 							return ((#name == 1) and name or COLLSYM[name]) or false, e + 2
 						end
+						-- an unterminated `[.`: BRACKMATCH's parse_collsym runs off the end
+						-- (the bracket fails, `[` aside) — the faithful matcher's case
+						M._gh = bit.bor(M._gh, 1)
 					end
 					return ch, k + 1
 				end
@@ -11734,7 +11770,33 @@ end
 -- the leftmost suffix), looped as pat_subst does.
 function M.subst_ext(val, glob, repl, all, anchor, icase, rx)
 	local n = #val
+	-- match_upattern's short cut first: the pattern made `*…*` (a `*` added where missing;
+	-- a leading `*(` counts as missing under extglob) must match the rest of the string,
+	-- or nothing matches there — which an unclosed group (`*!(Q` -> `*!(Q*`) can decide
+	local npat = glob
+	local l1, lz = glob:sub(1, 1), glob:sub(-1)
+	if l1 ~= "*" or glob:sub(2, 2) == "(" or lz ~= "*" then
+		if anchor ~= "^" and (l1 ~= "*" or glob:sub(2, 2) == "(") then
+			npat = "*" .. npat
+		end
+		if anchor ~= "$" then
+			if lz == "*" and glob:sub(-2, -2) == "\\" then
+				local k, odd = #glob - 1, false
+				while k >= 1 and glob:byte(k) == 92 do
+					odd, k = not odd, k - 1
+				end
+				if odd then
+					npat = npat .. "*"
+				end
+			elseif lz ~= "*" then
+				npat = npat .. "*"
+			end
+		end
+	end
 	local function find(from)
+		if not M.ext_match(val:sub(from), npat, icase) then
+			return nil
+		end
 		if anchor == "^" then
 			if from > 1 then
 				return nil
@@ -16317,7 +16379,9 @@ function M.substr_arith(sh, name, s)
 	local P = require("parser")
 	local sv = P.arith_cmd
 	P.arith_cmd = name
-	local ok, v = pcall(M.arith_str, sh, s)
+	-- (text with a `$`/`` ` `` left in it — an expansion's output — is never expanded again:
+	-- the strict path makes it a bad token, as bash's evalexp does)
+	local ok, v = pcall(s:find("[$`]") and require("interp").arith_expanded_eval or M.arith_str, sh, s)
 	P.arith_cmd = sv
 	if not ok then
 		if type(v) == "table" and v.__curse_matherr then -- (an arith error: DISCARD, no errexit)
