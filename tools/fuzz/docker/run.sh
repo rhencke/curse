@@ -88,20 +88,23 @@ for v in FUZZ_SECONDS FUZZ_INSTANCES FUZZ_JOBS FUZZ_TRIAGE_MAX FUZZ_DEFAULT_SECO
   [ -n "${!v+x}" ] && envs+=(-e "$v=${!v}")
 done
 
-started=0
-cleanup() { # by NAME, only a container this run started
-  [ $started = 1 ] || return 0
-  docker container inspect "$NAME" > /dev/null 2>&1 || return 0
-  echo "fuzz-docker: stopping $NAME" >&2
-  docker kill "$NAME" > /dev/null 2>&1
-  docker rm -f "$NAME" > /dev/null 2>&1
+CID="$OUT/.cid"
+rm -f "$CID"
+cleanup() { # by ID, only a container this run created (--cidfile): a `docker run` refused
+  # because another run's container holds the NAME must never stop that one
+  [ -s "$CID" ] || return 0
+  local id; id=$(cat "$CID")
+  docker container inspect "$id" > /dev/null 2>&1 || { rm -f "$CID"; return 0; }
+  echo "fuzz-docker: stopping $NAME ($id)" >&2
+  docker kill "$id" > /dev/null 2>&1
+  docker rm -f "$id" > /dev/null 2>&1
+  rm -f "$CID"
 }
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
 # Limits (each justified in README.md "Docker"):
-started=1
-timeout -k 30 "$deadline" docker run --rm --name "$NAME" --init \
+timeout -k 30 "$deadline" docker run --rm --name "$NAME" --cidfile "$CID" --init \
   --user "$(id -u):$(id -g)" \
   --read-only --tmpfs /tmp:rw,nosuid,nodev,size=256m,mode=1777 \
   --network none \
