@@ -2500,6 +2500,25 @@ function M.null_forks(redirs)
 	end
 	return false
 end
+-- ...and runs them so (both tiers): in a subshell, v never set here; $? the child's — as
+-- it was (the last substitution's), 1 when a redirection failed
+function M.null_redirs_fork(sh, redirs)
+	local I = require("interp")._int
+	local saves
+	local ok, err = pcall(sh.subshell_run, sh, function(sh)
+		local sv, rok = I.apply_redirs(sh, redirs)
+		saves = sv
+		if not rok then
+			sh.status = 1
+		end
+	end)
+	if saves then
+		M.redir_undo(saves)
+	end
+	if not ok then
+		error(err, 0)
+	end
+end
 -- The status of a command whose redirections failed: 1, or what M.redir_ext noted
 function M.redir_failst(sh)
 	local st = sh.redir_xst or 1

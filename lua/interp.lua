@@ -5841,20 +5841,7 @@ exec_stmt = function(sh, st, hook)
 			if st.redirs and rt.null_forks(st.redirs) then
 				-- (bash's execute_null_command forks for a `{v}` one or one onto fd 0: the child
 				-- does the redirections and exits — v is never set here)
-				local saves
-				local ok, err = pcall(sh.subshell_run, sh, function(sh)
-					local sv, rok = apply_redirs(sh, st.redirs)
-					saves = sv
-					if not rok then
-						sh.status = 1
-					end
-				end, nil, st)
-				if saves then
-					restore_redirs(saves)
-				end
-				if not ok then
-					error(err, 0)
-				end
+				rt.null_redirs_fork(sh, st.redirs)
 			elseif st.redirs then
 				local save, ok = apply_redirs(sh, st.redirs)
 				if not ok then

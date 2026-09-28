@@ -5379,8 +5379,11 @@ end
 local simple_compiled
 H.simple = function(cx, st, after)
 	-- (a null command whose redirections bash runs in a forked child: rt.null_forks)
-	if not (st.words and st.words[1]) and st.redirs and require("runtime").null_forks(st.redirs) then
-		return cx.refuse(st, after)
+	if not (st.words and st.words[1]) and not st.assigns and st.redirs and require("runtime").null_forks(st.redirs) then
+		local p = cx.newpc()
+		cx.blocks[p] = ("%ssh.status = 0; rt.null_redirs_fork(sh, %s[1]); %s; pc = %d"):format(dbg(st), EF.konst({ ser(st.redirs) }),
+			'sh:array_assign("PIPESTATUS", { tostring(sh.status) }, false)', after)
+		return p
 	end
 	-- set -k (keyword): an assignment-shaped word anywhere is an assignment for the command
 	-- (interp's exec_stmt): compile that reading too, and pick by sh.opt_k at run time

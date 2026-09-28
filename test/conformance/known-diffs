@@ -4,6 +4,11 @@
 # A ratchet: an entry that matches bash again is STALE and fails the run until removed.
 # Nothing goes here to hide noise — normalise it in the harness instead.
 
+# jobs/wait owner (queue.md "stderr gate triage" #1): `wait` on stopped jobs — curse also
+# warns "job 1[…] stopped" (bash warns only for job 3, twice), and prints the "Killed"
+# notices at lines 16/23 where bash prints them at 15/21. stdout and status match.
+cases 2538-wait-job-stops.sh stderr
+
 # queue.md "stderr gate triage" #3: interp only: in a GBK locale, the last line's
 # `( set -x; …; [[ $s == "$s" ]] )` returns 1 (bash: 0) — the traced quoted [[ ]] pattern
 # of a double-byte char with an ASCII trail byte doesn't match itself. Output matches.

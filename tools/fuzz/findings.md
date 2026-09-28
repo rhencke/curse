@@ -592,7 +592,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   reader exits (SIGPIPE race). `{ trap ':' USR1; kill -USR1 $$; }` in a pipeline stage:
   a signal to the main shell racing the other stage.
 
-## F53. `A=$((()))$(())`: the arithmetic error escapes as a parse error
+## F53. FIXED — `A=$((()))$(())`: the arithmetic error escapes as a parse error
 
     A=$((()))$(())
 
@@ -600,14 +600,14 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - curse (all tiers): escaped `unexpected EOF while looking for matching `"'` (no prefix);
   an AFL crash. `echo $((()))$(())` agrees: only in an assignment value.
 
-## F54. `$[${]`: escaped parse error instead of a bad substitution
+## F54. FIXED — `$[${]`: escaped parse error instead of a bad substitution
 
     echo $[${]
 
 - bash: `S: line 1: ${: bad substitution`.
 - curse (all tiers): escaped `unexpected EOF while looking for matching `}'`. Also `A=$[${]`.
 
-## F55. `${x/${/}}` still escapes (listed under "Variants of known entries" as F2/F5's, never fixed)
+## F55. FIXED — `${x/${/}}` still escapes (listed under "Variants of known entries" as F2/F5's, never fixed)
 
     x=a; echo ${x/${/}}
 
@@ -615,7 +615,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - curse (all tiers): escaped `unexpected EOF while looking for matching `}'`. Found as
   `{ "${#/${/}}";}`; 39 of the campaign's 46 crash inputs are F53/F54/F55.
 
-## F56. An arithmetic error in a subscript inside an EXIT trap: `(non-string error)` escapes
+## F56. FIXED — An arithmetic error in a subscript inside an EXIT trap: `(non-string error)` escapes
 
     trap '$[a[!]]' EXIT
 
@@ -623,7 +623,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - curse interp/compiled/tiered: the same line, then `(non-string error)`; static:
   `…/bash: (error object is not a string)`; status differs. An AFL crash.
 
-## F57. `for NAME in WORDS do` / `select NAME in WORDS do` (no `;`) is accepted
+## F57. FIXED — `for NAME in WORDS do` / `select NAME in WORDS do` (no `;`) is accepted
 
     for i in a do :; done
     select S in a do :; done
@@ -631,7 +631,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - bash: `syntax error near unexpected token `done'`, status 2.
 - curse (all tiers): runs (`do` is taken as the loop keyword; select prints its menu).
 
-## F58. `$(for i in 1; do break 2; done)`: escaped `attempt to compare number with nil`
+## F58. FIXED — `$(for i in 1; do break 2; done)`: escaped `attempt to compare number with nil`
 
     echo $(for i in 1; do break 2; done)
 
@@ -639,14 +639,14 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - curse interp / tiered / static: `curse:eval:16: attempt to compare number with nil` (the
   comsub's lifted chunk), status 1. Found inside a `select` word list.
 
-## F59. The `select` menu is always one column
+## F59. FIXED — The `select` menu is always one column
 
     select x in aaaaaaaaaaaaaa b c d e; do break; done <<< 1
 
 - bash: columns across `COLUMNS` (80): `1) aaaaaaaaaaaaaa  3) c` / `2) b ...`.
 - curse (all tiers): one item per line (runtime select_menu has no print_select_list layout).
 
-## F60. A syntax error inside `<( )` / `>( )` is not a parse error of the script
+## F60. FIXED — A syntax error inside `<( )` / `>( )` is not a parse error of the script
 
     cat <(:
     function f)
@@ -655,7 +655,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - curse (all tiers): `cat: command not found`, then `line 4: syntax error: unexpected end
   of file` (the body is parsed when it runs). `$( )` agrees. Probably F47's root.
 
-## F61. Interp/tiered: a missing operand after `?:` is not diagnosed
+## F61. FIXED — Interp/tiered: a missing operand after `?:` is not diagnosed
 
     echo $(( i ? $v ? 1 : 2 : 3 ))
     echo $(( 0 ? 1 : a && $a ))x
@@ -664,21 +664,21 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   `(… "&&  ")`, status 1.
 - curse interp / tiered / static: print `3` / `0x`, status 0 (also `$[(FUNCNAME) ? $b : x]`).
 
-## F62. Compiled tier: an arithmetic error in a `for … in` word list names the line of `do`
+## F62. FIXED — Compiled tier: an arithmetic error in a `for … in` word list names the line of `do`
 
     for a in $(( 1 ? : 3 ))
     do echo in; done
 
 - bash and the other tiers: `line 1:`; compiled: `line 2:`.
 
-## F63. `shift x 2`: argument count checked before the numeric check
+## F63. FIXED — `shift x 2`: argument count checked before the numeric check
 
     shift x 2; echo after $?
 
 - bash: `shift: x: numeric argument required`, `after 1`.
 - curse (all tiers): `shift: too many arguments`, and the script exits.
 
-## F64. A trap handler re-entered from itself: line numbers restart
+## F64. FIXED — A trap handler re-entered from itself: line numbers restart
 
     trap '((n++ < 1)) && kill -USR1 $$
     foo' USR1; kill -USR1 $$
@@ -686,7 +686,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - bash: `S: line 2: foo: command not found` twice.
 - curse (all tiers): `line 1:` for the inner run, `line 2:` for the outer.
 
-## F65. A quoted word before `()` is a function definition to bash's parser
+## F65. FIXED — A quoted word before `()` is a function definition to bash's parser
 
     'f'() { echo hi; }; echo st=$?
     ''()
@@ -695,33 +695,33 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   unexpected end of file`.
 - curse (all tiers): `syntax error near unexpected token `)'`, status 2.
 
-## F66. `${#v[x y]}` with v unset: bash never evaluates the subscript
+## F66. FIXED — `${#v[x y]}` with v unset: bash never evaluates the subscript
 
     echo ${#v[x y]}
 
 - bash: `0`. curse (all tiers): `x y: syntax error in expression (error token is "y")`.
   With `v=(1)` both give the error.
 
-## F67. Compiled tier: a function definition does not reset `$?`
+## F67. FIXED — Compiled tier: a function definition does not reset `$?`
 
     false; g () { :; }; echo $?
 
 - bash and the other tiers: `0`; compiled: `1`.
 
-## F68. Compiled tier: an internal name leaks into an arithmetic error
+## F68. FIXED — Compiled tier: an internal name leaks into an arithmetic error
 
     echo $(( x[ $v < ${#a} ] ))
 
 - bash and the other tiers: `< 0 : syntax error: operand expected (error token is "< 0 ")`.
 - compiled: `… "< __curse_len_a "`.
 
-## F69. `for x >&f`: the unexpected token is `>&`, not `>`
+## F69. FIXED — `for x >&f`: the unexpected token is `>&`, not `>`
 
     for x >&f
 
 - bash: `syntax error near unexpected token `>&'`. curse (all tiers): `` `>' ``. Same in eval.
 
-## F70. An unterminated `$[` in a here-document inside `$( )`
+## F70. FIXED — An unterminated `$[` in a here-document inside `$( )`
 
     x=$(cat <<EOF
     $[a[
@@ -732,7 +732,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - curse (all tiers): an arithmetic error with the body's text: `S: line 4: a[` /
   `: bad array subscript (error token is "a[` / `")`.
 
-## F71. A redirection error on a multi-line compound names its last line
+## F71. FIXED — A redirection error on a multi-line compound names its last line
 
     for ((;;))
     do
@@ -741,7 +741,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 
 - bash: `S: line 1: v: ambiguous redirect`. curse (all tiers): `line 4:`.
 
-## F72. `(( BASH_COMMAND ))`: the recursion error's token (and compiled: no line)
+## F72. FIXED — `(( BASH_COMMAND ))`: the recursion error's token (and compiled: no line)
 
     (( BASH_COMMAND ))
 
@@ -749,13 +749,13 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - curse: `(error token is "(( BASH_COMMAND ))")`; compiled also drops `line 1: `. With
   `!!BASH_COMMAND & $A` curse says `syntax error in expression` instead.
 
-## F73. An arithmetic error in `(( ))` shows `${…}` unexpanded
+## F73. FIXED — An arithmetic error in `(( ))` shows `${…}` unexpanded
 
     b=; (( 2 % (i /= i[${#b}]) ))
 
 - bash: `((: 2 % (i /= i[0]) : division by 0 …`. curse (all tiers): `… i[${#b}]) …`.
 
-## F74. `1 ? (0) ? ~x *= 1 : 2 : 3`: the wrong error
+## F74. FIXED — `1 ? (0) ? ~x *= 1 : 2 : 3`: the wrong error
 
     echo $(( 1 ? (0) ? ~x *= 1 : 2 : 3 ))
 
@@ -764,48 +764,48 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   Same family: `echo $(( ((b) ^ A /= 2) ))` — bash `attempted assignment to non-variable`,
   curse `` missing `)' ``.
 
-## F75. `$\A` in an arithmetic subscript: bash removes the backslash in the message
+## F75. FIXED — `$\A` in an arithmetic subscript: bash removes the backslash in the message
 
     echo $[a[$\A]]
 
 - bash: `$A: syntax error: operand expected (error token is "$A")`. curse: `$\A` both places.
 
-## F76. Compiled tier: a backquote inside `[[ ]]` reports the previous line
+## F76. FIXED — Compiled tier: a backquote inside `[[ ]]` reports the previous line
 
     (( 1 ))
     [[ ( `export -f b[]=` -gt 1 ) ]]
 
 - bash and the other tiers: `S: line 2: export: b[]=: not a function`; compiled: `line 1:`.
 
-## F77. `[[ !(a >| b) ]]`: bash's parse-error wording
+## F77. FIXED — `[[ !(a >| b) ]]`: bash's parse-error wording
 
     [[ !(a >| b) ]]
 
 - bash: `unexpected token `>|', conditional binary operator expected`, then `syntax error
   near `|'`. curse (all tiers): `expected `)'`, `syntax error near `b)'`.
 
-## F78. `[[ x -le @(a|b) ]]` without extglob: a parse error in bash
+## F78. FIXED — `[[ x -le @(a|b) ]]` without extglob: a parse error in bash
 
     [[ x -le @(a|b) ]]
 
 - bash: `syntax error in conditional expression: unexpected token `('`, status 2.
 - curse (all tiers): evaluates it: `[[: @(a|b): syntax error: operand expected`.
 
-## F79. Interp/tiered: `break` in a `for` word list's command substitution
+## F79. FIXED — Interp/tiered: `break` in a `for` word list's command substitution
 
     for i in `break -1 b`; do :; done
 
 - bash, curse compiled: `break: too many arguments`.
 - curse interp / tiered / static: `break: only meaningful in a `for', `while', or `until' loop`.
 
-## F80. Two here-documents on one line: the second's EOF warning names line 1
+## F80. FIXED — Two here-documents on one line: the second's EOF warning names line 1
 
     cat << A << B
 
 - bash: `… here-document at line 1 … (wanted `A')`, then `… at line 2 … (wanted `B')`.
 - curse (all tiers): `at line 1` for both.
 
-## F81. An unterminated quoted here-doc delimiter inside `${v=$( … )}`: the EOF error's line
+## F81. FIXED — An unterminated quoted here-doc delimiter inside `${v=$( … )}`: the EOF error's line
 
     echo ${M=$(cat <<"\"
     x
@@ -815,7 +815,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - bash: `S: line 1: unexpected EOF while looking for matching `"'`.
 - curse (all tiers): `S: line 4: …`.
 
-## F82. `{v}<&10` with fd 10 closed: no error
+## F82. FIXED — `{v}<&10` with fd 10 closed: no error
 
     {v}<&10; echo st=$?
 
@@ -823,7 +823,7 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   fd: Bad file descriptor`, `st=1`.
 - curse (all tiers): silent, `st=0`.
 
-## F83. An unterminated `$(` in a here-document body: earlier expansions not run; compiled: line 1
+## F83. FIXED — An unterminated `$(` in a here-document body: earlier expansions not run; compiled: line 1
 
     cat <<F
     $(nosuch)$(
@@ -832,14 +832,14 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   substitution: line 4: unexpected EOF while looking for matching `)'`, status 127.
 - curse (all tiers): no `nosuch` line, status 1; compiled also says `line 1:` for the EOF.
 
-## F84. Interp/tiered: the DEBUG trap misses a command after an async one
+## F84. FIXED — Interp/tiered: the DEBUG trap misses a command after an async one
 
     trap 'echo D' DEBUG; x=1 & wait
 
 - bash, curse compiled: `D` twice.
 - curse interp / tiered / static: once.
 
-## F85. `disown` in a pipeline in a command substitution before a command word (reduced, root open)
+## F85. FIXED — `disown` in a pipeline in a command substitution before a command word (reduced, root open)
 
     BASH_SOURCE=$(disown|while(())do c;done) p
 
@@ -847,14 +847,14 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
 - curse (all tiers): `disown: current: no such job` first. `x=$(disown | :)` agrees (both
   print it); reduced by ddmin in the container, not narrowed further.
 
-## F86. `declare -n BASH_ARGV["a b"]=x`: no error for the special array
+## F86. FIXED — `declare -n BASH_ARGV["a b"]=x`: no error for the special array
 
     declare -n BASH_ARGV["a b"]=x
 
 - bash: `S: line 1: declare: BASH_ARGV[a b]: reference variable cannot be an array`, status 1.
 - curse (all tiers): silent, status 1. (`declare -n A["a b"]=x` agrees.)
 
-## F87. Interp/tiered: a redirection error of a group on the left of `||` loses `line N:`
+## F87. FIXED — Interp/tiered: a redirection error of a group on the left of `||` loses `line N:`
 
     { :; } > "$x" || :
 
@@ -925,3 +925,55 @@ signal race; known.tsv), one is UB (unbounded recursion), one now agrees.
   test/cases/2747-prefix-then-reserved-word.sh
 - F50 FIXED — a syntax error where the line's list could end gathers the line's
   here-document bodies first (bash's simple_list reduction). test/cases/2748-syntax-error-pending-heredoc.sh
+
+# Fix notes, F53–F87 (fix-f53)
+
+- F53–F55 FIXED — the class: every text the parser stores raw and re-reads while a command
+  runs (${…} operands, subscripts, redirect targets, case patterns, arithmetic `$…` chunks,
+  prompts, mail/env-file texts, the compiled tier's assoc keys) now goes through ONE guarded
+  entry, parser.reword: a construct left open is an error part, never a raised Lua string.
+  Each earlier fix (F2, F5, F48) had guarded one more site; `grep -nE "(parse_word|
+  parse_default_quoted|parse_heredoc)\b" lua/*.lua` outside parser/emit now shows only
+  pcall'd or reword'd reads (emit's compile-time reads go through EF.pword → no compiled
+  form). Roots: `A=$((()))$(())` taken as one $((…)); ${x/PAT/REP} split on a `/` inside a
+  nested ${…}/$(…)/`…` (skip_to_delim); a ${ nested inside $((…)) (bash's P_ARITH nests
+  only $( ). test/cases/2749-reread-open-dolbrace.sh
+- F56 FIXED — a DISCARD out of the EXIT trap ends the handler with the saved status (one
+  runner for every EXIT trap, interp.run_trap_str); the compiled subscript error is a DISCARD
+  too; `exit` in a sourced file runs the EXIT trap in the file's frame.
+  test/cases/2750-exit-trap-subscript-discard.sh
+- F57 FIXED — `do` in a for/select list is a word. test/cases/2758-for-in-do-word.sh
+- F58 FIXED — Shell.new sets loopdepth 0. test/cases/2751-comsub-break-past-loops.sh
+- F59 FIXED — select's menu: print_select_list's columns. test/cases/2759-select-menu-columns.sh
+- F60 FIXED — <( )/>( ) bodies syntax-checked as the word is read.
+  test/cases/2760-procsub-body-syntax-error.sh
+- F61 FIXED on main before this work (by F36's vetting of every $name). F64 FIXED on main
+  (by F40's trap line numbering); F80 FIXED on main (by F47; the reduced repro above lost the
+  body line: `cat << A << B⏎x`). Pinned: test/cases/2776-fixed-by-fuzz3-pins.sh
+- F62 FIXED — the for/select list block takes the loop's line. test/cases/2752-for-list-error-line.sh
+- F63 FIXED — shift: the number, then the count. test/cases/2761-shift-numeric-first.sh
+- F65 FIXED — a quoted/escaped word before `()` names a function (invalid when it runs).
+  test/cases/2762-quoted-funcdef-name.sh
+- F66 FIXED — ${#NAME[SUB]} looks at NAME first (rt.elem_len_pre). test/cases/2763-len-subscript-unset.sh
+- F67 FIXED — compiled function definitions set $? 0. test/cases/2753-funcdef-status.sh
+- F68 FIXED — ${#name} in a subscript isn't rewritten. test/cases/2754-arith-len-in-subscript-error.sh
+- F69 FIXED — the whole operator token after `for NAME`. test/cases/2764-for-header-operator-token.sh
+- F70, F83 FIXED — a here-document body's open $[ / `…` / $( is an error part at its place.
+  test/cases/2765-heredoc-open-construct.sh
+- F71, F87 FIXED — a compound's redirection error names bash's executing_line_number
+  (rt.compound_line). test/cases/2766-compound-redirect-error-line.sh
+- F72 FIXED — recursion level checked where bash's pushexp does, reported in the enclosing
+  expression. test/cases/2767-arith-recursion-error-token.sh
+- F73 FIXED — arithmetic faults show the expanded text. test/cases/2768-arith-error-expanded-text.sh
+- F74 FIXED — test/cases/2769-arith-assign-non-variable.sh
+- F75 FIXED — test/cases/2770-arith-subscript-dollar-backslash.sh
+- F76 FIXED — rt.compiled_line for a $(…) in arithmetic text. test/cases/2755-arith-comsub-body-line.sh
+- F77, F78 FIXED — test/cases/2771-dbracket-operator-tokens.sh
+- F79 FIXED — test/cases/2756-for-list-break-in-loop.sh
+- F81 FIXED — test/cases/2772-comsub-heredoc-delimiter-eof.sh
+- F82 FIXED — test/cases/2773-varassign-dup-closed-fd.sh
+- F84 FIXED — test/cases/2757-debug-trap-async.sh
+- F85 FIXED — the root was not disown/pipelines: a prefix binding of a readonly/noassign
+  variable is refused before its value expands (BASH_SOURCE=$(…) p ran nothing in bash).
+  test/cases/2774-prefix-noassign-no-expansion.sh
+- F86 FIXED — test/cases/2775-nameref-noassign-array.sh
