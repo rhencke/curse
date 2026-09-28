@@ -480,6 +480,17 @@ int curse_held_takeall(int set, unsigned char *out)
   return n;
 }
 
+/* Take `s` alone out of `set`: 1 when it was held. */
+int curse_held_del(int set, int s)
+{
+  uint64_t bit;
+  if (set < 0 || set >= 2 || s <= 0 || s >= CURSE_NSIG) return 0;
+  bit = (uint64_t)1 << (s - 1);
+  if (!(curse_held_set[set] & bit)) return 0;
+  curse_held_set[set] &= ~bit;
+  return 1;
+}
+
 int curse_held_any(int set)
 {
   return set >= 0 && set < 2 && curse_held_set[set] != 0;

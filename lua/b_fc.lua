@@ -36,7 +36,7 @@ local function exec_string(sh, code, hook)
 						error(serr)
 					end
 					sh.noerr = ne0
-					rt.line_aborted(sh, 1, pf0)
+					rt.line_aborted(sh, 1, pf0, serr)
 					break
 				end
 				error(serr)

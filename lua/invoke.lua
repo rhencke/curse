@@ -235,7 +235,7 @@ local function env_file(sh, var)
 	if v and v ~= "" then
 		if v:find("[$`\\]") then
 			local ok, x = pcall(function()
-				return require("interp")._int.expand_word(sh, require("parser").parse_heredoc(v, false))
+				return require("interp")._int.expand_word(sh, require("parser").reword(v, "hd", false))
 			end)
 			v = ok and x or v
 		end

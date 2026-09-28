@@ -24,7 +24,14 @@ return function(sh, cmd, args, hook, tcb)
 			sh.arith_let = true -- (its text is already expanded: see arith_key)
 			for k = 2, #args do
 				local ok, v = pcall(function()
+					-- (expr.c's expr_skipsubscript on already-expanded text: with assoc_expand_once,
+					-- an associative array's key runs to its first `]` — parser.let_noexpand)
+					local sn = P.let_noexpand
+					P.let_noexpand = sh.shopt.assoc_expand_once and function(nm)
+						return sh:is_assoc(nm)
+					end or nil
 					local pok, ast = pcall(P.arith, args[k], "let") -- (args are already expanded)
+					P.let_noexpand = sn
 					if not pok then
 						P.trap_flow(ast)
 					end

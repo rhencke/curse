@@ -26,6 +26,7 @@ extern char curse_aopen_result[];
 extern char curse_aopen_start[];
 extern char curse_held_add[];
 extern char curse_held_any[];
+extern char curse_held_del[];
 extern char curse_held_take[];
 extern char curse_held_takeall[];
 extern char curse_ldfmt[];
@@ -183,6 +184,7 @@ static const curse_sym_t curse_syms[] = {
   { "curse_aopen_start", (void*)curse_aopen_start },
   { "curse_held_add", (void*)curse_held_add },
   { "curse_held_any", (void*)curse_held_any },
+  { "curse_held_del", (void*)curse_held_del },
   { "curse_held_take", (void*)curse_held_take },
   { "curse_held_takeall", (void*)curse_held_takeall },
   { "curse_ldfmt", (void*)curse_ldfmt },

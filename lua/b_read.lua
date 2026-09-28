@@ -265,11 +265,14 @@ return function(sh, cmd, args, hook, tcb)
 		end
 		do
 			local buf, got = {}, false
+			-- (a backslash delimiter without -r: read.def sees each `\` as an escape first,
+			-- so it never delimits — the bulk scans below, which split at the delimiter, can't)
+			local bulkok = raw or dch ~= "\\"
 			while true do
 				-- a chunked (regular-file) read: take the run up to the delimiter at once
 				-- when it needs no per-char handling (no backslash, NUL, CTLESC)
 				local bulk = false
-				if st.chunk and not nchars then
+				if st.chunk and not nchars and bulkok then
 					if st.ci > #st.chunk then -- (a short first read: lines are usually short, and
 						-- whatever is past the line is read again by the next `read`)
 						local n = C.read(ufd, rdbuf, st.chunk == "" and #buf == 0 and 128 or RDBUF)
@@ -295,7 +298,7 @@ return function(sh, cmd, args, hook, tcb)
 						end
 					end
 				end
-				if fifo and not nchars and st.pc.pb == "" then
+				if fifo and bulkok and not nchars and st.pc.pb == "" then
 					local pc = st.pc
 					if pc.pos > #pc.data then -- (nothing peeked left: peek again)
 						local d = rt.pipe_peek(ufd, rdbuf, RDBUF)
@@ -421,6 +424,9 @@ return function(sh, cmd, args, hook, tcb)
 				io.stderr:write("curse: read: " .. arr .. ": not an indexed array\n")
 				sh.status = 1
 				return
+			elseif arr and ndelim then -- (-N: read.def splits with an empty IFS — one element,
+				-- the whole text, none when nothing was read: list_string)
+				sh:array_assign(arr, line == "" and {} or { saw and (line:gsub("\1(.)", "%1")) or line }, false)
 			elseif arr then
 				sh:array_assign(arr, rt.ifs_split(sh, line, nomark, saw), false)
 			elseif ndelim then -- -N: no IFS processing; first var gets everything, rest empty
