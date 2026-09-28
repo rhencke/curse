@@ -4,6 +4,7 @@
     FUZZ_SECONDS=3600 meson compile -C build fuzz
     FUZZ_INSTANCES="gram:tiered gram:compiled" meson compile -C build fuzz
     meson compile -C build fuzz-triage   # re-triage the whole persistent queue
+    meson compile -C build fuzz-docker   # the same campaign in a hardened container
 
 `fuzz` is a run target, never part of `meson test`. It needs AFL++ (`afl-cc`,
 `afl-fuzz`, `afl-cmin`; Debian: `apt install afl++`) when the build dir is configured;
@@ -19,10 +20,13 @@ without it the target only prints how to get it. The differential step needs the
   code is the same VM loop for every script). Oracle: an escaped Lua error, or a
   Lua-internal message on stderr (`attempt to `, tracebacks, `module:line:`), aborts =
   an AFL crash. Each input runs in `sandbox.h`'s sandbox: read-only mount tree, private
-  tmpfs cwd and `$TMPDIR`, empty `PATH` (builtins only), rlimits (5 s CPU, 1 MB files, 2 GB AS), and
-  every instance runs inside its own user+pid namespace (`fuzz.sh in_ns`; `afl-fuzz -V`
-  ends it on time), so `kill -1`,
-  orphaned jobs and stray signals stay inside it.
+  tmpfs cwd and `$TMPDIR`, empty `PATH` (builtins only), rlimits (5 s CPU, 1 MB files, 2 GB AS,
+  256 processes), and every instance runs inside its own user+pid namespace (`fuzz.sh
+  in_ns`; `afl-fuzz -V` ends it on time), so `kill -1`, orphaned jobs and stray signals
+  stay inside it. Each exec's script also gets a pid namespace of its own (a tiny init as
+  pid 1, the script as pid 2, so `kill $$` still works): whatever it leaves running -- a
+  `/bin/sh` fork bomb, a job ignoring signals -- dies with the exec instead of starving the
+  next one (about 0.25 ms per exec; `FUZZ_NO_EXEC_NS=1` turns it off).
 - **Instances**: at most two (`FUZZ_INSTANCES`, default `gram:tiered byte:tiered`):
   `gram` = the grammar-aware custom mutator below plus AFL's own havoc; `byte` = AFL's
   byte-level mutators only. Both use `sh.dict` and a dictionary extracted from bash's
@@ -43,6 +47,54 @@ without it the target only prints how to get it. The differential step needs the
 `cmp.sh` masks: the sandbox script path, digit runs of 4+ (pids, `$!`), `time`/`times`
 figures, and the order of job-status lines. Inputs using `$RANDOM`, `jobs`, `$!`, `times`
 etc. are bucketed as NOISE rather than reported.
+
+## Docker (`fuzz-docker`): one contained, globally budgeted campaign
+
+    meson compile -C build fuzz-docker
+    FUZZ_DOCKER_OUT=~/fuzz-out FUZZ_SECONDS=3600 FUZZ_INSTANCES="gram:tiered gram:compiled" \
+      meson compile -C build fuzz-docker
+    tools/fuzz/docker/run.sh exec CMD...   # any command in the same container (probes)
+
+`docker/run.sh` builds `curse-fuzz:latest` (`docker/Dockerfile`: Debian trixie by digest,
+AFL++ 4.21c from apt, the same release as the host so the meson-built harness, luajit,
+curse and bash oracle run unchanged) and runs `fuzz.sh campaign` (or `triage`, `seeds`)
+inside it. `FUZZ_SECONDS`, `FUZZ_INSTANCES`, `FUZZ_JOBS`, `FUZZ_TRIAGE_MAX`, `GRAM_*`
+pass through. State (seeds, queues, triage) is `FUZZ_DOCKER_OUT` (default `FUZZ_WORK`,
+`build/fuzz-work`), mounted at `/fuzz-work`: the next run resumes its queues.
+
+**One budget for the whole host.** All instances of a campaign share one container; the
+container name is fixed (`curse-fuzz`) and `run.sh` takes `flock -n` on
+`FUZZ_DOCKER_OUT/.lock`: a second `fuzz-docker` (same or another output dir, another
+agent) is refused with a message, never queued or started alongside.
+
+| limit | why |
+|---|---|
+| `--cpus 2` (cgroup `cpu.max 200000 100000`) | the host always keeps 2 of its 4 cores |
+| `--cpu-shares 128` (`cpu.weight` 5) | yields to other containers/services even inside the cap (the user and system slices still split an overcommitted host evenly: the cap is what guarantees the 2 cores); `AFL_NO_AFFINITY=1`, no core pinning |
+| `--memory 4g --memory-swap 4g` | no swap; an OOM stays inside the container's cgroup |
+| `--pids-limit 2048` | fork bombs (the effective process cap; `--ulimit nproc=8192` is per host uid, so only a backstop) |
+| `--ulimit nofile=4096 fsize=1G core=0` | fd exhaustion, one runaway file, core dumps |
+| `--read-only`, `--tmpfs /tmp:size=256m`, `--network none` | the only writable host path is `FUZZ_DOCKER_OUT`; the repo and the build are mounted read-only |
+| `--user UID:GID --cap-drop ALL --security-opt no-new-privileges` | no capability is added back: none is needed (below) |
+| `--security-opt seccomp=docker/seccomp.json` | Docker 26.1.5's default profile plus one rule, below |
+| host `timeout` + `--stop-timeout 30` + `--init` | `FUZZ_SECONDS` + 300 s + `FUZZ_DOCKER_SLACK` (3600: seeds, triage); a container still there afterwards is killed by its name |
+| in-container watchdog | the container ends if `/fuzz-work` exceeds 3 GB (`FUZZ_DOCKER_MAXKB`); `fuzz.sh`'s 1 GB free-space check stays |
+
+**The per-exec sandbox still applies inside.** A fuzzed script must not be able to touch
+AFL's queue either, so `sandbox.h` (read-only mount tree, private tmpfs) and `fuzz.sh
+in_ns` (user+pid namespace: `kill -1`, orphans) keep working in the container. They need
+`unshare`, `mount` and `mount_setattr`, which Docker's default seccomp profile allows only
+with `CAP_SYS_ADMIN`; `seccomp.json` allows those three syscalls without it. That grants
+nothing by itself: the kernel still requires `CAP_SYS_ADMIN` in the user namespace that
+owns the target, which the (capability-less, non-root) container user only has in the
+namespaces it creates itself, so it can only mount inside its own fresh mount namespace.
+AppArmor stays `docker-default`. The container runs as the host user, not root: mapping
+uid 0 into a new user namespace would need `CAP_SETFCAP`. Two things differ from the
+host: `in_ns` gets no private `/proc` (`FUZZ_NS_PROC=0`: Docker over-mounts parts of
+`/proc` and the kernel refuses a fresh proc mount in a user namespace while anything in it
+is hidden; the pid namespace, which is what contains `kill -1`, doesn't need it), and
+triage (`cmp.sh`, `sig.sh`) runs each shell in its own user+pid namespace too, on the host
+as well: the bash oracle's real `kill -9 -1` otherwise reaches every process of the user.
 
 ## The grammar mutator (`gram_mutator.c` + `gram.lua`)
 
@@ -112,4 +164,5 @@ Env: `GRAM_COUNT` (custom mutations per queue entry, 2048: about half the execut
 | `gram_mutator.c`, `gram.lua` | the grammar-aware custom mutator |
 | `cmp.sh`, `sig.sh`, `bundle-line.sh` | differential check, crash signature, bundle line map |
 | `known.tsv` | known-issue buckets for triage |
+| `docker/Dockerfile`, `docker/run.sh`, `docker/seccomp.json` | the `fuzz-docker` container, its limits, the seccomp profile |
 | `sh.dict`, `mkdict.sh` | dictionaries |

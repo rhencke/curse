@@ -10,7 +10,8 @@ D=$W/sbx/sig; mkdir -p "$D"
 # (the mode of the instance that found it: out/MUTATOR-MODE/default/crashes/…)
 mode=${FUZZ_MODE:-}
 [ -z "$mode" ] && case $f in */out/*-interp/*) mode=interp ;; */out/*-compiled/*) mode=compiled ;; *) mode=tiered ;; esac
-o=$( (ulimit -f 2048; exec unshare -Ur env FUZZ_SBX="$D" FUZZ_MODE="$mode" timeout -k 2 5 "$B/harness-plain") < "$f" 2>&1 >/dev/null); rc=$?
+# (own user+pid namespace: a `kill -9 -1` reaches only this run)
+o=$( (ulimit -f 2048; exec unshare -Urpf --kill-child env FUZZ_SBX="$D" FUZZ_MODE="$mode" timeout -k 2 5 "$B/harness-plain") < "$f" 2>&1 >/dev/null); rc=$?
 if [ $rc = 124 ] || [ $rc = 137 ]; then sig="TIMEOUT(5s)"
 elif [ $rc != 134 ]; then sig="no-repro(rc=$rc)"
 else

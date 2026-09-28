@@ -28,9 +28,9 @@ mask() {
     grep -aE '^\[[0-9]+\][-+ ] +(Running|Done|Stopped|Terminated|Exit|Killed)' "$1" | LC_ALL=C sort; } > "$1.m"
   mv "$1.m" "$1"
 }
-run() { # name cmd...
+run() { # name cmd...  (own user+pid namespace: a `kill -9 -1` reaches only that run)
   local n=$1; shift
-  (ulimit -f 2048; exec unshare -Ur timeout -k 2 5 "$@") > "$T/$n.out" 2> "$T/$n.err"
+  (ulimit -f 2048; exec unshare -Urpf --kill-child timeout -k 2 5 "$@") > "$T/$n.out" 2> "$T/$n.err"
   echo $? > "$T/$n.st"
   mask "$T/$n.out"; mask "$T/$n.err"
 }
