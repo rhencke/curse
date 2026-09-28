@@ -1310,3 +1310,29 @@ losing its `line N:` prefix, turned out to already be fixed by that merge's
   incidental — reduces without it; needs the trap set through `eval`, not a literal
   top-level `trap` statement (a bare `trap "v='!'" ERR` at top level does not trigger it).
   (gram:tiers queue, the in-loop tier oracle: interp vs compiled vs tiered)
+
+## Campaign 3 (gram:arith + gram:pexp, containerized), branch fuzz-night
+
+Both targeted fuzzers (persistent AFL loop over curse's own forkserver child, README
+"Targeted in-process fuzzers"); every candidate below was independently re-run through
+`harness-plain` (one process, no loop) with a fresh `unshare` before being recorded, per
+the campaign brief's fork-per-input verification requirement, since `FUZZ_TLOOP=1` isn't
+wired through `docker/run.sh`'s env passthrough.
+
+## F122. `${name[*]@A}` / `${name[@]@A}` on a plain scalar: bash uses the light `${@Q}`-style quoting, curse uses full `declare -p` output
+
+    w='hello world'
+    echo "${w[*]@A}"
+    echo "${w[@]@A}"
+    echo "${w@A}"
+
+- bash: `w='hello world'` for all three (a `[*]`/`[@]` subscript on a non-array name makes
+  `@A` fall back to the same lightweight `name='value'` form as the subscript-less
+  `${w@A}`, not `declare -p`'s output).
+- curse (all tiers): `declare -- w="hello world"` for the first two (the generic
+  `declare -p`-style format, as if `w` were addressed by `declare -p w`), only agreeing
+  with bash on the subscript-less `${w@A}`. Found by `gram:pexp` (this shape — any
+  `${VAR[*]@A}`/`${VAR[@]@A}` on a scalar — was the majority of the campaign's ~140
+  unbucketed pexp signatures, e.g. `${r+${w[*]@A}} ${lo:x}`); confirmed fresh with
+  `harness-plain` before reduction, then reduced and reconfirmed with `cmp.sh` outside the
+  target harness.
