@@ -119,5 +119,27 @@ F26	sig-fixed	\[\\\[:
 F2	sig-fixed	unexpected EOF while looking for matching
 F11	sig-fixed	^all\|status N vs N
 F10	sig-fixed	near unexpected token `X'.*
+F88	both	^tiers:compiled:out	BASH_LINENO
+F89	both	command not found	\$\([^)]*<\(
+F90	both	^tiers:compiled:err\|< S: line N: .*command not found	(declare|typeset|local) -n
+F91	both	^tiers:compiled:err	(shift|return|break|continue|exit|set|shopt|unset|readonly|export)( [^;&|]*)? [^;&|]* 2>
+F92	both	^tiers:.*status	[^[:print:][:space:]]
+F94	both	^target:(de)?parse:	(^|[;&|{( \t])time[ \t]
+F95	both	^target:(de)?parse:.*here-document	<<
+F96	both	^target:deparse:	\$'
+F97	both	^target:deparse:	\$\{[^}]*"[^"]*\$"
+F99	sig	^target:arith:.*operand expected.*\|> .*operand expected
+F100	sig	^target:arith:.*bad array subscript\|> .*bad array subscript
+F101	both	^target:arith:	"
+F104	both	^target:arith:	\x0c
+F106	sig	escaped: .*b_eval.*parser:[0-9]+: unexpected EOF
+F107	both	^target:pexp:	\$\{[^}]*:[^}]*\$[@*]
+F109	both	^target:printf:	%[^a-zA-Z%]*\.-
+F110	both	^target:glob:	[@*+?!]\(
+F112	both	^target:read:	-N
+F115	both	^target:regex:	^l 
+F116	sig	^target:(de)?parse:.*\|> parse=N
+F117	sig	^target:(de)?parse:.*unexpected token
+F118	both	^target:pexp:output\|< S: line N: X: bad array subscript	\[-[0-9]
 NOISE	src	`set`|\$\(set\)|\$\{?BASH\}?([^_A-Za-z0-9]|$)|^[ \t]*(set|declare|typeset|readonly|export)( -p)?[ \t]*$
 NOISE	src	RANDOM|SRANDOM|EPOCH|BASHPID|SECONDS|\btimes\b|\bjobs\b|\$!|%[0-9%+-]|\bwait -n

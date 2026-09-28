@@ -3,6 +3,8 @@
     meson compile -C build fuzz          # one campaign (default 30 min), then triage
     FUZZ_SECONDS=3600 meson compile -C build fuzz
     FUZZ_INSTANCES="gram:tiered gram:compiled" meson compile -C build fuzz
+    FUZZ_INSTANCES="gram:tiers" meson compile -C build fuzz      # the in-loop tier oracle
+    FUZZ_INSTANCES="gram:arith byte:pexp" meson compile -C build fuzz   # targeted fuzzers
     meson compile -C build fuzz-triage   # re-triage the whole persistent queue
     meson compile -C build fuzz-docker   # the same campaign in a hardened container
 
@@ -27,14 +29,20 @@ without it the target only prints how to get it. The differential step needs the
   pid 1, the script as pid 2, so `kill $$` still works): whatever it leaves running -- a
   `/bin/sh` fork bomb, a job ignoring signals -- dies with the exec instead of starving the
   next one (about 0.25 ms per exec; `FUZZ_NO_EXEC_NS=1` turns it off).
-- **Instances**: at most two (`FUZZ_INSTANCES`, default `gram:tiered byte:tiered`):
-  `gram` = the grammar-aware custom mutator below plus AFL's own havoc; `byte` = AFL's
-  byte-level mutators only. Both use `sh.dict` and a dictionary extracted from bash's
-  sources (`mkdict.sh`: parse.y tokens, builtin names, shopt/set -o names).
+- **Instances**: at most two (`FUZZ_INSTANCES`, default `gram:tiered byte:tiered`), each
+  `MUTATOR:MODE`. `gram` = the grammar-aware custom mutator below plus AFL's own havoc;
+  `byte` = AFL's byte-level mutators only. MODE is a tier (`tiered` `interp` `compiled`:
+  scripts, the Lua-internal oracle above), `tiers` (scripts, the tier oracle below), or a
+  targeted fuzzer (`arith` `pexp` `printf` `glob` `read` `regex` `parse` `deparse`, below).
+  Script modes use `sh.dict` and a dictionary extracted from bash's sources (`mkdict.sh`:
+  parse.y tokens, builtin names, shopt/set -o names); a targeted fuzzer uses
+  `dicts/MODE.dict`.
 - **State** lives in `build/fuzz-work/` and persists: `seeds/` (built once: small cases
   from `test/cases`, the oil spec and bash's `tests/*.sub`, minimised with `afl-cmin`),
   `out/MUTATOR-MODE/` (AFL's queue; the next campaign resumes it), `triage/DATE/`.
   A campaign refuses to start with less than 1 GB free.
+  (A targeted fuzzer's queue is in its own language: triage signs its crashes but runs
+  no `cmp.sh` over its queue -- the loop already compared every input with bash.)
 - **Triage** (after every campaign, over what it added): each crash input is re-run
   through `harness-plain` and reduced to a signature (`sig.sh`: the escaped error with
   bundle lines mapped to `module:line`); a random sample of `FUZZ_TRIAGE_MAX` (600) new queue
@@ -49,6 +57,97 @@ without it the target only prints how to get it. The differential step needs the
 has bash's status and lines in another order is signed `order-only:` (known.tsv buckets it
 as NOISE when the script has an async construct). Inputs using `$RANDOM`, `jobs`, `$!`, `times`
 etc. are bucketed as NOISE rather than reported.
+
+## In-loop oracles
+
+The Lua-internal oracle only sees curse break its own rules. Two more oracles run inside
+the fuzz loop, so AFL's coverage feedback steers toward *disagreements*, not just crashes;
+each aborts with a report on stderr and a map slot of its own per disagreement kind (AFL
+keeps one crash per kind instead of deduplicating them into the first), and `sig.sh`
+folds the report into a signature (`tiers:compiled:out|< …|> …`,
+`target:arith:output|< bash line|> curse line`).
+
+### The tier oracle (`MODE` `tiers`, harness `FUZZ_ORACLE=tiers`)
+
+Each input runs in three workers -- interp, compiled, tiered -- and their stdout, stderr
+and status must agree after `cmp.sh`'s masks (digit runs of 4+, `time` figures, job
+lines as a sorted set). The tiered worker runs with `CURSE_HOT_LOOP=FUZZ_TIER_HOT` (3),
+so the interpreter-to-compiled switch (OSR, hot functions, fragments) happens on the
+small inputs a fuzzer makes, not only on 100-pass loops. Inputs matching a known.tsv
+`NOISE src` rule (`$RANDOM`, `jobs`, `$!`, …) are only run, not compared. No bash in the
+loop: every tier must equal the interpreter (bash is compared later by triage's `cmp.sh`).
+Cost: three runs per input (host, per exec: 2.5 ms plain, 9.1 ms with the tier oracle).
+
+### Targeted in-process fuzzers (`MODE` = a target, harness `FUZZ_TARGET=NAME`)
+
+A small input language per subsystem, run by curse IN the fuzz process and by a
+persistent bash 5.2.21 over a pipe, compared byte for byte (merged stdout+stderr, and the
+status). No shell or process startup per input: curse's shell is set up once before the
+forkserver starts (all modules loaded, a shared prelude of variables run), and
+`harness-target` is the harness in AFL++ persistent mode -- one forkserver child runs
+`FUZZ_TLOOP` (1000) inputs, each inside curse's own `( … )`, which is what keeps one
+input's shell state from the next. (A fork per input costs more than the input: the
+child faults in every heap page it touches. A crash is re-run by triage in
+`harness-plain`, one fork per input; one that doesn't reproduce there needed the loop's
+history -- a state leak across curse's `( )`, itself a bug.)
+
+| target | input (`targets.lua` has the exact formats) | what runs, both sides |
+|---|---|---|
+| `arith` | an expression (data), or `=EXPR` | `echo "$(( $__e ))"` / `x=$__e; $(( x ))`, then `declare -p` of the variables |
+| `pexp` | the words of one command: `${…}` operators, quoting, arrays, substrings, `@Q/@E/@A/@K`… | `__w WORDS` (each field as `<…>`), then `declare -p` |
+| `printf` | line 1 a format, then one argument per line (data) | `printf -- "$f" args…` and `printf -v` |
+| `glob` | line 1 a pattern, line 2 a string (data) | `[[ == ]]`, `case`, `# ## % %% / // /# /%` with `&` |
+| `read` | line 1 `U` / `=IFS`, line 2 options (`-r -s -a -d C -n N -N N`), then the data | `read` from a here-string, and unquoted/quoted field splitting |
+| `regex` | line 1 `v RE` (data) or `l RHS` (literal shell text after `=~`), line 2 a string | `[[ $s =~ … ]]`, status, `BASH_REMATCH` |
+| `parse` | a script | `( eval $'set -n\n'"$q" )`: syntax OK/error, message, line; nothing runs |
+| `deparse` | a script | as `parse`, then (when it parses) `declare -f` of it as a function body |
+
+Any input may start with a line `#@ extglob nocasematch utf8 posix …` (options set first).
+Inputs outside a target's language are skipped (not compared): see "sandbox" below. The
+`gram` mutator has a small generator per language (`GRAM_TARGET`; `parse`/`deparse` get
+the script mutator); seeds are `seeds/TARGET/` (hand-written), or the script seeds.
+
+**The bash side** (`bashco.h`): a broker process, forked before the forkserver, owns ONE
+bash per instance and restarts it when it dies, hangs (`FUZZ_BASH_TMOUT_MS`, 1000 per
+request) or floods (1 MB). Children talk to it over a SEQPACKET socket; replies carry the
+request id, so a child AFL killed mid-request leaves a stale reply the next child
+discards. Each request runs as `( eval "$__q" ) </dev/null 2>&1` in the driver file (the
+same file name on both sides: error prefixes and line numbers match), ending with a
+sentinel carrying a random per-instance nonce that exists only in the driver's text.
+Kept deterministic and side-effect free by: a fresh subshell per request; a fixed
+environment (`PATH` an empty dir, `LC_ALL=C`, `TZ=UTC`, `HOME=`); inputs that name
+`$RANDOM`, `$$`, `BASHPID`, `SECONDS`, `PPID`, `$_`, `LINENO`, the shells' own variables
+(`${!B*}`, `$BASH…`), or `%(…)T` without explicit times are skipped (`targets.lua` NOISE).
+
+**Sandbox** for the bash side, on top of the harness's (read-only mount tree, private
+tmpfs, rlimits; the harness now also has its own network namespace): bash is pid 1 of
+its own pid and network namespaces (afl-fuzz and the fuzz child are invisible to it; no
+`/dev/tcp`); the driver's prelude disables `kill exec ulimit suspend wait fg bg disown
+enable` and turns on restricted mode (`set -r`: no output redirection, `cd`, `PATH`
+changes, command names with `/`); data reaches it only as `$'\xHH'` words, and the two
+code-shaped languages (`pexp`, `regex l`) are refused unless curse's parser reads them as
+exactly one `__w …` / `[[ … ]]` command with no redirection, and no `$(`, backquote, `<(`
+or `>(` appears anywhere in the text.
+
+Exec rates (host, one input repeated, coverage hook on; `FUZZ_BENCH=N
+[FUZZ_BENCH_PERSIST=1]`): persistent 0.9-1.9 ms/exec (arith 0.9, pexp 1.2, printf 1.1,
+glob 1.3, read 1.7, regex 1.1, parse 1.9 ms); a fork per input 2.4-4.5 ms. bash's side is
+most of it: its `( … )` fork alone is ~0.45 ms on this host. Under afl-fuzz in the
+container (two instances sharing its 2 CPUs, 9 minutes each, 2026-09-28): pexp 970/s,
+regex 790/s, read 510/s, arith 420/s, parse 290/s, deparse 240/s, glob 140/s, printf
+135/s; `tiers` 160/s. AFL's stability is 30-70% for the targets (curse's module-level
+caches -- the eval parse cache, compiled patterns -- carry over in the persistent loop),
+94% for `tiers`.
+
+### Checking an oracle (planted bugs)
+
+`FUZZ_OVERRIDE=module=FILE,…` loads engine modules from source files instead of the
+embedded bundle, so a deliberately broken copy can be checked without rebuilding:
+
+    cp lua/interp.lua /tmp/i.lua   # then break `<<` in it: % 64 -> % 63
+    printf '1<<63' | unshare -Ur env FUZZ_SBX=$PWD/sbx FUZZ_TARGET=arith \
+      FUZZ_TARGETS_LUA=tools/fuzz/targets.lua FUZZ_BASH=build/test/oracle/bash \
+      FUZZ_OVERRIDE=interp=/tmp/i.lua build/tools/fuzz/harness-plain    # -> abort, the diff
 
 ## Docker (`fuzz-docker`): one contained, globally budgeted campaign
 
@@ -161,10 +260,12 @@ Env: `GRAM_COUNT` (custom mutations per queue entry, 2048: about half the execut
 |---|---|
 | `meson.build` | the `fuzz-harness` / `gram_mutator` / `fuzz` / `fuzz-triage` targets |
 | `fuzz.sh` | campaign, `seeds`, `run NAME SECONDS MUTATOR MODE`, `triage [SINCE-FILE]` |
-| `harness.c`, `afl_glue.c`, `sandbox.h`, `build.sh` | the AFL harness (+ `harness-plain`) |
+| `harness.c`, `afl_glue.c`, `sandbox.h`, `build.sh` | the AFL harness (+ `harness-target`, persistent; `harness-plain`) |
+| `targets.lua`, `bashco.h` | the targeted fuzzers: input languages -> snippets, the persistent bash |
+| `seeds/TARGET/`, `dicts/TARGET.dict` | their hand-written seeds and dictionaries |
 | `sbx.c` | runs bash / the static curse in the same sandbox (triage) |
 | `gram_mutator.c`, `gram.lua` | the grammar-aware custom mutator |
 | `cmp.sh`, `sig.sh`, `bundle-line.sh` | differential check, crash signature, bundle line map |
-| `known.tsv` | known-issue buckets for triage |
+| `known.tsv` | known-issue buckets for triage (its `NOISE src` rules also gate the tier oracle) |
 | `docker/Dockerfile`, `docker/run.sh`, `docker/seccomp.json` | the `fuzz-docker` container, its limits, the seccomp profile |
 | `sh.dict`, `mkdict.sh` | dictionaries |

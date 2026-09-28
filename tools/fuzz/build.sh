@@ -1,7 +1,8 @@
 #!/bin/sh
 # Build the AFL++ harnesses (called by the `fuzz-harness` target in tools/fuzz/meson.build).
 #   build.sh AFL_CC CC SRCDIR LUAJIT_INCDIR BUNDLE_C LIBLUAJIT_A OUTDIR
-# -> OUTDIR/harness (afl-cc: forkserver + Lua-level edge coverage), OUTDIR/harness-plain
+# -> OUTDIR/harness (afl-cc: forkserver + Lua-level edge coverage), OUTDIR/harness-target
+#    (the same, AFL++ persistent mode: the FUZZ_TARGET fuzzers), OUTDIR/harness-plain
 #    (plain cc: the same runner without AFL, for triage), OUTDIR/sbx (the triage sandbox).
 set -eu
 AFLCC=$1 CC=$2 S=$3 INC=$4 BUNDLE=$5 LIB=$6 O=$7
@@ -17,6 +18,9 @@ link() { # compiler output
 }
 AFL_QUIET=1 "$AFLCC" -O2 -I"$INC" -c "$S/harness.c" -o "$O/harness.o"
 AFL_QUIET=1 link "$AFLCC" harness
+# (harness-target: the same harness in AFL++ persistent mode for the FUZZ_TARGET fuzzers)
+AFL_QUIET=1 "$AFLCC" -O2 -DTPERSIST -I"$INC" -c "$S/harness.c" -o "$O/harness-target.o"
+AFL_QUIET=1 link "$AFLCC" harness-target
 $CC -O2 -I"$INC" -c "$S/harness.c" -o "$O/harness-plain.o"
 link "$CC" harness-plain
 $CC -O2 -static "$S/sbx.c" -o "$O/sbx"

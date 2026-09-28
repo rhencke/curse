@@ -7,8 +7,13 @@
 #
 # Env knobs:
 #   FUZZ_SECONDS    campaign wall time (default: -Dfuzz_seconds, 1800)
-#   FUZZ_INSTANCES  up to 2 of MUTATOR:MODE, MUTATOR gram|byte, MODE tiered|interp|compiled
-#                   (default "gram:tiered byte:tiered")
+#   FUZZ_INSTANCES  up to 2 of MUTATOR:MODE (default "gram:tiered byte:tiered"), MUTATOR
+#                   gram|byte, MODE one of
+#                     tiered|interp|compiled   scripts, one tier (oracle: Lua-internal errors)
+#                     tiers                    scripts, interp vs compiled vs tiered in the loop
+#                     arith|pexp|printf|glob|read|regex|parse
+#                                              a targeted in-process fuzzer, differential
+#                                              against a persistent bash 5.2.21 in the loop
 #   FUZZ_JOBS       parallel triage jobs (default 2)
 #   FUZZ_TRIAGE_MAX differential checks per triage: a random sample of the new queue entries (600)
 #   FUZZ_WORK       persistent state (default BUILD/fuzz-work): seeds/, out/NAME/ (AFL
@@ -24,6 +29,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 : "${FUZZ_BASH_SRC:=$FUZZ_ROOT/subprojects/bash-5.2.21}"
 : "${FUZZ_OIL_SPEC:=$FUZZ_ROOT/subprojects/oil/spec}"
 export FUZZ_ROOT FUZZ_BIN FUZZ_LUAJIT FUZZ_CURSE FUZZ_WORK FUZZ_ORACLE
+TARGETS="arith pexp printf glob read regex parse deparse"
+is_target() { case " $TARGETS " in *" $1 "*) return 0 ;; esac; return 1; }
 W=$FUZZ_WORK
 mkdir -p "$W"
 
@@ -51,7 +58,8 @@ afl_env() {
     AFL_FORKSRV_INIT_TMOUT=20000
 }
 
-dicts() {
+dicts() { # [MODE]: a targeted fuzzer's own dictionary (its input language), else the shell's
+  if [ -f "$here/dicts/${1:-}.dict" ]; then printf '%s\n' -x "$here/dicts/$1.dict"; return; fi
   [ -s "$W/auto.dict" ] || "$here/mkdict.sh" "$FUZZ_BASH_SRC" > "$W/auto.dict" 2>/dev/null || : > "$W/auto.dict"
   printf '%s\n' -x "$here/sh.dict"
   [ -s "$W/auto.dict" ] && printf '%s\n' -x "$W/auto.dict"
@@ -115,26 +123,47 @@ PY
   say "seeds: $(ls "$W/seeds" | wc -l) kept in $W/seeds"
 }
 
+# The harness environment of a MODE (fuzz.sh run, sig.sh): prints NAME=VALUE lines
+mode_env() { # MODE
+  case $1 in
+    tiered|interp|compiled) echo "FUZZ_MODE=$1" ;;
+    tiers) printf '%s\n' FUZZ_MODE=tiered FUZZ_ORACLE=tiers "FUZZ_KNOWN=$here/known.tsv" ;;
+    *) is_target "$1" || die "mode: tiered|interp|compiled|tiers|${TARGETS// /|}, not $1"
+       printf '%s\n' "FUZZ_TARGET=$1" "FUZZ_TARGETS_LUA=$here/targets.lua" "FUZZ_BASH=$FUZZ_ORACLE" ;;
+  esac
+}
+
 # ---- one afl-fuzz instance, in the foreground, for SECONDS
 run() { # NAME SECONDS MUTATOR MODE
   local name=$1 secs=$2 mut=$3 mode=$4
-  local out=$W/out/$name sbx=$W/sbx/$name
+  mode_env "$mode" > /dev/null || exit 1
+  local out=$W/out/$name sbx=$W/sbx/$name seeds=$W/seeds harness=$FUZZ_BIN/harness tmo=2000
   mkdir -p "$out" "$sbx" "$W/gram-hangs"
-  [ -d "$W/seeds" ] || seeds
+  if is_target "$mode" && [ "$mode" != parse ] && [ "$mode" != deparse ]; then
+    seeds=$here/seeds/$mode        # (hand-written, in the target's own language)
+  else
+    [ -d "$W/seeds" ] || seeds     # (scripts: tiers, parse and the tier modes)
+  fi
+  if is_target "$mode"; then
+    harness=$FUZZ_BIN/harness-target tmo=4000   # (persistent; bash may take BASH_TMOUT x2)
+    [ -x "$FUZZ_ORACLE" ] || die "mode $mode needs the bash 5.2.21 oracle ($FUZZ_ORACLE)"
+  fi
+  [ "$mode" = tiers ] && tmo=6000  # (three runs of every input)
   afl_env
-  export FUZZ_SBX=$sbx FUZZ_MODE=$mode
-  local -a extra=()
+  export FUZZ_SBX=$sbx
+  local -a extra=() menv=()
+  mapfile -t menv < <(mode_env "$mode") || exit 1
   case $mut in
     gram)
       export AFL_CUSTOM_MUTATOR_LIBRARY=$FUZZ_BIN/gram_mutator.so GRAM_LUAJIT=$FUZZ_LUAJIT \
-        GRAM_ROOT=$FUZZ_ROOT GRAM_STATS=$out/gram_stats GRAM_HANGS=$W/gram-hangs ;;
+        GRAM_ROOT=$FUZZ_ROOT GRAM_STATS=$out/gram_stats GRAM_HANGS=$W/gram-hangs GRAM_TARGET=$mode ;;
     byte) unset AFL_CUSTOM_MUTATOR_LIBRARY ;;
     *) die "mutator: gram or byte, not $mut" ;;
   esac
-  mapfile -t extra < <(dicts)
+  mapfile -t extra < <(dicts "$mode")
   # (afl-fuzz -V ends the run itself, stats written; the timeout is only a safety net)
-  timeout -s TERM -k 60 "$((secs + 300))" bash -c "$(declare -f in_ns); in_ns \"\$@\"" in_ns \
-    afl-fuzz -V "$secs" -i "$W/seeds" -o "$out" -t 2000 -m none "${extra[@]}" -- "$FUZZ_BIN/harness" \
+  timeout -s TERM -k 60 "$((secs + 300))" env "${menv[@]}" bash -c "$(declare -f in_ns); in_ns \"\$@\"" in_ns \
+    afl-fuzz -V "$secs" -i "$seeds" -o "$out" -t "$tmo" -m none "${extra[@]}" -- "$harness" \
     > "$W/$name.log" 2>&1
   return 0
 }
@@ -146,6 +175,12 @@ bucket() { # SIG FILE -> ID, ID:FIXED (matched a since-fixed finding's *-fixed f
   while IFS=$'\t' read -r id field re re2; do
     case $id in ''|'#'*) continue ;; esac
     base=${field%-fixed}; hit=0
+    # (an in-loop differential's signature -- target:… / tiers:… -- quotes bash's own
+    # wording; only rules written for it (a sig regex naming target:/tiers:) and NOISE/UB
+    # apply, not the script modes' loose error-text patterns)
+    case $sig in target:*|tiers:*)
+      case $id:$re in NOISE:*|UB*|*:*target:*|*:*tiers:*) ;; *) continue ;; esac ;;
+    esac
     case $base in
       sig) printf '%s\n' "$sig" | grep -qE -- "$re" && hit=1 ;;
       src) grep -qaE -- "$re" "$f" && hit=1 ;;
@@ -163,7 +198,10 @@ triage() { # [SINCE-FILE]: only entries newer than it
   local newer=(); [ -n "$since" ] && newer=(-newer "$since")
   find "$W"/out/*/default/crashes -type f -name 'id:*' "${newer[@]}" 2>/dev/null > "$t/crashes.list"
   # (a random sample: the newest entries tend to be one family, the latest favoured parent's)
-  find "$W"/out/*/default/queue -maxdepth 1 -type f -name 'id:*' "${newer[@]}" 2>/dev/null > "$t/queue.all"
+  # (the queue differential runs scripts: not the targeted fuzzers' queues, whose inputs are
+  # in their own languages and were already compared with bash in the loop)
+  find "$W"/out/*/default/queue -maxdepth 1 -type f -name 'id:*' "${newer[@]}" 2>/dev/null |
+    grep -vE "/out/[a-z]+-(${TARGETS// /|})/" > "$t/queue.all"
   shuf -n "$max" "$t/queue.all" > "$t/queue.list"
   say "triage: $(wc -l < "$t/crashes.list") crash inputs, $(wc -l < "$t/queue.list") of $(wc -l < "$t/queue.all") new queue entries sampled -> $t"
   xargs -r -d '\n' -n 1 -P "$jobs" "$here/sig.sh" < "$t/crashes.list" > "$t/crash-sigs.tsv"

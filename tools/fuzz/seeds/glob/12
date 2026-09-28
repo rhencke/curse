@@ -1,0 +1,3 @@
+#@ extglob
+*(a|b)x?(y)
+ababx
