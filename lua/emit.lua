@@ -1228,7 +1228,8 @@ etxt_args = function(e)
 	if not (e and e.etxt) then
 		return ""
 	end
-	return (", %q, %q"):format((EF.acmd and (EF.acmd .. ": ") or "") .. e.etxt, e.etok or "")
+	return (", %q, %q%s"):format((EF.acmd and (EF.acmd .. ": ") or "") .. e.etxt, e.etok or "",
+		e.etxt:find("[$`]") and ", sh" or "") -- (an expanding text: rt.arith_fault expands it)
 end
 emit_value = function(e, lifted)
 	local k = e.k
@@ -5286,7 +5287,9 @@ EF.simple_native = function(cx, st, after, cmd)
 				else
 					v = ("rt.xw_rhs(sh, %s)"):format(K(a.rhs))
 				end
-				bs[#bs + 1] = ("rt.pbind(sh, %q, %s, %s)"):format(a.name, v, tostring(a.append and true or false))
+				-- (a readonly / noassign name is refused before its value expands: rt.pbind_skip)
+				bs[#bs + 1] = ("if not rt.pbind_skip(sh, %q) then rt.pbind(sh, %q, %s, %s) end"):format(a.name, a.name, v,
+					tostring(a.append and true or false))
 			else
 				return nil
 			end
@@ -5375,6 +5378,10 @@ EF.simple_native = function(cx, st, after, cmd)
 end
 local simple_compiled
 H.simple = function(cx, st, after)
+	-- (a null command whose redirections bash runs in a forked child: rt.null_forks)
+	if not (st.words and st.words[1]) and st.redirs and require("runtime").null_forks(st.redirs) then
+		return cx.refuse(st, after)
+	end
 	-- set -k (keyword): an assignment-shaped word anywhere is an assignment for the command
 	-- (interp's exec_stmt): compile that reading too, and pick by sh.opt_k at run time
 	if EF.keyword and st.words and not st._kw then
@@ -6102,7 +6109,9 @@ simple_compiled = function(cx, st, after)
 			pnames[#pnames + 1] = ("%q"):format(a.name)
 			-- assignment-context value: its literal ~s expand (EF.tilde_value), else the
 			-- ordinary word value (no split — assignment RHS).
-			pvals[#pvals + 1] = EF.tilde_value(a.rhs, cx.lifted) or emit_word(a.rhs, cx.lifted)
+			-- (a readonly / noassign name: refused before its value expands — rt.pbind_skip)
+			pvals[#pvals + 1] = ("(rt.pbind_skip(sh, %q, true) and rt.PB_SKIP or %s)"):format(a.name,
+				EF.tilde_value(a.rhs, cx.lifted) or emit_word(a.rhs, cx.lifted))
 		end
 		local builder, bg
 		if pok then
@@ -6143,7 +6152,8 @@ simple_compiled = function(cx, st, after)
 						ps4 = true
 						xpv = xpv .. ("sh.xtrace_ps4 = __pv[%d]; "):format(i)
 					end
-					xpv = xpv .. EF.xta(a.name .. "=", ("__pv[%d]"):format(i))
+					xpv = xpv .. ("if __pv[%d] ~= rt.PB_SKIP then %s elseif sh.opt_x then rt.pbind_skip_say(sh, %q) end "):format(i,
+						EF.xta(a.name .. "=", ("__pv[%d]"):format(i)), a.name)
 				end
 				xpv = xpv .. (ps4 and "if not rt.in_subshell(sh) then sh.xtrace_ps4 = nil end; " or "") .. EF.xt("__a")
 					.. (ps4 and "sh.xtrace_ps4 = nil; " or "")
@@ -6987,7 +6997,10 @@ H.forin = function(cx, st, after)
 	local advp = cx.newpc()
 	cx.loopPc[st.id] = advp -- back-edge = resume point
 	cx.loopff(st.id)
+	local sbl = EF.base_line -- (the body runs at the `for` line: rt.compound_line)
+	EF.base_line = st.line or sbl
 	local bodyentry = cx.loop_list(st.body, advp, after, advp) -- break exits, continue advances
+	EF.base_line = sbl
 	-- init: expand the word list ONCE into sh.forstate[id] (so OSR resumes it)
 	local parts = { "local __l = {}" }
 	-- (a long run of plain literal words — `for i in {1..4000}` — is one constant table)
@@ -7116,7 +7129,10 @@ H.select = function(cx, st, after)
 	local initp = cx.newpc()
 	local advp = cx.newpc()
 	-- (no OSR resume point: the interpreter's select keeps its menu list to itself)
+	local sbl = EF.base_line -- (the body runs at the `select` line: rt.compound_line)
+	EF.base_line = st.line or sbl
 	local bodyentry = cx.loop_list(st.body, advp, after, advp)
+	EF.base_line = sbl
 	local parts = { "local __l = {}" }
 	local sv_loopn = EF.cur_loopn -- (the list expands inside the loop: H.forin)
 	EF.cur_loopn = (sv_loopn or 0) + 1
@@ -7284,7 +7300,12 @@ H.subshell = function(cx, st, after)
 	if #st.body > 0 then
 		-- Compile the body WITH the program lift set so it shares the module's lifted
 		-- upvalues with any function it calls (no sh.vars-vs-upvalue desync).
+		local sbl = EF.base_line -- (its commands run at the subshell's line: rt.compound_line)
+		if not st.fnbody then
+			EF.base_line = st.line or sbl
+		end
 		local id = emit_fragment(st.body, nil, EF.lifted_set)
+		EF.base_line = sbl
 		if id then
 			local p = cx.newpc()
 			local ecs = errchk_s(st)
@@ -7717,6 +7738,8 @@ H.case = function(cx, st, after)
 	local nomatch = cx.newpc()
 	cx.blocks[nomatch] = (ran and ("if not %s then sh.status = 0 end; "):format(ran) or "sh.status = 0; ")
 		.. ("pc = %d"):format(after)
+	local sbl = EF.base_line -- (the clauses run at the `case` line: rt.compound_line)
+	EF.base_line = st.line or sbl
 	for i = n, 1, -1 do -- back-to-front so forward targets (next body/match) already exist
 		local cl = st.clauses[i]
 		local btarget = (cl.term == "fall" and (i < n and bodyentry[i + 1] or after))
@@ -7764,6 +7787,7 @@ H.case = function(cx, st, after)
 		)
 		matchentry[i] = mp
 	end
+	EF.base_line = sbl
 	if st.line then
 		EF.cur_line = st.line
 		EF.cur_cline = st.cline or st.line
@@ -7779,7 +7803,51 @@ H.case = function(cx, st, after)
 	return subjp
 end
 
+-- Note on each command node of a tree its `_base`: bash's line_number when it starts — the
+-- enclosing for/select/case/subshell's line, a function body's (rline), else the line group's
+-- end (rt.compound_line). A node marked already (a shared subtree) keeps its mark.
+local BASE_SKIP = { words = true, redirs = true, assigns = true, subject = true, expr = true, cond = true,
+	init = true, step = true, pexp = true, parts = true, list = false }
+function EF.mark_base(node, base, seen)
+	seen = seen or {}
+	if type(node) ~= "table" or seen[node] then
+		return
+	end
+	seen[node] = true
+	if node.t then
+		if node._base ~= nil then
+			return
+		end
+		node._base = base
+		local t = node.t
+		if t == "forin" or t == "select" or t == "case" or (t == "subshell" and not node.fnbody) then
+			base = node.line or base
+		elseif t == "funcdef" then
+			base = node.rline or base
+		end
+	end
+	for k, v in pairs(node) do
+		if type(v) == "table" and not BASE_SKIP[k] then
+			EF.mark_base(v, base, seen)
+		end
+	end
+end
+function EF.mark_groups(stmts) -- (a text's top-level commands, by line group)
+	local gb
+	for _, st in ipairs(stmts) do
+		if st.lgstart then
+			gb = st.lgeline or st.lgspan and st.lgspan[2] or st.line or gb
+		end
+		if gb then
+			EF.mark_base(st, gb)
+		end
+	end
+end
 build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
+	-- (each line group of a text read at the top: bash's line_number between its commands is
+	-- the reader's — the group's end — which a compound in it with no line of its own names:
+	-- rt.compound_line; noted per statement, the CFG being flattened back to front)
+	EF.mark_groups(stmts)
 	-- per-CFG compile state, passed explicitly to the module-level statement handlers (H)
 	local cx = { stmts = stmts, lifted = lifted, funcflags = funcflags, inlinefns = inlinefns, toplevel = toplevel }
 	-- topcode: a fragment (pipeline stage, subshell, $( ), …) of code NOT in any function —
@@ -8312,7 +8380,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		-- (a redirect error names the line bash is at: a top-level compound's end, else the
 		-- command before it — a compound doesn't move the line itself)
 		local sl = EF.cur_line
-		EF.cur_line = st.top and st.redirs[1].line or cx.prev_line or sl
+		EF.cur_line = require("runtime").compound_line({ base_line = st._base }, st) or cx.prev_line or sl
 		local ps, psv -- (a >(…) target: drained after the whole compound, as interp does)
 		if cx.has_procsub({ redirs = st.redirs }) then
 			psv = cx.newloopvar()
@@ -8354,6 +8422,9 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		cx.cur_simple = t == "simple" and st or nil -- (its external's text: cx.blocks)
 		EF.cur_loopn = #cx.loopstack -- (compile_cmdsub: is this command inside a loop …
 		EF.cur_infunc = not cx.toplevel and not cx.topcode -- … or a function)
+		if st._base then -- (a line group read at the top: the reader's line — build_cfg)
+			EF.base_line = st._base
+		end
 		if st.line then
 			cx.prev_line = EF.cur_line -- (the command before: a redirected compound's errors)
 			EF.cur_line = (t == "simple" or t == "assign" or t == "assignlist" or t == "arrayassign") and st.cline or st.line -- (a simple command: interp's rule)
@@ -9214,6 +9285,7 @@ function EF.konst(items)
 	return ("__K[%d]"):format(#k)
 end
 function M.emit(ast, opts)
+	EF.mark_groups(ast.stmts) -- (before any function body compiles: rt.compound_line)
 	EF.fntab = false
 	EF.konsts = {}
 	EF.frag_depth = 0
@@ -9537,7 +9609,10 @@ function M.emit(ast, opts)
 			local sv_fl = EF.fn_locals
 			EF.fn_locals = #fl > 0 and ls or nil
 			EF.cur_cfg = fnlname(st.name)
+			local sbl = EF.base_line -- (a function's body: execute_function's line — rt.compound_line)
+			EF.base_line = st.rline
 			local cfg = build_cfg(st.body, ls, funcflags, inlinefns)
+			EF.base_line = sbl
 			EF.cur_cfg = "run"
 			EF.fn_locals = sv_fl
 			fndefs[#fndefs + 1] = assemble(cfg, fnlname(st.name) .. " = function(sh, pc)",

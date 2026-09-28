@@ -300,6 +300,14 @@ local function arith(src, nodefer)
 		return nm, nil, nil
 	end
 
+	-- an assignment operator next (after an operand that is no variable): in every place bash
+	-- reads an expassign — the top level, inside ( ), a ternary's middle — that is "attempted
+	-- assignment to non-variable" (`1 ? ~x *= 1 : 2`, `((b) ^ A /= 2)`)
+	local function asgn_next()
+		skip()
+		return (src:sub(i, i) == "=" and src:sub(i + 1, i + 1) ~= "=") or src:find("^[%+%-%*/%%&|%^]=", i) ~= nil
+			or src:find("^<<=", i) ~= nil or src:find("^>>=", i) ~= nil
+	end
 	-- `asgn`: an assignment may start here — only at the head of a lowest-precedence
 	-- expression (bash: assignment binds loosest, so `0 && B=42` is an error)
 	local function primary(asgn)
@@ -309,6 +317,9 @@ local function arith(src, nodefer)
 			i = i + 1
 			local e = parseComma()
 			if not eat(")") then
+				if asgn_next() then
+					aerr("attempted assignment to non-variable", e)
+				end
 				aerr("missing `)'", e)
 			end
 			e.paren = true -- (complete once its `)` is read: see spine)
@@ -434,6 +445,8 @@ local function arith(src, nodefer)
 			return { k = "num", v = v }
 		end
 		-- a name (optionally subscripted): a var, an assignment, or ++/--
+		skip()
+		local ns0 = i -- (where its token starts: a recursion error names the text from there)
 		local name, idx, ir = nameSub()
 		-- post ++/--
 		if starts("++") then
@@ -460,7 +473,7 @@ local function arith(src, nodefer)
 			i = i + 1
 			return { k = "asgn", name = name, idx = idx, idxraw = ir, op = "=", e = parseExpr(0) }
 		end
-		return { k = "var", name = name, idx = idx, idxraw = ir }
+		return { k = "var", name = name, idx = idx, idxraw = ir, esrc = src, ep = ns0 }
 	end
 
 	-- binary operators by precedence (higher binds tighter), matching bash
@@ -556,6 +569,9 @@ local function arith(src, nodefer)
 				return { k = "tern", c = c, a = p or ZERO, b = ZERO }
 			end, parseExpr, 0)
 			if not eat(":") then
+				if asgn_next() then
+					aerr("attempted assignment to non-variable", { k = "tern", c = c, a = a, b = ZERO })
+				end
 				aerr("`:' expected for conditional expression", { k = "tern", c = c, a = a, b = ZERO })
 			end
 			if peek() == "" then
@@ -1297,8 +1313,9 @@ scan_cmdsub = function(src, j, onwarn)
 						d[#d + 1] = src:sub(k + 1, k + 1)
 					end
 					k = k + 2
-				elseif ch == "'" or ch == '"' then
-					local e = quote_end(src, k) - 1 -- (the closing quote; quote removal)
+				elseif ch == "'" or ch == '"' then -- (one that never closes: its EOF error, at
+					-- the quote's line — parse_comsub reads the word with read_token)
+					local e = quote_end(src, k, ch == '"', true) - 1 -- (the closing quote; quote removal)
 					d[#d + 1] = src:sub(k + 1, e - 1)
 					k = e + 1
 				elseif ch:match("^[ \t\n;&|()<>]$") then
@@ -2447,7 +2464,11 @@ end
 for _, b in ipairs({ "=", "==", "!=", "=~", "<", ">", "-nt", "-ot", "-ef", "-eq", "-ne", "-lt", "-le", "-gt", "-ge" }) do
 	COND_BINOP[b] = true
 end
-local COND_OPTOK = { ["&&"] = true, ["||"] = true, ["("] = true, [")"] = true, ["<"] = true, [">"] = true }
+local COND_OPTOK = { ["&&"] = true, ["||"] = true, ["("] = true, [")"] = true, ["<"] = true, [">"] = true,
+	-- (the shell's other operator tokens, which [[ ]] has no use for: its errors name them)
+	["<<<"] = true, ["<<-"] = true, ["&>>"] = true, [";;&"] = true, ["<<"] = true, ["<&"] = true, ["<>"] = true,
+	[">>"] = true, [">&"] = true, [">|"] = true, ["&>"] = true, ["|&"] = true, [";;"] = true, [";&"] = true,
+	["|"] = true, [";"] = true, ["&"] = true }
 -- (nlb[k]: a newline came before token k. cond_term skips newlines only where bash's
 -- cond_skip_newlines does — before a term and after one; reading a unary operator's
 -- operand, a binary operator, or its right side (`nonl`) a newline is a `newline' token)
@@ -4038,7 +4059,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- the whole word, inside "…" (q0: its opening quote) and out: an expansion is read the
 	-- same way in both — a $( … ) in "…" is syntax-checked and takes its here-document too.
 	local word_sub -- (a command-position NAME[ … ] whose subscript was already scanned: word())
-	local function word(stop_paren, stop_cmp)
+	local function word(stop_paren, stop_cmp, xgok) -- (xgok false: a [[ ]] word that is no
+		-- pattern — extglob only as the shell's option has it)
 		ws()
 		local start, line0, lfix, ldq, q0 = i, line, 0, nil, nil
 		if word_sub and word_sub.at == i and word_sub.src == src then -- (NAME[ … ]: read whole)
@@ -4152,8 +4174,8 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				end
 				i = je
 			elseif (c == "?" or c == "*" or c == "+" or c == "@" or c == "!") and src:sub(i + 1, i + 1) == "("
-				and (stop_cmp or not xg_off()) then
-				if not (sh or stop_cmp or extglob_on or xg == false) then
+				and ((stop_cmp and xgok ~= false) or not xg_off()) then
+				if not (sh or (stop_cmp and xgok ~= false) or extglob_on or xg == false) then
 					xg_guess = true
 				end
 				-- extglob ?(..) *(..) +(..) @(..) !(..): part of the word, not a subshell —
@@ -4299,7 +4321,7 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			-- line_number = tc->line, which make_function_def sets to function_bstart — only
 			-- a `{` body's parse updates that (parse.y's PST_ALLOWOPNBRC), so any other body
 			-- carries the last `{`-bodied function's `{` line (0 -> 1: notify_of_job_status)
-			return { { t = "subshell", line = bline, body = body, jcx = { l = math.max(M.fn_bstart, 1) } } }, bline, true,
+			return { { t = "subshell", line = bline, body = body, jcx = { l = math.max(M.fn_bstart, 1) }, fnbody = true } }, bline, true,
 				close
 		end
 		M.fn_bstart = bline -- (at its `{`: a function defined inside moves it on)
@@ -5271,7 +5293,11 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 					i = i + 1
 				else
 					local before = i
-					local wok, w = pcall(word, true, true) -- split on <,>,(,) operators (no spaces needed in [[ ]])
+					-- (bash reads an extglob pattern in [[ ]] only after `==`/`=`/`!=` — PST_EXTPAT —
+					-- or with extglob on as the line is read: `[[ x -le @(a|b) ]]` is `@` then `(`)
+					local lt = toks[#toks]
+					local pat = (lt == "==" or lt == "=" or lt == "!=") and not quoted[#toks]
+					local wok, w = pcall(word, true, true, pat) -- split on <,>,(,) operators (no spaces needed in [[ ]])
 					if not wok then
 						if type(w) == "string" and w:find("unexpected EOF while looking for matching", 1, true) then
 							pend_err = w
@@ -5285,15 +5311,12 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 						-- word() stalled on a self-delimiting metacharacter. `&&`/`||` are
 						-- two-char operator tokens; `(`, `)`, `<`, `>`, `;`, … are one char
 						-- (each becomes its own token so the tokenizer makes progress).
-						if i == before then
-							local two = src:sub(i, i + 1)
-							if two == "&&" or two == "||" then
-								w = two
-								i = i + 2
-							else
-								w = src:sub(i, i)
-								i = i + 1
-							end
+						if i == before then -- (the shell's operator tokens, whole: `>|` `<&` `;;` …)
+							w = src:match("^<<<", i) or src:match("^<<%-", i) or src:match("^&>>", i)
+								or src:match("^;;&", i) or src:match("^[<>]%(", i) and src:sub(i, i)
+								or src:match("^<[<&>]", i) or src:match("^>[>&|]", i) or src:match("^&[&>]", i)
+								or src:match("^|[|&]", i) or src:match("^;[;&]", i) or src:sub(i, i)
+							i = i + #w
 						else
 							break
 						end
@@ -6231,6 +6254,7 @@ function M.parse(src, sh, aenv, noalias, posix, line0, line1, xg, bq, cs)
 		if stmts[first] then -- (the first statement of a line group: where a line abort resumes)
 			stmts[first].lgstart = true
 			stmts[first].lgread = lg.rline -- (rt.jobs_line's line)
+			stmts[first].lgeline = lg.eline -- (the reader's line after it: rt.compound_line)
 			if lg.eline and lg.sline and lg.eline > lg.sline then -- (its lines: rt.line_drift)
 				stmts[first].lgspan = { lg.sline, lg.eline }
 			end

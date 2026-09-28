@@ -739,12 +739,22 @@ local sherr = rt.Shell.errmsg -- error-message writer, capture-aware for `2>&1` 
 -- recursively parsed and evaluated (so bar=foo; foo=5; $((bar)) == 5). A pure
 -- integer literal short-circuits (the hot path); a recursion guard bounds cycles.
 local looks_numeric = rt.looks_numeric -- shared with the compiled tier (one source in runtime)
-arith_resolve = function(sh, s)
+arith_resolve = function(sh, s, e)
 	if s == nil or s:match("^%s*$") then
 		return i64(0)
 	end -- unset/blank value -> 0 (bash)
 	if looks_numeric(s) then
 		return rt.arith_num(s)
+	end
+	-- a value naming itself (x=x, or a=b b=a): bash's expression recursion limit, checked
+	-- as evalexp starts on the value (pushexp) — before it is read — and reported in the
+	-- ENCLOSING expression, at the variable's token (e: its var node: `(x)` → "x)")
+	local depth = (sh.arith_depth or 0) + 1
+	if depth >= 1024 then -- (rt.arith_recur_err: said by the outermost level)
+		if e and e.esrc then
+			error(rt.arith_recur_err((e.esrc:gsub("^[ \t\n]+", "")), e.esrc:sub(e.ep)), 0)
+		end
+		error(rt.arith_recur_err(s, s), 0)
 	end
 	-- (the VALUE is not word-expanded: bash's expr_streval evaluates it as-is, so a `$`,
 	-- backquote or quote in it is a syntax error — "let" mode; only a subscript expands)
@@ -754,14 +764,16 @@ arith_resolve = function(sh, s)
 	end
 	if not ok then -- the value is not a valid arith expression (e.g. "12 34", "1+"): an
 		-- arith error — the command fails and (bash) the rest of the line is discarded
-		arith_pre(sh, ast)
+		-- (what bash evaluated before it met the error — a variable read there recurses at
+		-- this level: `!!BASH_COMMAND & $A`)
+		sh.arith_depth = depth
+		local pok, perr = pcall(arith_pre, sh, ast)
+		sh.arith_depth = depth - 1
+		if not pok then
+			rt.arith_recur_say(sh, perr)
+			error(perr, 0)
+		end
 		io.stderr:write("curse: " .. P.arith_errmsg(s, ast) .. "\n")
-		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
-	end
-	-- a value naming itself (x=x, or a=b b=a): bash's expression recursion limit
-	local depth = (sh.arith_depth or 0) + 1
-	if depth > 1024 then
-		io.stderr:write("curse: " .. P.arith_errmsg(s, { msg = "expression recursion level exceeded", tok = s }) .. "\n")
 		error({ __curse_exit = 1, __curse_matherr = true, __curse_experr = true, __curse_lineabort = true })
 	end
 	-- A nested bad value (rare: `s=t; t='1 2'`) stays swallowed as 0, matching the
@@ -770,8 +782,12 @@ arith_resolve = function(sh, s)
 	local sv = in_expanded_text
 	in_expanded_text = true -- (a value is expansion output: its subscripts expand unquoted)
 	sh.arith_depth = depth
+	local se = sh.arith_etxt -- (the text being evaluated: rt.arith_read_slow's enclosing one)
+	sh.arith_etxt = s
 	local ok2, v = pcall(eval, sh, ast)
+	sh.arith_etxt = se
 	sh.arith_depth = depth - 1
+	rt.arith_recur_say(sh, v)
 	in_expanded_text = sv
 	if not ok2 then
 		P.trap_flow(v)
@@ -788,11 +804,10 @@ end
 -- Division/modulo by zero is a fatal arithmetic error (bash aborts the current
 -- command with status 1 and a diagnostic). Tagged __curse_matherr so a caller
 -- that runs code in a protected context (compgen -F) can recover from it.
-local function arith_div0(e, msg)
-	-- bash's evalerror text: the expression and the lookahead token (parser: etxt/etok)
-	msg = msg or "division by 0"
-	io.stderr:write("curse: " .. (e and e.etxt and P.arith_errmsg(e.etxt, { msg = msg, tok = e.etok }) or msg) .. "\n")
-	error({ __curse_exit = 1, __curse_matherr = true, __curse_lineabort = true })
+local function arith_div0(e, msg, sh)
+	-- bash's evalerror text: the expression and the lookahead token (parser: etxt/etok) —
+	-- expanded as bash expanded it (rt.arith_fault, both tiers)
+	rt.arith_fault(e and e.etxt, e and e.etok, msg, sh)
 end
 
 -- Reading an unset variable in arithmetic under `set -u` is a fatal unbound-
@@ -847,9 +862,15 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 	while k <= n do
 		local c = raw:sub(k, k)
 		if c == "\\" then
-			-- (the text is expanded as in double quotes: at top level `\$` is a `$`, …)
+			-- (the text is expanded as in double quotes: at top level `\$` is a `$`, …; a
+			-- subscript of the whole text is expanded as an UNQUOTED word, then quoted again
+			-- — bash 5.2's expand_array_subscript: `a[$\A]` reads `a[\$A]`)
 			local nx = raw:sub(k + 1, k + 1)
-			out[#out + 1] = (depth == 0 and nx:match('^[$`\\"]$')) and nx or raw:sub(k, k + 1)
+			if depth > 0 and not depth0 then
+				out[#out + 1] = (nx:gsub("[%]%[%$`\\\"'~]", "\\%0"))
+			else
+				out[#out + 1] = (depth == 0 and nx:match('^[$`\\"]$')) and nx or raw:sub(k, k + 1)
+			end
 			k = k + 2
 		elseif c == '"' then
 			k = k + 1
@@ -890,6 +911,9 @@ local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a s
 				sh.cur_cline = rt.compiled_line(sh) or sh.cur_cline -- compiled caller's: rt.compiled_line)
 			end
 			local v = e > k and expand_word(sh, P.reword('"' .. chunk .. '"')) or chunk
+			if e == k and c == "$" and depth > 0 and not depth0 then -- (a lone `$` in such a
+				v = "\\$" -- subscript is a literal character: quoted)
+			end
 			-- inside a SUBSCRIPT an expansion's value is backslash-quoted against
 			-- re-evaluation, as bash does for ] [ $ ` \ " ' ~ (`(( a[$k]++ ))` keys the
 			-- literal text of $k); at top level `(( $expr ))` re-reads it as arithmetic
@@ -1042,6 +1066,13 @@ eval = function(sh, e)
 	end
 	if k == "var" then
 		if e.idxraw then
+			-- (an indexed element's subscript is itself evaluated — one nesting level: at bash's
+			-- limit that evaluation is what fails, and array_expand_index DISCARDs)
+			if (sh.arith_depth or 0) + 1 >= 1024 and e.esrc and not sh:is_assoc(e.name) then
+				local err = rt.arith_recur_err((e.esrc:gsub("^[ \t\n]+", "")), e.esrc:sub(e.ep))
+				err.__curse_subscript, err.__curse_discard = true, true
+				error(err, 0)
+			end
 			arith_nounset(sh, e.name)
 			if rt.arith_badraw(sh, e.name, e.idxraw, "r") then -- (non-fatal: 0)
 				return i64(0)
@@ -1054,7 +1085,7 @@ eval = function(sh, e)
 			if rt.arith_badkey(sh, e.name, iv, "r") then
 				return i64(0)
 			end
-			return arith_resolve(sh, sh:array_get(e.name, iv))
+			return arith_resolve(sh, sh:array_get(e.name, iv), e)
 		end
 		arith_nounset(sh, e.name)
 		-- Numeric-authoritative fast path: a scalar set via aset holds its i64 in b.n
@@ -1084,7 +1115,7 @@ eval = function(sh, e)
 		if e.dollar and not looks_numeric(v) then
 			error({ __arith_textual = true })
 		end
-		return arith_resolve(sh, v)
+		return arith_resolve(sh, v, e)
 	end
 	if k == "param" then
 		return rt.str_to_i64(sh:param(e.n))
@@ -1223,13 +1254,13 @@ eval = function(sh, e)
 		end
 		if op == "/" then
 			if r == i64(0) then
-				arith_div0(e)
+				arith_div0(e, nil, sh)
 			end
 			return l / r
 		end
 		if op == "%" then
 			if r == i64(0) then
-				arith_div0(e)
+				arith_div0(e, nil, sh)
 			end
 			return l % r
 		end
@@ -1268,7 +1299,7 @@ eval = function(sh, e)
 		end
 		if op == "**" then
 			if r < 0 then -- bash disallows a negative exponent (fatal arith error)
-				arith_div0(e, "exponent less than 0")
+				arith_div0(e, "exponent less than 0", sh)
 			end
 			return rt.ipow_raw(l, r)
 		end
@@ -1303,12 +1334,12 @@ eval = function(sh, e)
 				v = cur * v
 			elseif o == "/" then
 				if v == i64(0) then
-					arith_div0(e)
+					arith_div0(e, nil, sh)
 				end
 				v = cur / v
 			elseif o == "%" then
 				if v == i64(0) then
-					arith_div0(e)
+					arith_div0(e, nil, sh)
 				end
 				v = cur % v
 			elseif o == "&" then
@@ -3102,7 +3133,8 @@ local function apply_redirs(sh, redirs, cname, ctx, args) -- cname: the command 
 				if m then
 					m = rt.fd_number(m)
 				end
-				if m == r.fd then -- `N>&N` / `N<&N-`: nothing to do (redir.c: redir_fd == redirector)
+				if m == r.fd and not fdnew then -- `N>&N` / `N<&N-`: nothing to do (redir.c: redir_fd
+					-- == redirector — never a `{v}<&N`: its fd was free, so N is closed)
 				elseif m then
 					-- Validate the source fd is open BEFORE backing up the destination: a
 					-- dup-based backup would otherwise reuse a just-closed source fd number,
@@ -4462,6 +4494,10 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		end
 	end
 	local ok, err = true, nil
+	-- (execute_function: line_number is the body's line — rline, as for its redirections —
+	-- where a compound in it with no line of its own reports: rt.compound_line)
+	local sbl, fdb = sh.base_line, sh.func_def and sh.func_def[cmd]
+	sh.base_line = fdb and (not sh.eof_read and fdb.rline_own or fdb.rline) or sbl
 	if fr and rok == false then
 		sh.status = 1 -- a failed redirect skips the body (bash)
 	elseif type(fn) == "function" then
@@ -4497,6 +4533,7 @@ local function run_function(sh, cmd, fn, args, hook, tenv_base)
 		M._int.drain_procsub(sh, pnp, pnf)
 	end
 	sh.loopdepth = saved_ld
+	sh.base_line = sbl
 	-- `return N` sets the function's status but not $? (return.def: only return_catch_value),
 	-- so the RETURN trap sees the status from before it; N is $? once the trap has run
 	-- (N parked in sh.fret: a compiled body's own, or a `return N` raised mid-body here)
@@ -5513,6 +5550,7 @@ function SIMPLE.bind(sh, spec)
 			rt.pbind_bad(sh, a.name, tostring(a.index))
 		elseif a.raw then
 			rt.pbind(sh, a.name, nil, false, a.raw)
+		elseif rt.pbind_skip(sh, a.name) then -- (refused before its value expands)
 		elseif a.arith then -- (`x=$((…))`, parsed as arithmetic)
 			rt.pbind(sh, a.name, rt.i64_to_str(eval(sh, a.arith)), false)
 		else
@@ -5591,9 +5629,10 @@ exec_stmt = function(sh, st, hook)
 		local rd = st.redirs
 		local pnp, pnf = procsub_mark(sh) -- a >() redirect target drains after the whole command
 		local line0 = sh.cur_line
-		if st.top and rd[1].line and not (sh.in_trap and sh.in_trap > 0) then
-			sh.cur_line = rd[1].line -- (a top-level one's errors are at its end; nested, bash
-		end -- hasn't moved the line on from the enclosing command's)
+		if not (sh.in_trap and sh.in_trap > 0) then -- (a top-level one's errors are at its end;
+			-- nested, at bash's line_number of the moment: rt.compound_line)
+			sh.cur_line = rt.compound_line(sh, st) or sh.cur_line
+		end
 		local save, ok = apply_redirs(sh, rd)
 		if not ok then
 			sh.status = 1
@@ -5799,7 +5838,24 @@ exec_stmt = function(sh, st, hook)
 				sh.status = sh.ncs ~= ncs0 and sh.last_cmdsub_status or 0
 			end
 			-- a redirection with no command still opens/truncates its target (`> file`)
-			if st.redirs then
+			if st.redirs and rt.null_forks(st.redirs) then
+				-- (bash's execute_null_command forks for a `{v}` one or one onto fd 0: the child
+				-- does the redirections and exits — v is never set here)
+				local saves
+				local ok, err = pcall(sh.subshell_run, sh, function(sh)
+					local sv, rok = apply_redirs(sh, st.redirs)
+					saves = sv
+					if not rok then
+						sh.status = 1
+					end
+				end, nil, st)
+				if saves then
+					restore_redirs(saves)
+				end
+				if not ok then
+					error(err, 0)
+				end
+			elseif st.redirs then
 				local save, ok = apply_redirs(sh, st.redirs)
 				if not ok then
 					sh.status = 1
@@ -5977,7 +6033,11 @@ exec_stmt = function(sh, st, hook)
 		if sh.traps and sh.traps.ERR and not (sh.in_trap and sh.in_trap > 0) then
 			sh.cur_cmd = st -- ($BASH_COMMAND for an ERR trap it fires: the whole `( … )`)
 		end
+		local sbl = sh.base_line
 		local ok, err = pcall(sh.subshell_run, sh, function(sh)
+			if not st.fnbody then -- (execute_in_subshell: line_number is the subshell's — where
+				sh.base_line = st.line -- it closes; a function's ( … ) body: the call set it)
+			end
 			if st.redirs then
 				if st.top and st.redirs[1].line and not (sh.in_trap and sh.in_trap > 0) then
 					sh.cur_line = st.redirs[1].line
@@ -5991,6 +6051,7 @@ exec_stmt = function(sh, st, hook)
 			end
 			exec_list(sh, st.body, SUBHOOK, false)
 		end, nil, st, st.inplace) -- (st: its text, for the report if a signal kills it)
+		sh.base_line = sbl
 		if saves then
 			restore_redirs(saves)
 		end
@@ -6123,6 +6184,8 @@ exec_stmt = function(sh, st, hook)
 		-- a matching body still sees the PREVIOUS $? (bash); the case's status is its LAST
 		-- executed body's, 0 when that body is empty or nothing matched
 		local lastempty = true
+		local sbl = sh.base_line -- (execute_case_command: line_number is the `case` line)
+		sh.base_line = st.line
 		for _, cl in ipairs(st.clauses) do
 			local matched = fall
 			if not matched then
@@ -6146,6 +6209,7 @@ exec_stmt = function(sh, st, hook)
 				end -- ;; : done
 			end
 		end
+		sh.base_line = sbl
 		if lastempty then
 			sh.status = 0
 		end
@@ -6294,6 +6358,8 @@ exec_stmt = function(sh, st, hook)
 		local fs = { list = list, idx = 0 }
 		local bodystatus = 0
 		sh.loopdepth = (sh.loopdepth or 0) + 1
+		local sbl = sh.base_line -- (execute_for_command: line_number is the `for` line throughout)
+		sh.base_line = st.line
 		while true do
 			sh.forstate[st.id] = fs
 			local hr, herr = hook("loop", st.id, st, sh)
@@ -6330,6 +6396,7 @@ exec_stmt = function(sh, st, hook)
 			end
 		end
 		sh.loopdepth = sh.loopdepth - 1
+		sh.base_line = sbl
 		sh.status = bodystatus
 	elseif t == "select" then
 		-- select NAME [in WORDS]: print the numbered menu + $PS3 to stderr, read a line from
@@ -6370,6 +6437,8 @@ exec_stmt = function(sh, st, hook)
 			run_debug(sh, (sh.in_trap and sh.in_trap > 0 and (sh.calldepth or 0) == sh.trap_calldepth) and sh.cur_line or st.line)
 		end
 		rt.select_menu(sh, list)
+		local sbl = sh.base_line -- (line_number is the `select` line throughout)
+		sh.base_line = st.line
 		while true do
 			hook("loop", st.id, st, sh) -- (st: the tier hook tells the program's loops from eval'd ones)
 			if not rt.select_next(sh, list, st.name) then -- (the prompt/read/REPLY/NAME round: EOF
@@ -6383,6 +6452,7 @@ exec_stmt = function(sh, st, hook)
 			end
 		end
 		sh.loopdepth = sh.loopdepth - 1
+		sh.base_line = sbl
 		sh.status = bodystatus
 	elseif t == "if" then
 		local ran = false
@@ -6797,6 +6867,7 @@ end
 -- Run one logical line (a parser group) the way the shell runs its own input.
 local function run_group(sh, lg, hook, k)
 	sh.cmd_number = (sh.cmd_number or 0) + 1 -- (the prompt's \#)
+	sh.base_line = lg.eline -- (bash's line_number between commands: the reader's — rt.compound_line)
 	if not lg.jobs_read and (sh.jobs_waited or sh.jobs_pending) then -- (reading a line:
 		rt.jobs_line(sh, lg.rline) -- notify_and_cleanup — rt.jobs_line; run_lazy's before the parse)
 	end
