@@ -69,6 +69,27 @@ do
   progs[#progs+1] = { "synthetic#250-statement-function", table.concat(c, "\n") }
   progs[#progs+1] = { "synthetic#all", table.concat(a, "\n") .. "\n" .. table.concat(b, "\n") .. "\n" .. table.concat(c, "\n") }
 end
+-- ...and constructs past LuaJIT's jump range, constants and syntax levels in ONE statement
+-- or frame (stress-attack S11/S16/S17): an 8000-alternative pattern, a 5000-part word, a
+-- 3000-element array literal, 20000 flat arithmetic terms, a 2000-arm case, `$( … )` nested
+-- 18 deep, and 20000 statements (a segmented frame: whole program only, `nomodes`).
+do
+  local function rep(n, f) local t = {} for i = 0, n - 1 do t[#t+1] = f(i) end return table.concat(t) end
+  progs[#progs+1] = { "synthetic#alternatives-8000", "for ((r = 0; r < 150; r++)); do case zzz in p0"
+    .. rep(7999, function(i) return "|p" .. (i + 1) end) .. ") m=1;; esac; done" }
+  progs[#progs+1] = { "synthetic#word-5000", "for ((r = 0; r < 150; r++)); do y=" .. rep(5000, function() return "a${r}" end)
+    .. "; done" }
+  progs[#progs+1] = { "synthetic#array-3000", "for ((r = 0; r < 150; r++)); do ar=("
+    .. rep(3000, function(i) return "[" .. i .. "]=$r " end) .. "); done" }
+  progs[#progs+1] = { "synthetic#arith-20000", "for ((r = 0; r < 150; r++)); do ((x += r*0"
+    .. rep(19999, function(i) return "+r*" .. (i + 1) end) .. ")); done" }
+  progs[#progs+1] = { "synthetic#arms-2000", "for ((i = 0; i < 300; i++)); do case $((i * 7 % 2000)) in\n"
+    .. rep(2000, function(i) return i .. ") c=$((c + " .. i .. "));;\n" end) .. "esac; done" }
+  progs[#progs+1] = { "synthetic#cmdsub-18", "for ((r = 0; r < 3; r++)); do y=$(" .. rep(18, function() return "echo $(" end)
+    .. "echo 1" .. rep(18, function() return ")" end) .. "); done" }
+  progs[#progs+1] = { "synthetic#statements-20000", rep(20000, function(i) return "t" .. (i % 40) .. "=" .. i .. "\n" end)
+    .. "for ((i = 0; i < 150; i++)); do t0=$((t0 + t39)); done", true }
+end
 -- the fragment modes swept with --modes
 local modes = {}
 if MODES then
@@ -139,7 +160,7 @@ for idx, pr in ipairs(progs) do
         nnoc = nnoc + 1; note(why, r, pr[1])
       end
       -- the whole program as a fragment, in every mode (a fresh parse: emit annotates the AST)
-      if ok and err ~= "" and MODES then
+      if ok and err ~= "" and MODES and not pr[3] then
         for _, m in ipairs(modes) do
           local okq, a2 = pcall(P.parse, pr[2])
           if okq then
