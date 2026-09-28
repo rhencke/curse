@@ -1079,8 +1079,12 @@ eval = function(sh, e)
 		end
 		return arith_resolve(sh, v)
 	end
-	if k == "param" then
-		return rt.str_to_i64(sh:param(e.n))
+	if k == "param" then -- ($n, like $name: a value that isn't a plain number is re-read as text)
+		local v = sh:param(e.n)
+		if not looks_numeric(v) then
+			error({ __arith_textual = true })
+		end
+		return rt.arith_num(v)
 	end
 	if k == "xpand" then -- deferred: expansions inside $(( )) resolved at runtime
 		-- Fast path when the raw only uses $name/${…}/$digit (no $(…)/`…`/$*/glued name):
@@ -5422,47 +5426,8 @@ local function head(sh, st, text)
 		sh.cur_cmd = { t = "head", text = text }
 	end
 end
-local function run_debug(sh, line)
-	local h = sh.traps and sh.traps.DEBUG
-	if not h or h == "" or sh.in_debug or (sh.in_pipestage or 0) > 0 then
-		return
-	end
-	-- DEBUG doesn't reach into a subshell/command substitution unless functrace extends it.
-	-- (A function call hides it at entry instead — rt.debug_enter — so one the function
-	-- sets itself still fires in its body.)
-	if (sh.in_subprogram or 0) > 0 and not rt.pseudo_trapped(sh, "DEBUG") then
-		return -- (one the subshell set itself is live there)
-	end
-	sh.in_debug = true
-	local saved = sh.status
-	if line then
-		sh.cur_line = line
-	end
-	local exited, rret = run_trap(sh, h, "debug trap")
-	local trap_status = sh.status
-	sh.status = saved
-	sh.in_debug = false
-	if rret then -- `return` in the DEBUG trap returns from the running function
-		error({ __curse_return = rret })
-	end
-	-- `exit` in a DEBUG trap exits the shell; a non-zero DEBUG return under errexit
-	-- also exits (skipping the command), matching bash.
-	if exited then
-		error({ __curse_exit = trap_status })
-	end
-	if sh.opt_e and trap_status ~= 0 then
-		error({ __curse_exit = trap_status })
-	end
-	-- shopt -s extdebug: a non-zero DEBUG status skips the command; 2 inside a function
-	-- or sourced file acts as a `return` from it (bash)
-	if trap_status ~= 0 and sh.shopt.extdebug then
-		if trap_status == 2 and ((sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0) then
-			error({ __curse_return = trap_status }) -- (the function returns 2: bash)
-		end
-		return true
-	end
-end
-M.run_debug = run_debug -- compiled tier fires DEBUG before each native command
+local run_debug = rt.run_debug -- (the one DEBUG-trap runner: runtime, shared with the compiled tier)
+M.run_debug = run_debug
 
 local wall_secs = rt.wall_secs
 
@@ -6513,42 +6478,14 @@ end
 -- exec_list, run_lazy and the &&/|| handler (which previously drifted apart).
 -- Run just the ERR trap (once, in scope), preserving $?; no errexit-exit. Used
 -- both by fire_err and directly by run_trap (a failed command inside a handler).
-fire_err_trap = function(sh)
-	local h = sh.traps and sh.traps.ERR
-	-- ERR is not re-run inside a forked pipeline stage (bash fires it ONCE for the
-	-- whole pipeline, in the parent); errtrace still extends it to functions/subshells.
-	-- (not inherited by functions/subshells — but one SET in a function or subshell
-	-- fires there, as bash's trap is active in the context that set it)
-	-- (functions hide it on entry — rt.debug_enter; a subshell doesn't inherit it either)
-	-- (a stage skips only the INHERITED trap: one set inside the stage fires there)
-	local sp, ps = sh.in_subprogram or 0, sh.in_pipestage or 0
-	local errscope = sh.opt_errtrace or ((ps == 0 or ps == sh.err_trap_ps) and (sp == 0 or sp == sh.err_trap_sp))
-	if sh.err_skip then -- (the failing call set the trap itself: bash sampled none before it)
-		sh.err_skip = nil
-		return
-	end
-	if h and h ~= "" and not sh.in_err_trap and errscope then
-		sh.in_err_trap = true
-		local saved = sh.status
-		local exited, rret = run_trap(sh, h, "error trap")
-		local xst = sh.status
-		sh.status = saved
-		sh.in_err_trap = false
-		if exited then -- `exit` in the ERR trap exits the shell (_run_trap_internal)
-			error({ __curse_exit = xst })
-		end
-		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
-			error({ __curse_return = rret })
-		end
-	end
-end
+fire_err_trap = rt.fire_err_trap -- (the one ERR-trap runner: runtime, shared with the compiled tier)
 fire_err = function(sh)
 	fire_err_trap(sh)
 	if sh.opt_e then
 		error({ __curse_exit = sh.status })
 	end
 end
-M.fire_err_trap = fire_err_trap -- compiled tier fires ERR after a failing native command
+M.fire_err_trap = fire_err_trap
 -- A prompt string (PS1/PS2/… and ${x@P}): decode the backslash escapes, then (promptvars)
 -- expand it as if double-quoted — $var/$(…)/`…`, `\` escaping only $ ` " \ (bash's
 -- Q_DOUBLE_QUOTES; a bare `"` is literal, so the heredoc-style body parse).

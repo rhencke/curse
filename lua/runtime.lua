@@ -4553,7 +4553,7 @@ function M.debug_enter(sh, name)
 	if sh.opt_functrace or (sh.fn_trace and sh.fn_trace[name]) then
 		-- inherited: it also fires once on ENTRY, at the definition's line (bash)
 		if d ~= nil then
-			require("interp").run_debug(sh, sh.func_bline and sh.func_bline[name] or nil)
+			M.run_debug(sh, sh.func_bline and sh.func_bline[name] or nil)
 		end
 		return saved
 	end
@@ -16846,6 +16846,10 @@ function M.arith_isnum(sh, name)
 	end -- i64-authoritative
 	return M.looks_numeric(sh:get(name)) ~= nil
 end
+-- …and for a positional parameter ($n in arithmetic)
+function M.param_isnum(sh, n)
+	return M.looks_numeric(sh:param(n)) ~= nil
+end
 -- Textual substitution of a non-numeric $name value into arithmetic (bash re-parses
 -- the value's TEXT). Dynamic — deferred to the interpreter bootstrap.
 function M.arith_textual(sh, raw)
@@ -17025,11 +17029,85 @@ end
 function M.assign_elem(sh, w)
 	return require("interp").expand_assign_word(sh, w)
 end
+-- The DEBUG and ERR trap runners, shared by both tiers (the compiled code calls rt.run_debug
+-- before a command, rt.fire_err_trap after a failing one; the interpreter binds the same
+-- functions). The handler text itself runs through the trap-handler runner (interp's
+-- run_trap: parse + run, or its compiled fragment).
+function M.run_debug(sh, line)
+	local h = sh.traps and sh.traps.DEBUG
+	if not h or h == "" or sh.in_debug or (sh.in_pipestage or 0) > 0 then
+		return
+	end
+	-- DEBUG doesn't reach into a subshell/command substitution unless functrace extends it.
+	-- (A function call hides it at entry instead — rt.debug_enter — so one the function
+	-- sets itself still fires in its body.)
+	if (sh.in_subprogram or 0) > 0 and not M.pseudo_trapped(sh, "DEBUG") then
+		return -- (one the subshell set itself is live there)
+	end
+	sh.in_debug = true
+	local saved = sh.status
+	if line then
+		sh.cur_line = line
+	end
+	local exited, rret = require("interp")._int.run_trap(sh, h, "debug trap")
+	local trap_status = sh.status
+	sh.status = saved
+	sh.in_debug = false
+	if rret then -- `return` in the DEBUG trap returns from the running function
+		error({ __curse_return = rret })
+	end
+	-- `exit` in a DEBUG trap exits the shell; a non-zero DEBUG return under errexit
+	-- also exits (skipping the command), matching bash.
+	if exited then
+		error({ __curse_exit = trap_status })
+	end
+	if sh.opt_e and trap_status ~= 0 then
+		error({ __curse_exit = trap_status })
+	end
+	-- shopt -s extdebug: a non-zero DEBUG status skips the command; 2 inside a function
+	-- or sourced file acts as a `return` from it (bash)
+	if trap_status ~= 0 and sh.shopt.extdebug then
+		if trap_status == 2 and ((sh.calldepth or 0) > 0 or (sh.sourcedepth or 0) > 0) then
+			error({ __curse_return = trap_status }) -- (the function returns 2: bash)
+		end
+		return true
+	end
+end
+
+function M.fire_err_trap(sh)
+	local h = sh.traps and sh.traps.ERR
+	-- ERR is not re-run inside a forked pipeline stage (bash fires it ONCE for the
+	-- whole pipeline, in the parent); errtrace still extends it to functions/subshells.
+	-- (not inherited by functions/subshells — but one SET in a function or subshell
+	-- fires there, as bash's trap is active in the context that set it)
+	-- (functions hide it on entry — rt.debug_enter; a subshell doesn't inherit it either)
+	-- (a stage skips only the INHERITED trap: one set inside the stage fires there)
+	local sp, ps = sh.in_subprogram or 0, sh.in_pipestage or 0
+	local errscope = sh.opt_errtrace or ((ps == 0 or ps == sh.err_trap_ps) and (sp == 0 or sp == sh.err_trap_sp))
+	if sh.err_skip then -- (the failing call set the trap itself: bash sampled none before it)
+		sh.err_skip = nil
+		return
+	end
+	if h and h ~= "" and not sh.in_err_trap and errscope then
+		sh.in_err_trap = true
+		local saved = sh.status
+		local exited, rret = require("interp")._int.run_trap(sh, h, "error trap")
+		local xst = sh.status
+		sh.status = saved
+		sh.in_err_trap = false
+		if exited then -- `exit` in the ERR trap exits the shell (_run_trap_internal)
+			error({ __curse_exit = xst })
+		end
+		if rret then -- `trap 'return N' ERR`: the failing command's function returns N
+			error({ __curse_return = rret })
+		end
+	end
+end
 -- shopt -s extdebug: the DEBUG trap before a compiled command; a non-zero status skips
 -- the command — raised as the pc it continues at, for the catcher of the CFG `cfg`
 -- (tier.run_compiled for `run`, rt.catch_dbgskip for a function's)
 function M.debug_x(sh, line, after, cfg)
-	if require("interp").run_debug(sh, line) then
+	if M.run_debug(sh, line) then
 		error({ __curse_dbgskip = after, cfg = cfg }, 0)
 	end
 end

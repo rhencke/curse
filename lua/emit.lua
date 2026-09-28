@@ -15,8 +15,8 @@
 -- literal) are LIFTED to native Lua int64 locals, seeded from `sh` on entry and
 -- written back on exit. Everything else stays in `sh`, so both tiers share it.
 --
--- Compiled code calls only the runtime (rt.* / sh:* / a few interp hooks such as
--- I.fire_err_trap), never the interpreter's statement walker. Where a comment below says
+-- Compiled code calls only the runtime (rt.* / sh:* — the DEBUG/ERR traps too:
+-- rt.run_debug, rt.fire_err_trap), never the interpreter's statement walker. Where a comment below says
 -- a word or command "delegates", the fast path it describes declines and the caller takes
 -- a more general compiled one — a shared runtime engine (rt.word_fields, rt.simple_run,
 -- rt.assign_full, rt.redir_apply_one, …) run through cx.dispatch — or, when nothing fits,
@@ -618,6 +618,10 @@ local function xpand_split(e, lifted, nl, lf, seen)
 	if type(e) ~= "table" then
 		return
 	end
+	if e.k == "param" and not seen[e.n] then -- ($n: guarded like a non-lifted $name)
+		seen[e.n] = true
+		nl[#nl + 1] = e.n
+	end
 	if e.k == "var" and e.dollar and not e.idx and not seen[e.name] then
 		seen[e.name] = true
 		if lifted[e.name] then
@@ -847,13 +851,14 @@ local function errchk(st) -- the guard statement for `st`, or "" when errexit ne
 	if EF.has_err then -- ERR trap fires on the same condition as errexit; set $LINENO to this
 		-- command's line, fire ERR (fire_err_trap scopes by calldepth/in_subprogram — inside a
 		-- function/subshell only under errtrace), THEN errexit (bash order).
-		return ("if sh.noerr == 0 and sh.status ~= 0 then %sI.fire_err_trap(sh); if sh.opt_e then error({ __curse_exit = sh.status }) end end"):format(
+		return ("if sh.noerr == 0 and sh.status ~= 0 then %srt.fire_err_trap(sh); if sh.opt_e then error({ __curse_exit = sh.status }) end end"):format(
 			(EF.trapline and not EF.cur_infunc) and "" or ("sh.cur_line = %d; "):format(st.line or 0)
 		)
 	end
 	return ERRCHK
 end
-EF.LINE_BUILTINS = { compgen = 1, mapfile = 1, readarray = 1, fc = 1 } -- (see the builtin dispatch)
+EF.LINE_BUILTINS = { compgen = 1, mapfile = 1, readarray = 1, fc = 1, -- (see the builtin dispatch; the
+	declare = 1, typeset = 1, ["local"] = 1, readonly = 1, export = 1, set = 1 } -- listers print LINENO)
 EF.has_debug = false -- program installs a DEBUG trap → fire it before each command
 -- set -x: a program that can turn on xtrace (or runs eval/source, which may) carries a
 -- trace hook per command — `if sh.opt_x then rt.xtrace…` — placed where the interpreter
@@ -957,9 +962,9 @@ local function dbg(st, head)
 	end
 	if EF.has_debug then
 		if EF.trapline and not EF.cur_infunc then -- (a handler's commands: the interrupted line)
-			return "I.run_debug(sh, sh.cur_line); "
+			return "rt.run_debug(sh, sh.cur_line); "
 		end
-		return ("I.run_debug(sh, %d) "):format(st.line or 0)
+		return ("rt.run_debug(sh, %d) "):format(st.line or 0)
 	end
 	return ""
 end
@@ -970,8 +975,8 @@ function EF.dbg_plain(text, line)
 	if not EF.has_debug then
 		return bc
 	end
-	return bc .. ((EF.trapline and not EF.cur_infunc) and "I.run_debug(sh, sh.cur_line) "
-		or ("I.run_debug(sh, %d) "):format(line or 0))
+	return bc .. ((EF.trapline and not EF.cur_infunc) and "rt.run_debug(sh, sh.cur_line) "
+		or ("rt.run_debug(sh, %d) "):format(line or 0))
 end
 -- Wrap a compiled function call `s` (function `cmd`, called at source `line`) with
 -- call-stack maintenance ($FUNCNAME/BASH_* when read) and, when an ERR/DEBUG trap is
@@ -1238,7 +1243,7 @@ emit_value = function(e, lifted)
 		return lifted[e.name] and lname(e.name) or (EF.arith_varread):format(e.name)
 	end
 	if k == "param" then
-		return ("rt.str_to_i64(sh:param(%d))"):format(e.n)
+		return ("rt.arith_num(sh:param(%d))"):format(e.n) -- (under xpand's rt.param_isnum guard)
 	end
 	if k == "xpand" then
 		-- $name/$digit arithmetic: bash substitutes each value's TEXT and re-parses, which
@@ -1262,7 +1267,8 @@ emit_value = function(e, lifted)
 		end -- every $-operand is a lifted i64: pure native
 		local conds = {}
 		for _, nm in ipairs(nl) do
-			conds[#conds + 1] = ("rt.arith_isnum(sh,%q)"):format(nm)
+			conds[#conds + 1] = type(nm) == "number" and ("rt.param_isnum(sh,%d)"):format(nm)
+				or ("rt.arith_isnum(sh,%q)"):format(nm)
 		end
 		local fb -- fallback: flush any lifted operands to sh, then bash's textual substitution
 		if #lf == 0 then
@@ -1461,7 +1467,7 @@ emit_avalue = function(e)
 		return ("rt.arith_read(sh, %q)"):format(e.name)
 	end -- recursive (reentrancy-guarded)
 	if k == "param" then
-		return ("rt.str_to_i64(sh:param(%d))"):format(e.n)
+		return ("rt.arith_num(sh:param(%d))"):format(e.n) -- (under xpand's rt.param_isnum guard)
 	end
 	if k == "un" then
 		local v = emit_avalue(e.e)
@@ -4302,11 +4308,41 @@ analyze_lift = function(ast)
 			end
 		end
 	end
+	-- An ELEMENT read of a name (`${t[0]}`, `$(( t[0] + 1 ))` — a scalar is its element 0)
+	-- reads sh.vars (rt.array_elem / rt.arith_read_elem): that name stays in sh too.
+	local function disq_elem(nm)
+		if type(nm) == "string" then
+			disq[nm] = true
+		end
+	end
+	local function arith_elems(a) -- (every element read/write in a parsed arith tree)
+		any_node(a, function(x)
+			if type(x.idxraw) == "string" then
+				disq_elem(x.name)
+				disq_text(x.idxraw)
+			end
+			if x.k == "xpand" and type(x.raw) == "string" and x.raw:find("[", 1, true) then
+				local ok, nat = pcall(require("parser").arith, x.raw, true)
+				if ok then
+					arith_elems(nat)
+				else
+					require("parser").trap_flow(nat)
+				end
+			end
+			return false
+		end)
+	end
 	any_node(ast.stmts, function(n)
 		if n.t == "assign" or n.t == "arrayassign" then
 			disq_text(n.index)
 		end
+		if n.k == "xpand" and type(n.raw) == "string" and n.raw:find("[", 1, true) then
+			arith_elems(n)
+		end
 		if n.pexp then
+			if n.pexp.index ~= nil then
+				disq_elem(n.pexp.name)
+			end
 			disq_text(n.pexp.index)
 			if n.pexp.op == "sub" then
 				disq_text(n.pexp.arg)
@@ -4317,15 +4353,11 @@ analyze_lift = function(ast)
 			disq_text(n.key)
 		end
 		if type(n.idxraw) == "string" then -- (an arith element's subscript: `(( a[i++] = 5 ))`)
+			disq_elem(n.name)
 			disq_text(n.idxraw)
 		end
 		if type(n.arith) == "string" and n.arith:find("[", 1, true) then -- (a word's `$(( a[i++] ))`)
-			any_node(safe_arith(n.arith), function(a)
-				if type(a.idxraw) == "string" then
-					disq_text(a.idxraw)
-				end
-				return false
-			end)
+			arith_elems(safe_arith(n.arith))
 		end
 		return false
 	end)
@@ -4720,11 +4752,38 @@ end
 -- An arith node is inline-substitutable only if subst_arith reaches every leaf that
 -- could reference the caller. An `xpand` (embedded $-expansion, e.g. `$(( $* ))`) is
 -- delegated verbatim and would re-read the INLINE SITE's sh.params/vars — never inline it.
+-- A FAST xpand whose only $-operands are positionals (`$(( $1 * 3 ))`) IS: its native tree
+-- (xpand_native) has param leaves subst_arith replaces — when the call's argument is a
+-- plain number (bash substitutes the TEXT, and a number binds like an atom).
+local function xpand_native(e)
+	if not xpand_fast(e.raw) then
+		return nil
+	end
+	local ok, nat = pcall(require("parser").arith, xpand_lens(e.raw), true)
+	if not ok then
+		require("parser").trap_flow(nat)
+		return nil
+	end
+	local nl, lf = {}, {}
+	xpand_split(nat, {}, nl, lf, {})
+	for _, nm in ipairs(nl) do
+		if type(nm) == "string" then -- (a $name: its own textual guard, not substitutable)
+			return nil
+		end
+	end
+	if arith_side_effect(nat) or not_compilable(nat) then
+		return nil
+	end
+	return nat
+end
 local function arith_inlinable(e)
 	if type(e) ~= "table" then
 		return true
 	end
-	if e.k == "xpand" or e.k == "arith_perr" then -- (arith_perr: a parse error only the interp renders)
+	if e.k == "xpand" then
+		return xpand_native(e) ~= nil
+	end
+	if e.k == "arith_perr" then -- (arith_perr: a parse error only the interp renders)
 		return false
 	end
 	return arith_inlinable(e.e)
@@ -4749,6 +4808,15 @@ local function word_arith_perr(w)
 	return false
 end
 
+-- every $(( … )) in the word inline-substitutable (arith_inlinable)
+local function word_arith_inlinable(w)
+	for _, p in ipairs(w.parts) do
+		if p.arith and not arith_inlinable(safe_arith(p.arith)) then
+			return false
+		end
+	end
+	return true
+end
 local function inlinable_body(body)
 	for _, st in ipairs(body) do
 		-- A redirect whose target references params/cmdsub (`echo x > "$@"`, `: >&$1`)
@@ -4766,7 +4834,7 @@ local function inlinable_body(body)
 			end
 		end
 		if st.t == "assign" then
-			if st.rhs and (word_varargs(st.rhs) or word_arith_perr(st.rhs)) then
+			if st.rhs and (word_varargs(st.rhs) or word_arith_perr(st.rhs) or not word_arith_inlinable(st.rhs)) then
 				return false
 			end
 			if st.arith and not arith_inlinable(st.arith) then
@@ -4784,7 +4852,12 @@ local function inlinable_body(body)
 				if word_varargs(st.words[j]) then
 					return false
 				end
-				if word_arith_perr(st.words[j]) then
+				if word_arith_perr(st.words[j]) or not word_arith_inlinable(st.words[j]) then
+					return false
+				end
+			end
+			for _, a in ipairs(st.assigns or {}) do
+				if a.rhs and (word_varargs(a.rhs) or not word_arith_inlinable(a.rhs)) then
 					return false
 				end
 			end
@@ -4797,13 +4870,29 @@ end
 
 -- Substitute positional params ($n) with the caller's already-computed Lua exprs.
 -- pb[n] = { int = <arith Lua expr>, str = <string Lua expr> }.
+-- pb[n].num: the argument's text is a plain decimal number (its arith value reads the same
+-- substituted as text); a $n in arith whose argument isn't (or is missing) sets
+-- subst_textual — bash re-parses such a value's text, so that call isn't spliced.
+local subst_textual = false
 local function subst_arith(e, pb)
 	if type(e) ~= "table" then
 		return e
 	end
 	local k = e.k
-	if k == "param" and e.n ~= 0 then -- unset positional inside the callee is 0 in arith
-		return pb[e.n] and { k = "raw", code = pb[e.n].int } or { k = "num", v = "0" }
+	if k == "param" then -- ($0 too: the shell's name is text)
+		if not (pb[e.n] and pb[e.n].num) then
+			subst_textual = true
+			return { k = "num", v = "0" }
+		end
+		return { k = "raw", code = pb[e.n].int }
+	end
+	if k == "xpand" then -- (arith_inlinable admitted it: a positionals-only fast xpand)
+		local nat = xpand_native(e)
+		if not nat then
+			subst_textual = true
+			return e
+		end
+		return subst_arith(nat, pb)
 	end
 	if e.e or e.l or e.c then -- (a copy: keeps etxt/etok, idxraw, … — only operands change)
 		local c = {}
@@ -6363,23 +6452,23 @@ simple_compiled = function(cx, st, after)
 		for j = 2, #st.words do
 			local w = st.words[j]
 			local strExpr = emit_word(w, cx.lifted)
-			local intExpr
+			local intExpr, num
 			if #w.parts == 1 then
 				local pp = w.parts[1]
-				if pp.var then
-					intExpr = cx.lifted[pp.var] and lname(pp.var) or ("sh:aget(%q)"):format(pp.var)
-				elseif pp.lit and pp.lit:match("^[+-]?%d+$") then
-					intExpr = pp.lit .. "LL"
-				elseif pp.arith then
-					intExpr = emit_value(safe_arith(pp.arith), cx.lifted)
-				else
-					intExpr = ("rt.str_to_i64(%s)"):format(strExpr)
+				if pp.var and cx.lifted[pp.var] then -- (an i64 local: always a number)
+					intExpr, num = lname(pp.var), true
+				elseif pp.lit and (pp.lit:match("^[+-]?[1-9]%d?%d?%d?%d?%d?%d?%d?%d?%d?%d?%d?%d?%d?%d?%d?%d?%d?$")
+					or pp.lit:match("^[+-]?0$")) then -- (no octal/base/overflow text)
+					intExpr, num = pp.lit .. "LL", true
+				elseif pp.arith and not arith_side_effect(safe_arith(pp.arith)) and not not_compilable(safe_arith(pp.arith)) then
+					intExpr, num = emit_value(safe_arith(pp.arith), cx.lifted), true
 				end
-			else
-				intExpr = ("rt.str_to_i64(%s)"):format(strExpr)
 			end
-			pb[j - 1] = { int = intExpr, str = strExpr }
+			pb[j - 1] = { int = intExpr, str = strExpr, num = num }
 		end
+		subst_textual = false
+		local ibody = subst_list(cx.inlinefns[cmd], pb)
+		if not subst_textual then
 		-- $_ after the call is the call's LAST argument (or the name), expanded BEFORE the
 		-- body runs (which may change it): capture it, splice the body, then set $_.
 		local us = cx.newloopvar()
@@ -6387,7 +6476,7 @@ simple_compiled = function(cx, st, after)
 		local post = cx.newpc()
 		cx.blocks[post] = ('sh:set_str("_", %s); if sh.ifs_fc then rt.ifs_popchk(sh) end; pc = %d'):format(us, after) -- (pop_context's sv_ifs: rt.ifs_first)
 		local cl = EF.cur_line -- (the call traces under ITS line, not the inlined body's)
-		local bodyentry = cx.flatten_list(subst_list(cx.inlinefns[cmd], pb), post)
+		local bodyentry = cx.flatten_list(ibody, post)
 		EF.cur_line = cl
 		local pre = cx.newpc()
 		local xpre = ""
@@ -6400,6 +6489,7 @@ simple_compiled = function(cx, st, after)
 		end
 		cx.blocks[pre] = ("%s%s = %s; pc = %d"):format(xpre, us, emit_word(lastw, cx.lifted), bodyentry)
 		return pre
+		end -- (else: an out-of-line call, below)
 	end
 	local p = cx.newpc()
 	local args = {}
@@ -7331,7 +7421,7 @@ H.pipeline = function(cx, st, after)
 	-- bash quirk (execute_cmd.c): a failing `( … )` LAST stage runs ERR itself, on top of the
 	-- pipeline's own ERR — keyed on that subshell's status, not the pipeline's `!`.
 	if EF.has_err and n >= 2 and st.cmds[n].t == "subshell" then
-		ecs = "; if sh.noerr == 0 and (sh.last_stage_status or 0) ~= 0 then I.fire_err_trap(sh) end" .. ecs
+		ecs = "; if sh.noerr == 0 and (sh.last_stage_status or 0) ~= 0 then rt.fire_err_trap(sh) end" .. ecs
 	end
 	-- Every stage runs IN-PROCESS under the coroutine scheduler. In an eval/source program a
 	-- stage's command names may be redefined at run time (dyn_guard): the stages' own simple
@@ -8241,7 +8331,7 @@ build_cfg = function(stmts, lifted, funcflags, inlinefns, toplevel)
 		end
 		-- a failed redirect on a compound fires ERR (interp's compound-redirect path does)
 		-- ($LINENO is NOT updated for the redirect — bash reports the last command's line)
-		local errfire = EF.has_err and "if sh.noerr == 0 then I.fire_err_trap(sh) end; " or ""
+		local errfire = EF.has_err and "if sh.noerr == 0 then rt.fire_err_trap(sh) end; " or ""
 		-- (a redirect error names the line bash is at: a top-level compound's end, else the
 		-- command before it — a compound doesn't move the line itself)
 		local sl = EF.cur_line
@@ -9382,7 +9472,6 @@ function M.emit(ast, opts)
 
 	local o = {
 		'local rt = require("runtime")',
-		'local I = require("interp")',
 		'local bit = require("bit")',
 		"local __noop = function() end",
 		"local __pre = rt.preempt_flag",
