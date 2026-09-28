@@ -229,7 +229,6 @@ return function(sh, cmd, args, hook, tcb)
 			end
 		end
 		sh.status = any and 0 or 1
-		local _, rx = rt.cmd_text(sh)
-		rt.self_sig_release(sh, rx)
+		rt.self_sig_release(sh, rt.cmd_redirected(sh))
 	end
 end

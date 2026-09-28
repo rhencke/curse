@@ -2633,6 +2633,23 @@ function M.cmd_text(sh)
 	end
 	return c or ""
 end
+-- Has the command running now redirections of its own? (M.cmd_text's `rx`, without the text)
+function M.cmd_redirected(sh)
+	local getinfo, getlocal = debug.getinfo, debug.getlocal
+	for level = 2, 200 do
+		local info = getinfo(level, "f")
+		if not info or M.INTERP_FRAMES[info.func] then
+			break
+		end
+		local t = M.PCLINE[info.func]
+		if t then
+			local _, pc = getlocal(level, 2)
+			return t.rx and t.rx[pc] or false
+		end
+	end
+	local c = sh.cur_cmd
+	return type(c) == "table" and c.redirs and #c.redirs > 0 or false
+end
 -- The line a foreground job's report carries (bash's line_number back in the caller of
 -- execute_simple_command: the enclosing context's — parser.lua's jcx): compiled code
 -- registers it per pc (M.pcline's `jl`, where it differs from the pc's own line), the
