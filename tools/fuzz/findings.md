@@ -1646,3 +1646,36 @@ loose-tag-coincidence pattern from campaign 1; the rest were not individually re
   (`v='!'` / `<(jobs << 08 % \${#b} >r) ei`); confirmed fresh via `cmp.sh` in the container
   on both the original and the reduced one-liner.
 
+## Campaign 3 (gram:arith + gram:pexp, containerized, 20 min), branch fuzz-hunt
+
+711 crash signatures (91 target:arith, 424 target:pexp NEW; plus 195 already bucketed —
+F125's new rule alone caught 23 of the arith ones). Given the volume, sampled rather than
+exhaustively triaged: most of the arith NEW signatures are further variants of F125's
+"bash's eager lexer catches a malformed trailing token with a specific message; curse's
+recursive-descent parser stops cleanly on a prior operand and reports a different, later
+diagnosis" family (different message pairs, same shape) — not recorded individually.
+Sampling the pexp pile found one clean, high-value, previously-unseen bug (F132 below);
+the rest of the pexp NEW signatures are a mix of the same message-substitution pattern and
+apparent masking gaps (invalid-UTF-8 bytes rendering identically after masking on both
+sides yet still flagged, e.g. several signatures where `<` and `>` show byte-identical
+text) — not individually resolved. No REG-tagged hits this round.
+
+## F132. `${arr[i]-word}`/`${arr[i]:-word}`: word-splitting ignores quoting inside `word`
+## when the parameter being defaulted has an array subscript
+
+    printf '<%s>' ${x[0]-'a b'}
+
+- bash: `<a b>` — one field. `x[0]` is unset, so the default value `'a b'` is used; the
+  quotes are honored during quote removal/splitting exactly as normal, keeping the literal
+  space out of IFS splitting.
+- curse (all tiers): `<a><b>` — two fields. The literal space inside the single-quoted
+  default value is split on anyway. The array subscript on the *defaulted* parameter is
+  what triggers it: the same expression with a plain scalar (`${x-'a b'}`) agrees with bash
+  on all tiers. Confirmed the quoting itself still works with a scalar parameter and with
+  an array-subscripted *nested* expansion elsewhere in the word (`${x-${q[0]}'a b'}` also
+  agrees) — it's specifically the outer, defaulted name carrying `[...]` that loses the
+  quote-protection tracking for its own default-value word. Found via `gram:pexp`
+  (originally inside a larger nested expansion, `id:001045`: `"${y@k}"
+  ${x[$n]-${q[k]@u}[!a-m]~\}'x y'/?} "${q[k]^?}"`); reduced to the one-liner above and
+  confirmed fresh via `cmp.sh` in the container.
+
