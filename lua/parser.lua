@@ -4766,7 +4766,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 			k = e2 + 1
 		end
 		local w = table.concat(parts)
-		if not RESERVED[w] or src:find("^[^ \t\n;&|()<>]", k) then
+		-- (…not one that ends the input: that `\<newline>` is one more line read — the EOF
+		-- error's line counts it, where ws() finds it)
+		if not RESERVED[w] or k > n or src:find("^[^ \t\n;&|()<>]", k) then
 			return
 		end
 		for j = #cs, 1, -1 do
