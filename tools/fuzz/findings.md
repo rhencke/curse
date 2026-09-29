@@ -1425,3 +1425,257 @@ line as `ARG`, then `declare -p __v`.)
   through the echo builtin's code (Shell:echo), which then took `\\` as an escape; they now print
   lines as they are. test/cases/3363-builtin-output-xpg-echo.sh
 
+## Special triage (branch fuzz-hunt): the arith target's overnight backlog of unbucketed
+## "`:' expected for conditional expression" signatures
+
+`gram:arith`'s 2026-09-28 09:15 triage (`~/workspace/curse-wt/fuzz-docker/triage/20260928-091505`)
+left ~40 NEW crash signatures (plus 6 more mis-swept into the unrelated F101 "contains a
+quote" bucket — same root cause, different accidental bucket) all of the shape
+`target:arith:output|< S: line N: … (bash's own, specific message)|> S: line N: … \`:'
+expected for conditional expression (error token is …)`, e.g.:
+
+    target:arith:output|< N#: invalid integer constant (error token is X)|> N# : `:' expected for conditional expression (error token is X)
+    target:arith:output|< S: line N: X: invalid arithmetic operator (error token is X)|> S: line N: N?N/N{#… : `:' expected for conditional expression (error token is X)
+
+## F125. Arithmetic: text left over after a ternary's true branch is never re-lexed, so
+## bash's specific tokenizer error is replaced by a generic "expected ':'"
+
+    echo "$(( 1?2 3# ))"
+
+- bash: `S: line 1: 1?2 3#: invalid integer constant (error token is "3#")` — bash lexes the
+  whole expression before parsing it, so the malformed base-number token `3#` (a base with
+  no digits) is caught immediately, independent of where it falls relative to the `?`.
+- curse (interp, compiled, tiered, and the static `build/curse` binary, all identically):
+  `S: line 1: 1?2 3# : \`:' expected for conditional expression (error token is "3# ")` —
+  `parseExpr`'s ternary arm (`lua/parser.lua` ~line 700) parses the true branch with its own
+  recursive `parseExpr`, which stops cleanly after `2` (the token `3#` doesn't look like a
+  binary operator, so the inner loop just returns); back in the ternary caller, `eat(":")`
+  fails (the cursor sits on `3#`, not `:`), and the code reports the ternary's own generic
+  diagnosis (`aerr("`:' expected for conditional expression", …)`) using the unconsumed
+  tail as `lookahead(a)`'s error token — never re-lexing that tail to see *why* it isn't a
+  colon, so bash's real complaint about `3#` itself is lost. The reported error token also
+  picks up a trailing space that isn't part of the token (`"3# "` vs bash's `"3#"`).
+  Confirmed fresh in the container with `cmp.sh` (interp/compiled/tiered/static all agree
+  with each other and disagree with bash identically):
+  `interp/compiled/tiered/static: S: line 1: 1?2 3# : \`:' expected for conditional expression (error token is "3# ")`.
+  Reduced from the campaign's `gram-arith` crash `id:000270` (original 2-line fuzz input
+  `2**63-ba?c^iranges` / `10#`, i.e. `2**63-ba?c^iranges\n10#` with the embedded newline
+  acting as whitespace) down to the 6-byte expression `1?2 3#`; the `2 ` before the bad
+  token is required — `1?3#` (nothing between `?` and the bad token) does not reproduce,
+  because there the ternary's true-branch `parseExpr` call fails on `3#` immediately as its
+  *first* token instead of stopping cleanly after a prior operand.
+  Not ternary-specific: the same defect (unconsumed trailing text never re-lexed) also
+  fires with no `?` at all — `echo "$(( 2 3# ))"` — curse says `syntax error in expression
+  (error token is "3# ")` where bash says `invalid integer constant (error token is "3#")`;
+  recorded here rather than as a second finding since it's the same root cause, just a
+  different generic fallback message (ternary vs top-level) for the same "leftover token
+  after a clean sub-parse" gap. Other malformed trailing tokens reproduce the same ternary
+  variant with bash's other specific lexer messages in place of "invalid integer constant",
+  e.g. `echo "$(( 1?2 { ))"` -> bash `syntax error: invalid arithmetic operator (error token
+  is "{ ")`, curse still `\`:' expected for conditional expression`.
+
+## Campaign 1 (gram:tiered + gram:compiled, containerized, 30 min), branch fuzz-hunt
+
+82 differential signatures (49 NEW, 33 tagged "regression or variant of a FIXED finding").
+Verified a representative sample of each (fresh, in the container, via `cmp.sh` on the
+actual crashing queue file and on hand-reduced minimizations): most of the volume traces to
+two mechanisms that are not fresh findings — (1) `gen-script`/token mutations occasionally
+strip a `for`/`until` loop's bound out of `for ((1;1;1))`-style headers, producing a
+genuinely unbounded loop whose runaway output is truncated by the sandbox's `ulimit -f`
+(SIGXFSZ, status 153) at a byte offset that depends on bash's vs. curse's internal stdio
+buffer size — a real difference, but not an actionable behavioral one (confirmed
+deterministic across 3 repeats; same first ~40 lines, diverges only in the exact truncated
+tail); (2) a backgrounded `(( … )) &` whose stderr races the foreground script's own
+output/next builtin — which worker (interp/compiled/tiered/static) the live campaign
+timing flagged as disagreeing was not reproducible run-to-run (confirmed by rerunning the
+same queue file 2+ times: the disagreeing worker changed between runs), i.e. genuine
+scheduling nondeterminism, the same family cmp.sh's `order-only:` check already targets
+but doesn't fully catch when the split lands mid-line rather than mid-stream. Of the 33
+FIXED-finding tags, 6 were individually verified against the original finding's actual
+mechanism (not just its loose bash-wording regex): F72, F74 and F76 below are genuine
+(an incomplete fix and two new variants in the same families); F10 and F45's tags were
+coincidental (bash's generic "syntax error near .../unexpected EOF" wording matched a
+different, new mechanism — see F129); a sample of the F37 tags (nested/special-variable
+array subscripts, e.g. `BASH_SUBSHELL[COLUMNS[a]]`) reproduced only in a large, entangled
+generated script and did not survive hand reduction in the time available — left open,
+not recorded as a finding. The remaining FIXED-tags were not individually re-verified
+(time-boxed); given how loose their known.tsv wording is (see fuzz.sh's own comment on
+this category) and that none sampled were genuine, they are treated as coincidental
+pending a future pass.
+
+## F126. Compiled tier: `exit` inside a command substitution silently discards stderr the
+## substitution already produced
+
+    `f=$[i[$OLDPWD]] exit`
+
+- bash, interp, tiered, and the static `build/curse` binary: `S: line 1: i[]: bad array
+  subscript` (twice — bash's own double-report for a bad subscript), status 0 (the
+  backquoted command's stdout is empty, so the outer bare command-substitution statement
+  runs nothing).
+- curse **compiled tier only**: no output at all (stdout empty, stderr empty), status 0 —
+  the bad-subscript error that fired earlier in the same command substitution is dropped
+  entirely once `exit` runs afterward. Reproduces with `exit` specifically; the same
+  script with `true` in place of `exit` agrees with bash (error printed normally), and
+  with `return` in place of `exit` all tiers agree (bash's own "can only `return' from a
+  function" error, status 2) — so it's `exit`'s in-process unwind out of the command
+  substitution (curse never forks for `` ` ` ``/`$( )`, see docs on in-process subshells)
+  that loses the buffered diagnostic, specific to the compiled tier. Reduced from
+  gram-tiered queue entry `id:006398` (`set -o errtrace $"hi" \`f="${HOME##?}x"${1?$[i[$OLDPWD]]}5 OLDPWD+=( [1]+=y) exit\``);
+  confirmed fresh via `cmp.sh` in the container on the reduced one-liner.
+
+## F127. Regression/incomplete fix of F72 — `(( BASH_COMMAND++ ))`: the leading `((` is
+## still left in the recursion error's token when a postfix operator is attached
+
+    (( BASH_COMMAND++ ))
+
+- bash: `S: line 1: ((: (( BASH_COMMAND++ )): expression recursion level exceeded (error
+  token is "BASH_COMMAND++ ))")` — the token starts at `BASH_COMMAND`, not `((`.
+- curse (all tiers): same message but `(error token is "(( BASH_COMMAND++ ))")` — the
+  leading `((` is still in the token, exactly F72's original defect. F72's fix evidently
+  covers `BASH_COMMAND` as a bare operand (`(( BASH_COMMAND & 1 ))` now agrees with bash)
+  but not when a postfix `++`/`--` is attached directly to it (confirmed `(( BASH_COMMAND-- ))`
+  also reproduces). Reduced from gram-tiered queue entry `id:006407`
+  (`(( BASH_COMMAND++ & 7 >> 18446744073709551616 || ${#f} ))`); confirmed fresh via
+  `cmp.sh` in the container on both the reduced form and the original.
+
+## F128. Arithmetic: a readonly-variable check fires before bash's own "not an lvalue"
+## check on an unrelated nested compound assignment
+
+    echo $(( (UID >>= 3 >= b %= a) ))
+
+- bash: `S: line 1: (UID >>= 3 >= b %= a) : attempted assignment to non-variable (error
+  token is "%= a) ")` — `%=` binds lower than `>=`, so its left side is the comparison
+  result `3 >= b`, not a variable; bash catches this (an inner operator's target isn't an
+  lvalue) before ever touching `UID`, regardless of whether `UID` itself is writable.
+- curse (all tiers): `S: line 1: UID: readonly variable` — curse validates (and rejects)
+  the *outer* `UID >>=` target's readonly-ness before it has parsed/validated far enough
+  to notice the inner `%=`'s target is invalid. Confirmed the readonly-ness is the
+  deciding factor: the same shape with a plain writable variable (`echo $(( (x >>= 3 >= b
+  %= a) ))`) already agrees with bash (both report the `%=` error). Same family as F74
+  (bash's parse-time lvalue check vs. curse's eager evaluation order) but a distinct
+  trigger (a readonly target masks the deeper error, rather than a ternary/paren
+  confusing which side is the lvalue) — recorded as a new finding, not a regression, since
+  F74's fixed cases never involved a readonly variable. Reduced from gram-tiered queue
+  entry `id:006711`; confirmed fresh via `cmp.sh` in the container.
+
+## F129. A syntax error inside `$( )` that bash defers to run time (confined to the
+## substitution) is a fatal top-level parse error in curse
+
+    echo "$((( 1 )) &
+    ( while true; do
+    )
+    )"
+
+- bash: status 0, prints one blank line (the substitution's content fails its own,
+  separate parse — reported as `S: command substitution: line 4: syntax error near
+  unexpected token ')'`, note the `command substitution:` prefix marking a deferred,
+  run-time parse of the extracted substitution text) — but the failure is confined to the
+  substitution (which contributes nothing to the word), and `echo` still runs.
+- curse (all tiers): status 2, **no stdout at all** — `S: line 4: syntax error near
+  unexpected token ')'` (no `command substitution:` prefix) is instead treated as a fatal
+  top-level parse error, aborting the whole script before `echo` ever runs. Only
+  reproduces through the `$((`/`$( (` ambiguity (bash's ambiguous-paren heuristic falls
+  back to a deferred/run-time parse of the substitution's raw extracted text in some
+  cases but not others — a plain unambiguous case like `echo "$(if)"` is a fatal top-level
+  error on both sides, agreeing); the trigger is narrow and fragile under hand
+  simplification (several straightforward-looking trims stopped reproducing it — e.g.
+  swapping `while true; do` for `if true; then`, or removing the split between the two
+  closing-paren lines, made both sides agree again). Reduced from gram-tiered queue entries
+  `id:006441` and (independently, with a different inner syntax error — `unexpected end of
+  file` after an unterminated here-document) `id:006267`, both showing the identical
+  bash-status-0-vs-curse-status-2 pattern; confirmed fresh via `cmp.sh` in the container on
+  the reduced 4-line form. (Tagged by triage as a regression of F10/F45 respectively —
+  coincidental: both are bash's generic "syntax error near .../unexpected EOF" wording
+  attached to an unrelated mechanism, not the originally-fixed constructs.)
+
+## Campaign 2 (gram:tiers + gram:parse, containerized, 30 min), branch fuzz-hunt
+
+109 differential/crash signatures (90 NEW, 19 tagged "regression or variant of a FIXED
+finding"). `gram:parse`'s 90 NEW signatures are essentially all fine-grained wording/token-
+choice variants of the already-open F116/F117 parser-message-fidelity gap (which token
+bash blames, or "unexpected EOF" vs "syntax error near", for complex nested malformed
+constructs); sampled ~10 of the shortest, none showed a mechanism distinct from that known
+gap, so none recorded as new. `gram:tiers`'s crash list had a cluster of ~28
+`tiers:compiled:*`/`tiers:tiered:*` signatures nearly all sharing one of two seed bases
+(`src:001140+001771`, `src:001140+002698`) with single-byte mutations; one base
+(`<(jobs << 08) ei`-shaped: a `&`-backgrounded job or process substitution racing the
+foreground script's own output) is scheduling nondeterminism — confirmed by re-running the
+identical queue file, which reproduced a *different* disagreeing worker each time (as
+campaign 1's cluster A/B); the other base is the genuine, deterministic F130 below. Of the
+19 FIXED-finding tags, 3 were individually verified: the two F47 tags are a real,
+deterministic gap in the same family (F131 below); a sample of the various F52 tags
+(`wait: BASH_ARGV: cannot unset`, `export: x: not a function`, `let: {a,b}: syntax error`,
+`local: can only be used in a function` — four unrelated messages under one loose tag) were
+each unrelated to F52's actual "set -v echoes its own line" mechanism, confirming the
+loose-tag-coincidence pattern from campaign 1; the rest were not individually re-verified
+(time-boxed).
+
+## F130. Compiled tier: a failed redirect inside a multi-line `$( )` blames the
+## substitution's opening line, not the line the redirect is actually on
+
+    v='!'
+    <Djobs -='!'v=${#}$(mapfile IFS
+    <DjobO) echo hi
+
+- bash, interp, tiered, and static: `S: line 3: DjobO: No such file or directory` (the
+  `<DjobO` redirect is textually on line 3, inside the `$( )` that opened on line 2) then
+  `S: line 2: Djobs: No such file or directory` (the outer redirect, correctly on line 2).
+- curse **compiled tier only**: `S: line 2: DjobO: ...` — blames line 2 (the substitution's
+  opening line) instead of line 3. Same family as F76 (compiled misattributes a line
+  inside a `` ` ` ``/`$( )`/`>( )` substitution) but a distinct trigger not covered by
+  F76's fix. Fragile under simplification: dropping the outer command's own `<Djobs`
+  redirect, or using a plain assignment/builtin instead of `mapfile`, made both sides
+  agree again — not reduced further in the time available. Reduced from `gram-tiers`
+  crash `id:000050`; confirmed fresh via `cmp.sh` in the container.
+
+## F131. Regression/incomplete fix of F47 — a heredoc inside `<( )` is missing bash's
+## specific "delimited by end-of-file" warning, and the line count after it drifts by one
+
+    echo <(cat << 08) ei
+
+- bash: `S: line 1: warning: command substitution: 1 unterminated here-document` **and**
+  `S: line 1: warning: here-document at line 1 delimited by end-of-file (wanted \`08')`
+  (both warnings, both on line 1), then continues the script still on line 1.
+- curse (all tiers): only the first, generic warning — the second, specific "delimited by
+  end-of-file (wanted `DELIM')" warning never fires — and whatever runs next is attributed
+  to line 2 instead of line 1 (e.g. the same script with `cat` replaced by a name that
+  doesn't resolve reports `S: line 2: cat: command not found` where bash reports nothing
+  further on that line). F47's fix evidently covers the generic "N unterminated
+  here-document" warning for `<( )`/`>( )` but not the per-heredoc delimiter warning or
+  the subsequent line-count carry-over. Reduced from `gram-tiers` queue entry `id:003845`
+  (`v='!'` / `<(jobs << 08 % \${#b} >r) ei`); confirmed fresh via `cmp.sh` in the container
+  on both the original and the reduced one-liner.
+
+## Campaign 3 (gram:arith + gram:pexp, containerized, 20 min), branch fuzz-hunt
+
+711 crash signatures (91 target:arith, 424 target:pexp NEW; plus 195 already bucketed —
+F125's new rule alone caught 23 of the arith ones). Given the volume, sampled rather than
+exhaustively triaged: most of the arith NEW signatures are further variants of F125's
+"bash's eager lexer catches a malformed trailing token with a specific message; curse's
+recursive-descent parser stops cleanly on a prior operand and reports a different, later
+diagnosis" family (different message pairs, same shape) — not recorded individually.
+Sampling the pexp pile found one clean, high-value, previously-unseen bug (F132 below);
+the rest of the pexp NEW signatures are a mix of the same message-substitution pattern and
+apparent masking gaps (invalid-UTF-8 bytes rendering identically after masking on both
+sides yet still flagged, e.g. several signatures where `<` and `>` show byte-identical
+text) — not individually resolved. No REG-tagged hits this round.
+
+## F132. `${arr[i]-word}`/`${arr[i]:-word}`: word-splitting ignores quoting inside `word`
+## when the parameter being defaulted has an array subscript
+
+    printf '<%s>' ${x[0]-'a b'}
+
+- bash: `<a b>` — one field. `x[0]` is unset, so the default value `'a b'` is used; the
+  quotes are honored during quote removal/splitting exactly as normal, keeping the literal
+  space out of IFS splitting.
+- curse (all tiers): `<a><b>` — two fields. The literal space inside the single-quoted
+  default value is split on anyway. The array subscript on the *defaulted* parameter is
+  what triggers it: the same expression with a plain scalar (`${x-'a b'}`) agrees with bash
+  on all tiers. Confirmed the quoting itself still works with a scalar parameter and with
+  an array-subscripted *nested* expansion elsewhere in the word (`${x-${q[0]}'a b'}` also
+  agrees) — it's specifically the outer, defaulted name carrying `[...]` that loses the
+  quote-protection tracking for its own default-value word. Found via `gram:pexp`
+  (originally inside a larger nested expansion, `id:001045`: `"${y@k}"
+  ${x[$n]-${q[k]@u}[!a-m]~\}'x y'/?} "${q[k]^?}"`); reduced to the one-liner above and
+  confirmed fresh via `cmp.sh` in the container.
+
