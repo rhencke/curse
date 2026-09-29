@@ -118,6 +118,12 @@ local function arith(src, nodefer)
 		local s2 = table.concat(out)
 		dtxt, src = s2 ~= src and s2 or nil, s2
 	end
+	-- A backslash in SOURCE arithmetic quotes as in double quotes (bash's expand_arith_string):
+	-- `\$ \` \" \\` lose it — the character left is literal, no expansion or quote — so
+	-- `$(( \" ))` evaluates ` " `. Expanded at run time, then parsed as that text.
+	if not nodefer and src:find('\\[$`"\\]') then
+		return { k = "xpand", raw = src }
+	end
 	-- `${…}` no longer forces a whole-expression defer — primary() consumes it as an
 	-- opaque operand leaf. A GLUED `${…}` (part of a compound name, `x${y}`) is still
 	-- caught by `[%w_]%$` below and deferred whole, as are $(…), `…`, and $*/$@/$?/…
@@ -245,8 +251,8 @@ local function arith(src, nodefer)
 			return spine(e.e, nostr)
 		elseif k == "tern" then
 			return { k = "tern", c = e.c, a = e.a, b = spine(e.b, nostr) or ZERO }
-		elseif nostr and k == "var" and not e.dollar then
-			return nil
+		elseif nostr and ((k == "var" and not e.dollar) or k == "pre") then
+			return nil -- (a `++NAME` too: readtok's peek past NAME failed before the increment)
 		end
 		return e
 	end
@@ -2184,7 +2190,8 @@ local function parse_dquote(inner, add, heredoc, bt_keep)
 			-- ends on — csnl: the newlines from the `$(` — then DISCARD)
 			if heredoc == true and inner:byte(i + 1) == 40 and not (inner:byte(i + 2) == 40 and dparen_is_arith(inner, i + 3))
 				and not pcall(scan_cmdsub, inner, i + 2) then
-				add({ cserr = M.open_comsub_err(inner:sub(i + 2)), csnl = select(2, inner:sub(i):gsub("\n", "")), q = true })
+				local ce, cl, ct = M.open_comsub_err(inner:sub(i + 2))
+				add({ cserr = ce, csnl = select(2, inner:sub(i):gsub("\n", "")), csline = cl, cstext = ct, q = true })
 				return
 			end
 			-- (a heredoc body's ${x-word} keeps a $'…' in word literal — bash; so does a
@@ -2776,20 +2783,23 @@ end
 -- pexp default expansion and the compiled tier so both render such a default identically.
 -- The error bash's xparse_dolparen reports for a $( whose `)` never comes (BODY: the text
 -- after it, to the end of the word): the body's own syntax error, else the missing `)'.
+-- (2nd, 3rd results: a syntax error's line in the body, 1-based, and the text bash echoes
+-- for it — parse_comsub met it before running out of input: `$( fi` reports the `fi`)
 function M.open_comsub_err(body)
 	local ok, ast = pcall(M.parse, body)
 	local err = not ok and (type(ast) == "table" and ast.msg or tostring(ast)) or nil
+	local eline, etext = nil, nil
 	for _, st in ipairs(ok and ast.stmts or {}) do
 		if st.t == "parse_error" and not st.recoverable then
-			err = tostring(st.msg)
+			err, eline, etext = tostring(st.msg), st.line, st.text
 			break
 		end
 	end
 	err = err and unpos(err)
 	if err == "syntax error: unexpected end of file" then -- (the body ran out inside a
-		err = nil -- construct: parse_comsub's own EOF — the `)' it was looking for)
+		err, eline = nil, nil -- construct: parse_comsub's own EOF — the `)' it was looking for)
 	end
-	return err or "unexpected EOF while looking for matching `)'"
+	return err or "unexpected EOF while looking for matching `)'", eline, etext
 end
 function M.parse_default_quoted(txt, heredoc)
 	local out, k, m, inq = {}, 1, #txt, false
@@ -4724,6 +4734,47 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 	-- (memoized by position: the parser peeks the same spot again and again for keywords;
 	-- a hit re-applies ws's line effect so nothing observable changes)
 	local pk_i, pk_src, pk_w, pk_dl
+	-- A `\<newline>` inside a reserved word or right after one (`fi\⏎`, `}\⏎⏎`, `f\⏎i`):
+	-- bash's shell_getc removed it before the lexer saw the word. Take it out of the text
+	-- here (its newline still counts a line), so the word reads as the reserved word it is.
+	local function cont_splice(p)
+		src = src:sub(1, p - 1) .. src:sub(p + 2)
+		n = #src
+		line = line + 1
+		for k = 1, astk_n do
+			if astk[k][2] > p then
+				astk[k][2] = astk[k][2] - 2
+			end
+		end
+		if alias_nl then
+			local moved = {}
+			for x in pairs(alias_nl) do
+				moved[x > p and x - 2 or x] = true
+			end
+			alias_nl = moved
+		end
+	end
+	local function kw_splice(s, e) -- the word src[s..e] runs on through continuations?
+		if not (src:byte(e + 1) == 92 and src:byte(e + 2) == 10) then
+			return
+		end
+		local parts, k, cs = { src:sub(s, e) }, e + 1, {}
+		while src:byte(k) == 92 and src:byte(k + 1) == 10 do
+			cs[#cs + 1] = k
+			local _, e2 = src:find("^[%w_]*", k + 2)
+			parts[#parts + 1] = src:sub(k + 2, e2)
+			k = e2 + 1
+		end
+		local w = table.concat(parts)
+		-- (…not one that ends the input: that `\<newline>` is one more line read — the EOF
+		-- error's line counts it, where ws() finds it)
+		if not RESERVED[w] or k > n or src:find("^[^ \t\n;&|()<>]", k) then
+			return
+		end
+		for j = #cs, 1, -1 do
+			cont_splice(cs[j])
+		end
+	end
 	local function peekword()
 		if pk_i == i and pk_src == src then
 			line = line + pk_dl
@@ -4731,6 +4782,14 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 		end
 		local save, l0 = i, line
 		ws()
+		do
+			local s0, e0 = src:find("^[%a_][%w_]*", i)
+			if s0 then
+				local l1 = line
+				kw_splice(s0, e0)
+				l0 = l0 + (line - l1) -- (a splice's line is counted once: not re-applied on a hit)
+			end
+		end
 		local s, e = src:find("^[%a_][%w_]*", i)
 		-- (a reserved word is a whole token: `if=1`, `do.x`, `fi-2` are ordinary words)
 		local w = s and not src:find("^[^ \t\n;&|()<>]", e + 1) and src:sub(s, e) or nil
@@ -6475,6 +6534,9 @@ local function make_parser(src, sh, aenv, noalias, posix, line0, lineabs, xg, bq
 				-- expand it before looking for one; parse_command then won't re-expand
 				try_alias(true)
 				cmd_prex = i
+			end
+			if stopset["}"] and src:sub(i, i) == "}" then
+				kw_splice(i, i)
 			end
 			if stopset["}"] and src:sub(i, i) == "}" and not src:find("^[^ \t\n;&|()<>]", i + 1) then
 				i = i + 1 -- (a reserved word is a whole token: `}x`, `}\r` are ordinary words)

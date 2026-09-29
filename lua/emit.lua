@@ -419,15 +419,16 @@ end
 -- magic it is an ordinary variable (bash), as is a function's plain `local LINENO`
 -- (a trap handler's own commands keep the line of the command it interrupted — interp's
 -- run_trap doesn't advance sh.cur_line at the trap's call depth: EF.trapline)
+-- (rt.dyn_note: the value read is LINENO's value cell — what `set` lists afterwards)
 local function lineno_expr()
 	if EF.trapline and not EF.cur_infunc then -- (the handler's line k: the trapped line + k-1)
 		local tl = ("((sh.trap_base or sh.cur_line or 0) + %d)"):format(math.max((EF.cur_line or 1) - 1, 0))
-		return "((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
-			.. ("(sh.ldrift and rt.ldrift_str(sh, %s)) or tostring(%s))"):format(tl, tl)
+		return "rt.dyn_note(sh, 'LINENO', ((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
+			.. ("(sh.ldrift and rt.ldrift_str(sh, %s)) or tostring(%s)))"):format(tl, tl)
 	end
 	-- (sh.ldrift: bash's lines drifted after a discarded command — rt.line_drift)
-	return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
-		.. "(sh.ldrift and rt.ldrift_str(sh, %d)) or %q)"):format(EF.cur_line or 0, tostring(EF.cur_line or 0))
+	return ("rt.dyn_note(sh, 'LINENO', ((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:get('LINENO') or "
+		.. "(sh.ldrift and rt.ldrift_str(sh, %d)) or %q))"):format(EF.cur_line or 0, tostring(EF.cur_line or 0))
 end
 -- A non-literal command word (`c=unset; $c f`) or an `unset` passed on as an argument
 -- (`run unset f`, to a function that runs "$@") may unset any literal name after it too.
@@ -1071,6 +1072,7 @@ EF.funcnest = false -- program may set $FUNCNEST → compiled calls check the ca
 EF.funcstack = false -- program reads $FUNCNAME → maintain sh.funcstack around calls
 EF.pipestatus = false -- program reads $PIPESTATUS → set it (=(status)) after each simple cmd
 EF.has_trap = false -- program installs any trap (EF.trap_ret)
+EF.inl_guard = false -- inlinable calls spliced only while rt.hooks_idle (emit_pass)
 EF.trap_ret = false -- a trap handler's `return` may end a compiled function → fn_x catches it (rt.catch_return)
 local emit_redir_funcs = {} -- funcs with a definition redirect (`f(){…} >&2`): delegate them + their calls
 local emit_multidef = {} -- names defined by more than one top-level funcdef: a single hoisted
@@ -1379,10 +1381,10 @@ emit_value = function(e, lifted)
 	end
 	if k == "var" and e.name == "LINENO" then -- compile-time line (unless `unset LINENO`)
 		if EF.trapline and not EF.cur_infunc then
-			return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.trap_base or sh.cur_line or 0) + %d))"):format(
+			return ("rt.dyn_note(sh, 'LINENO', ((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or (0LL + (sh.trap_base or sh.cur_line or 0) + %d)))"):format(
 				math.max((EF.cur_line or 1) - 1, 0))
 		end
-		return ("((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or %sLL)"):format(
+		return ("rt.dyn_note(sh, 'LINENO', ((sh.vars.LINENO or sh.unset_specials) and rt.lineno_plain(sh) and sh:aget('LINENO') or %sLL))"):format(
 			tostring(EF.cur_line or 0))
 	end
 	if k == "var" and e.idxraw then -- $(( a[i] )): array/assoc element read (gated by arith_elem_ok)
@@ -3046,7 +3048,9 @@ function pexp_scalar(pe, lifted)
 			end
 			return ("rt.elem_len(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
 		end
-		val = ("rt.array_elem(sh, %s, %q, %s)"):format(ename, pe.index, expanded)
+		-- (the reference's own name: its helpers resolve it, and a nameref to an unset
+		-- variable names itself in a bad-subscript error — rt.badsub_name)
+		val = ("rt.array_elem(sh, %q, %q, %s)"):format(pe.name, pe.index, expanded)
 		if pe.op == nil then
 			return val
 		end
@@ -6822,7 +6826,7 @@ simple_compiled = function(cx, st, after)
 	if cmd == "return" then
 		return EF.simple_native(cx, st, after, cmd) or cx.refuse(st, after)
 	end
-	if cx.inlinefns and cx.inlinefns[cmd] and not redir_apply then
+	if cx.inlinefns and cx.inlinefns[cmd] and not redir_apply and cx.inl_off ~= st then
 		-- INLINE: bind $n to the caller's exprs and splice the body flowing to `after`.
 		local pb = {}
 		for j = 2, #st.words do
@@ -6864,6 +6868,14 @@ simple_compiled = function(cx, st, after)
 			xpre = EF.xtc(cmd, "{" .. table.concat(xa, ", ") .. "}")
 		end
 		cx.blocks[pre] = ("%s%s = %s; pc = %d"):format(xpre, us, emit_word(lastw, cx.lifted), bodyentry)
+		if EF.inl_guard then -- (spliced only while no trap that could fire in it is set: else
+			cx.inl_off = st -- the out-of-line call, which keeps the frame the hooks scope to)
+			local callpc = simple_compiled(cx, st, after)
+			cx.inl_off = nil
+			local g = cx.newpc()
+			cx.blocks[g] = ("if rt.hooks_idle(sh) then pc = %d else pc = %d end"):format(pre, callpc)
+			return g
+		end
 		return pre
 		end -- (else: an out-of-line call, below)
 	end
@@ -10045,6 +10057,51 @@ function M.emit(ast, opts)
 	end
 	return code
 end
+-- The program's functions whose calls can't ARM a trap (rt.catch_return's lazy form: with
+-- no DEBUG/ERR/signal trap set as such a function is called, no handler can run — so none
+-- can `return` from it — before it returns; it skips the pcall). A body arms nothing when
+-- every command in it (at any depth: $(…) and ( … ) bodies too, conservatively) is a
+-- literal builtin that runs no shell code of its own, or a call of another such function.
+-- (An expansion can't arm one: a $(…) body runs in a subshell, whose traps are its own.)
+EF.NOARM_CMDS = {}
+for _, c in ipairs({ "echo", "printf", ":", "true", "false", "test", "[", "local", "declare",
+	"typeset", "readonly", "export", "unset", "shift", "let", "return", "break", "continue",
+	"set", "shopt", "cd", "pwd", "pushd", "popd", "dirs", "read", "getopts", "hash", "type",
+	"umask", "kill", "wait", "times", "ulimit", "alias", "unalias", "caller", "jobs", "disown" }) do
+	EF.NOARM_CMDS[c] = true
+end
+function EF.noarm_funcs(stmts, ndefs)
+	local body = {}
+	for _, st in ipairs(stmts) do
+		if st.t == "funcdef" and ndefs[st.name] == 1 and not emit_redir_funcs[st.name] then
+			body[st.name] = st.body
+		end
+	end
+	local ok = {}
+	for n in pairs(body) do
+		ok[n] = true
+	end
+	local changed = true
+	while changed do -- (a fixpoint: a call of a function that may arm arms too)
+		changed = false
+		for n, b in pairs(body) do
+			if ok[n] and any_node(b, function(x)
+				if x.t == "funcdef" then
+					return true -- (a nested definition: delegated, its calls too)
+				end
+				if x.t ~= "simple" or not x.words or not x.words[1] then
+					return false
+				end
+				local c = full_lit(x.words[1])
+				return not c or not (EF.NOARM_CMDS[c] or ok[c])
+			end) then
+				ok[n] = nil
+				changed = true
+			end
+		end
+	end
+	return ok
+end
 function M.emit_pass(ast, opts)
 	EF.ov_need = { frames = {}, upv = false }
 	EF.frag_seq = 0
@@ -10164,7 +10221,15 @@ function M.emit_pass(ast, opts)
 	-- catches it (rt.catch_return) and calls track calldepth — which tells run_trap and
 	-- `return` that a function is running. Any trap (or eval/source, which may set one).
 	EF.trap_ret = EF.has_trap or EF.has_dyncode
-	local no_inline = EF.has_err or EF.has_debug or EF.funcstack or EF.trap_ret
+	-- (…unless the hooks are all it would lose — an ERR/DEBUG/RETURN/signal trap that may be
+	-- set, by the program or eval/source code: then a call is spliced while none is set
+	-- (rt.hooks_idle, at run time) and runs out of line otherwise — EF.inl_guard. An
+	-- inlinable body can't set one itself. Not with $FUNCNAME stacks, $BASH_COMMAND or
+	-- extdebug, which every call must maintain.)
+	-- (and $FUNCNEST, which a spliced call can't count: out of line while it is set)
+	EF.inl_guard = (EF.has_err or EF.has_debug or EF.trap_ret or EF.funcnest) and not EF.funcstack
+		and not EF.bash_command and not EF.extdebug or false
+	local no_inline = (EF.has_err or EF.has_debug or EF.funcstack or EF.trap_ret or EF.funcnest) and not EF.inl_guard
 	emit_redir_funcs = {}
 	emit_multidef = {}
 	do -- a name defined by more than one top-level funcdef can't be a single hoisted fn_x;
@@ -10392,6 +10457,8 @@ function M.emit_pass(ast, opts)
 		end
 	end
 	count_defs(ast.stmts, {})
+	-- (EF.trap_ret: which functions can't ARM a trap themselves — rt.catch_return's lazy form)
+	local noarm = EF.trap_ret and EF.noarm_funcs(ast.stmts, ndefs) or {}
 	for _, st in ipairs(ast.stmts) do
 		if st.t == "funcdef" then
 			-- keep every fn_x (indirect/dynamic dispatch); it can't see run-locals, so
@@ -10426,7 +10493,8 @@ function M.emit_pass(ast, opts)
 				fndefs[#fndefs + 1] = ("%s = rt.catch_dbgskip(%s, %q)"):format(fnlname(st.name), fnlname(st.name), fnlname(st.name))
 			end
 			if EF.trap_ret then -- (a trap handler's `return` raised mid-body ends THIS call)
-				fndefs[#fndefs + 1] = ("%s = rt.catch_return(%s)"):format(fnlname(st.name), fnlname(st.name))
+				fndefs[#fndefs + 1] = ("%s = rt.catch_return(%s%s)"):format(fnlname(st.name), fnlname(st.name),
+					noarm[st.name] and ", true" or "")
 			end
 			if next(cfg.loopPc) and not fnloop[st.name] and ndefs[st.name] == 1 then
 				fnloop[st.name] = cfg.loopPc

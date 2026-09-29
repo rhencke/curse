@@ -866,6 +866,29 @@ end
 -- substituted as literal text.
 local function arith_expand_text(sh, raw, depth0) -- depth0: 1 = the text IS a subscript
 	local out, k, n, depth = {}, 1, #raw, depth0 or 0
+	-- (text with nothing to expand — no `$`, `` ` `` or `~`, bash's ARITH_EXP_CHAR — gets only
+	-- expand_arith_string's string_quote_removal, as in double quotes: `\` before $ ` " \
+	-- goes, every `"` goes; no subscript is quoted — `$(( A[\\x] ))` reads `A[\x]`)
+	if not depth0 and not raw:find("[$`~]") then
+		while k <= n do
+			local c = raw:sub(k, k)
+			if c == "\\" then
+				local nx = raw:sub(k + 1, k + 1)
+				if not nx:match('^[$`"\\\n]$') then
+					out[#out + 1] = c
+				end
+				out[#out + 1] = nx
+				k = k + 2
+			elseif c == '"' then
+				k = k + 1
+			else
+				local e = (raw:find('[\\"]', k) or (n + 1)) - 1
+				out[#out + 1] = raw:sub(k, e)
+				k = e + 1
+			end
+		end
+		return table.concat(out)
+	end
 	while k <= n do
 		local c = raw:sub(k, k)
 		if c == "\\" then
@@ -1869,7 +1892,17 @@ expand_part_str = function(sh, p, assign)
 		local fl, ip, pl = sh.force_line, sh.in_perr, sh.perr_label
 		sh.in_perr, sh.perr_label = true, "command substitution"
 		sh.force_line = (fl or rt.current_line(sh)) + 1 + (p.csnl or 0)
-		sherr(sh, "curse: " .. p.cserr .. "\n")
+		if p.csline then -- (a here-document's: a syntax error the parser met in the body is
+			-- reported at its line — counted from the line after the command — as the reader's
+			-- are: `near unexpected token`, then the line's text)
+			sh.force_line = sh.force_line - (p.csnl or 0) + p.csline - 1
+			sherr(sh, "curse: " .. p.cserr:gsub("^syntax error near `", "syntax error near unexpected token `") .. "\n")
+			if p.cstext then
+				sherr(sh, "curse: `" .. p.cstext .. "'\n")
+			end
+		else
+			sherr(sh, "curse: " .. p.cserr .. "\n")
+		end
 		sh.in_perr, sh.perr_label, sh.force_line = ip, pl, fl
 		-- (reader_loop's DISCARD: a status already non-zero — the last substitution's — stays)
 		error({ __curse_exit = sh.status ~= 0 and sh.status or 1, __curse_lineabort = true, __curse_keepst = true })
@@ -6682,7 +6715,16 @@ run_trap = function(sh, code, tag)
 		end
 	end
 	local ne0 = sh.noerr
-	local ok, err = pcall(body)
+	-- (the handler runs with compiled code's live lifted registers in sh around it —
+	-- rt.ltext: a handler whose text the compiler never saw — set by `eval "$s"`, a sourced
+	-- file — may read or assign a variable the interrupted code holds in a register)
+	local sync = rt.trap_needs_sync(sh, code)
+	local ok, err
+	if sync then
+		ok, err = pcall(rt.ltext, sh, body)
+	else
+		ok, err = pcall(body)
+	end
 	-- (the handler is parse_and_execute'd: a line abort in it — a div0 — skips the rest of
 	-- that handler line only)
 	while not ok and type(err) == "table" and err.__curse_lineabort and not err.__curse_discard do
@@ -6690,7 +6732,11 @@ run_trap = function(sh, code, tag)
 		while k < #stmts and not stmts[k + 1].lgstart do
 			k = k + 1
 		end
-		ok, err = pcall(body)
+		if sync then
+			ok, err = pcall(rt.ltext, sh, body)
+		else
+			ok, err = pcall(body)
+		end
 	end
 	if vtext and not mod then
 		M.v_echo(sh, code, nil, vst) -- (the rest, read to the end of the text)
@@ -7006,6 +7052,10 @@ local function run_group(sh, lg, hook, k)
 		hook("stmt", k)
 		local ne0, pf0 = sh.noerr, sh.procsub_files and #sh.procsub_files or 0
 		local ok, err = pcall(exec_stmt, sh, st, hook)
+		if not ok and type(err) == "table" and err.__curse_noexec and not rt.in_subshell(sh) then
+			sh.status, sh.noerr = 0, ne0 -- (`set -n` below the top level: the rest is only read)
+			ok = true
+		end
 		if not ok then
 			-- a fatal WORD-context expansion (div0 in $((…)), failglob no-match) aborts
 			-- the REST of this line; under `set -e` it exits the shell like any failure

@@ -224,11 +224,16 @@ return function(sh, cmd, args, hook, tcb)
 						names[#names + 1] = nm
 					end
 				end
-				-- …and the integer dynamic scalars (`declare -p -i`)
-				for _, nm in ipairs({ "BASHPID", "HISTCMD", "RANDOM", "SRANDOM" }) do
-					if sh.vars[nm] == nil then
-						virt[nm] = { int = true, s = "" }
-						names[#names + 1] = nm
+				-- …and the dynamic scalars, with the value last read (none: never read) —
+				-- the integer ones `-i` (`declare -p -i`)
+				for nm in pairs(rt.DYN_SCALAR_ATTR) do
+					if rt.dyn_unstored(sh, nm) then
+						local v, fl = rt.dyn_listed(sh, nm)
+						if sh.vars[nm] == nil then
+							names[#names + 1] = nm
+						end
+						virt[nm] = { int = fl == "i" or nil, s = v or "",
+							dyn_line = "declare -" .. fl .. " " .. nm .. (v and ("=" .. M.decl_quote(v)) or "") }
 					end
 				end
 			end
@@ -236,9 +241,9 @@ return function(sh, cmd, args, hook, tcb)
 			sh.bav_nolazy = true -- (a listing isn't a reference: BASH_ARGV/ARGC stay unset — bash)
 			local lok, lerr = pcall(function()
 			for _, nm in ipairs(names) do
-				local box = sh.vars[nm] or virt[nm]
+				local box = virt[nm] or sh.vars[nm]
 				if box and decl_match(nm, box) then
-					local d = bare and fmt_set_var(nm, box) or fmt_decl(sh, nm)
+					local d = box.dyn_line or (bare and fmt_set_var(nm, box) or fmt_decl(sh, nm))
 					if d and sh.opt_posix and (cmd == "readonly" or cmd == "export") then
 						-- posix mode lists `readonly [-a|-A] name=value` / `export …` (bash)
 						local fl, rest = d:match("^declare %-(%S*) (.*)$")

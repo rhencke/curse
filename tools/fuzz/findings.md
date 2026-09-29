@@ -478,7 +478,7 @@ tiered (harness) and the static build/curse. None of these is in F1-F15.
 - A brace group / function body ending a line: `};` vs bash's `}` (2180); `for ((i=0; i<1;
   i++))` split across lines in the source prints differently (2490, 2563); `[[ 1 -lt
   [[:a:]] ]]` (bash: `[\[:a:\]]`, 2722); a `case` inside `<( )` (860), an alias inside a
-  `$( )` (2568), `$( )` line numbers (2715), `$(echo side >&2)` inside an array literal
+  `$( )` (2568 — FIXED: the body is parsed without alias expansion, test 3380), `$( )` line numbers (2715), `$(echo side >&2)` inside an array literal
   (2080: bash `1>&2`), `declare -a e1=( $(…) … )` spacing (2010), `exec 3> >(cat >out)`
   (2533: bash `cat > out`). Each is `deparse` target output vs bash on the named
   test/cases file; minimise one before fixing it.

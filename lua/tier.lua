@@ -312,7 +312,7 @@ local dgetinfo, dgetlocal = debug.getinfo, debug.getlocal
 -- parse_and_execute DISCARD jumps to the subshell's top level, which ends it, status 1.
 function M.run_compiled(mod, sh, pc, nested)
 	local pd0, cd0, fs0, ne0 = sh.pd, sh.calldepth, sh.funcstack and #sh.funcstack or 0, sh.noerr
-	local ffo, lastff = sh._ff, false
+	local ffo, lastff, noexec_err = sh._ff, false, nil
 	local lrun, lupv, grabbed = mod.lrun, mod.lupv, nil
 	local larr = mod.larr -- (run()'s spilled registers: its __L, the local after lrun's)
 	if larr and not lrun then
@@ -357,11 +357,25 @@ function M.run_compiled(mod, sh, pc, nested)
 		if ok then
 			if nested then
 				sh._ff = ffo
+				if noexec_err then
+					error(noexec_err, 0)
+				end
 			end
 			return
 		end
+		local noexec = type(err) == "table" and err.__curse_noexec and sh._ff ~= lastff
 		if type(err) == "table" and err.__curse_dbgskip and err.cfg == "run" then
 			pc = err.__curse_dbgskip -- (extdebug: the DEBUG trap skipped a command — go on after it)
+		elseif noexec then -- (`set -n` below the top level: the rest is only read — the next
+			while sh.pd > pd0 do -- statement's marker skips to a syntax error, or the end)
+				sh:popCall()
+			end
+			while sh.funcstack and #sh.funcstack > fs0 do
+				sh:leaveFunc()
+			end
+			sh.calldepth, sh.noerr, sh._sy, sh.status = cd0, ne0, sy0, 0
+			lastff, noexec_err = sh._ff, err -- (eval/source code: once read, it unwinds on)
+			pc = sh._ff
 		elseif type(err) == "table" and err.__curse_lineabort and not rt.lineabort_exits(sh, err) then
 			-- a lineabort from inside a function call unwinds its frames (locals, params,
 			-- FUNCNAME) — the compiled call sites pop them only on a normal return
