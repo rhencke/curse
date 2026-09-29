@@ -373,6 +373,54 @@ function M.lift_one(sh, name, push)
 		error(err, 0)
 	end
 end
+-- A trap handler's text needs the live registers in sh (M.ltext) only if it can reach a
+-- lifted variable by itself: a name some compiled code lifts, a function (whose body may
+-- read one through sh), or a construct naming variables at run time — eval/source, a
+-- builtin handed a name, ${!…}. (Values evaluated as text — arithmetic on a variable
+-- holding `n+1` — sync on their own: rt.arith_read_text and friends run under M.ltext.)
+-- The walk costs ~0.3 µs a frame, per handler run: a DEBUG trap runs one per command.
+local LT_DYN = {}
+for _, w in ipairs({ "eval", "source", "read", "printf", "mapfile", "readarray", "getopts", "declare",
+	"typeset", "local", "export", "readonly", "unset", "let", "wait", "select", "builtin", "command",
+	"exec", "coproc", "fc", "trap" }) do
+	LT_DYN[w] = true
+end
+local lt_ids, lt_n = {}, 0
+function M.trap_needs_sync(sh, code)
+	if next(M.PCLIFT) == nil then
+		return false
+	end
+	local ids = lt_ids[code]
+	if ids == nil then
+		if lt_n >= 256 then
+			lt_ids, lt_n = {}, 0
+		end
+		ids = {}
+		if code:find("${!", 1, true) or code:find("%f[^%s;&|(]%.%s") or code:find("^%.%s") then
+			ids = false -- (a name built at run time, or a sourced file)
+		else
+			for w in code:gmatch("[%a_][%w_]*") do
+				if LT_DYN[w] then
+					ids = false
+					break
+				end
+				ids[#ids + 1] = w
+			end
+		end
+		lt_ids[code], lt_n = ids, lt_n + 1
+	end
+	if not ids then
+		return true
+	end
+	local fns, ln = sh.functions, M.LNAMES
+	for k = 1, #ids do
+		local w = ids[k]
+		if ln[w] or (fns and fns[w]) then
+			return true
+		end
+	end
+	return false
+end
 -- f(...) run with the live lifted registers in sh around it (see above)
 function M.ltext(sh, f, ...)
 	if next(M.PCLIFT) == nil then
