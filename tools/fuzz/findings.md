@@ -1588,3 +1588,61 @@ pending a future pass.
   coincidental: both are bash's generic "syntax error near .../unexpected EOF" wording
   attached to an unrelated mechanism, not the originally-fixed constructs.)
 
+## Campaign 2 (gram:tiers + gram:parse, containerized, 30 min), branch fuzz-hunt
+
+109 differential/crash signatures (90 NEW, 19 tagged "regression or variant of a FIXED
+finding"). `gram:parse`'s 90 NEW signatures are essentially all fine-grained wording/token-
+choice variants of the already-open F116/F117 parser-message-fidelity gap (which token
+bash blames, or "unexpected EOF" vs "syntax error near", for complex nested malformed
+constructs); sampled ~10 of the shortest, none showed a mechanism distinct from that known
+gap, so none recorded as new. `gram:tiers`'s crash list had a cluster of ~28
+`tiers:compiled:*`/`tiers:tiered:*` signatures nearly all sharing one of two seed bases
+(`src:001140+001771`, `src:001140+002698`) with single-byte mutations; one base
+(`<(jobs << 08) ei`-shaped: a `&`-backgrounded job or process substitution racing the
+foreground script's own output) is scheduling nondeterminism — confirmed by re-running the
+identical queue file, which reproduced a *different* disagreeing worker each time (as
+campaign 1's cluster A/B); the other base is the genuine, deterministic F130 below. Of the
+19 FIXED-finding tags, 3 were individually verified: the two F47 tags are a real,
+deterministic gap in the same family (F131 below); a sample of the various F52 tags
+(`wait: BASH_ARGV: cannot unset`, `export: x: not a function`, `let: {a,b}: syntax error`,
+`local: can only be used in a function` — four unrelated messages under one loose tag) were
+each unrelated to F52's actual "set -v echoes its own line" mechanism, confirming the
+loose-tag-coincidence pattern from campaign 1; the rest were not individually re-verified
+(time-boxed).
+
+## F130. Compiled tier: a failed redirect inside a multi-line `$( )` blames the
+## substitution's opening line, not the line the redirect is actually on
+
+    v='!'
+    <Djobs -='!'v=${#}$(mapfile IFS
+    <DjobO) echo hi
+
+- bash, interp, tiered, and static: `S: line 3: DjobO: No such file or directory` (the
+  `<DjobO` redirect is textually on line 3, inside the `$( )` that opened on line 2) then
+  `S: line 2: Djobs: No such file or directory` (the outer redirect, correctly on line 2).
+- curse **compiled tier only**: `S: line 2: DjobO: ...` — blames line 2 (the substitution's
+  opening line) instead of line 3. Same family as F76 (compiled misattributes a line
+  inside a `` ` ` ``/`$( )`/`>( )` substitution) but a distinct trigger not covered by
+  F76's fix. Fragile under simplification: dropping the outer command's own `<Djobs`
+  redirect, or using a plain assignment/builtin instead of `mapfile`, made both sides
+  agree again — not reduced further in the time available. Reduced from `gram-tiers`
+  crash `id:000050`; confirmed fresh via `cmp.sh` in the container.
+
+## F131. Regression/incomplete fix of F47 — a heredoc inside `<( )` is missing bash's
+## specific "delimited by end-of-file" warning, and the line count after it drifts by one
+
+    echo <(cat << 08) ei
+
+- bash: `S: line 1: warning: command substitution: 1 unterminated here-document` **and**
+  `S: line 1: warning: here-document at line 1 delimited by end-of-file (wanted \`08')`
+  (both warnings, both on line 1), then continues the script still on line 1.
+- curse (all tiers): only the first, generic warning — the second, specific "delimited by
+  end-of-file (wanted `DELIM')" warning never fires — and whatever runs next is attributed
+  to line 2 instead of line 1 (e.g. the same script with `cat` replaced by a name that
+  doesn't resolve reports `S: line 2: cat: command not found` where bash reports nothing
+  further on that line). F47's fix evidently covers the generic "N unterminated
+  here-document" warning for `<( )`/`>( )` but not the per-heredoc delimiter warning or
+  the subsequent line-count carry-over. Reduced from `gram-tiers` queue entry `id:003845`
+  (`v='!'` / `<(jobs << 08 % \${#b} >r) ei`); confirmed fresh via `cmp.sh` in the container
+  on both the original and the reduced one-liner.
+
